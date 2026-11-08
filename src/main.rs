@@ -7,9 +7,12 @@ mod media;
 mod model;
 mod player;
 mod qr;
+mod stickers;
 mod td;
 mod theme;
 mod ui;
+mod upload;
+mod voice;
 
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::process::ExitCode;
@@ -24,8 +27,6 @@ use ratatui_image::picker::{Picker, ProtocolType};
 use crate::app::App;
 use crate::keymap::Keymap;
 use crate::td::{Event, Td};
-
-const ANIMATION_TICK: Duration = Duration::from_millis(50);
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> ExitCode {
@@ -77,8 +78,11 @@ async fn run() -> Result<(), String> {
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     let (picker, picker_warning) = image_picker();
     let mut app = App::new(td, creds, data_dir, keymap, picker);
+    if let Err(e) = upload::prune_uploads(app.uploads_dir()) {
+        warnings.push(e);
+    }
     if !warnings.is_empty() {
-        app.set_status(format!("keymap: {}", warnings.join("; ")), true);
+        app.set_status(warnings.join("; "), true);
     } else if let Some(w) = picker_warning {
         app.set_status(w, true);
     }
@@ -142,9 +146,7 @@ async fn event_loop(
         if app.quitting && deadline.is_none() {
             deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
         }
-        let tick = app
-            .animating
-            .then(|| tokio::time::Instant::now() + ANIMATION_TICK);
+        let tick = app.tick_interval().map(|d| tokio::time::Instant::now() + d);
         tokio::select! {
             ev = input.next() => match ev {
                 Some(Ok(ev)) => app.handle(Event::Input(ev)),

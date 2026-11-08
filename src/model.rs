@@ -71,6 +71,8 @@ pub struct FileRef {
     pub done: bool,
     pub active: bool,
     pub downloaded: i64,
+    pub uploading: bool,
+    pub uploaded: i64,
 }
 
 impl FileRef {
@@ -83,6 +85,13 @@ impl FileRef {
             return None;
         }
         Some((self.downloaded.clamp(0, self.size) * 100 / self.size) as u8)
+    }
+
+    pub fn upload_percent(&self) -> Option<u8> {
+        if !self.uploading || self.size <= 0 {
+            return None;
+        }
+        Some((self.uploaded.clamp(0, self.size) * 100 / self.size) as u8)
     }
 }
 
@@ -568,6 +577,10 @@ mod tests {
         assert_eq!(done.percent(), None);
         f.active = false;
         assert_eq!(f.percent(), None);
+        assert_eq!(f.upload_percent(), None);
+        f.uploading = true;
+        f.uploaded = 150;
+        assert_eq!(f.upload_percent(), Some(75));
     }
 
     #[test]

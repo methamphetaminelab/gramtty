@@ -109,10 +109,13 @@ pub enum Action {
     RefreshScreen,
     ChatSwitcher,
     LogOut,
+    AttachFile,
+    RecordVoice,
+    OpenStickers,
 }
 
 impl Action {
-    pub const ALL: [Action; 31] = [
+    pub const ALL: [Action; 34] = [
         Action::StartComposer,
         Action::OpenPaneFilter,
         Action::ClosePopup,
@@ -144,6 +147,9 @@ impl Action {
         Action::RefreshScreen,
         Action::ChatSwitcher,
         Action::LogOut,
+        Action::AttachFile,
+        Action::RecordVoice,
+        Action::OpenStickers,
     ];
 
     pub fn name(self) -> &'static str {
@@ -179,6 +185,9 @@ impl Action {
             Action::RefreshScreen => "RefreshScreen",
             Action::ChatSwitcher => "ChatSwitcher",
             Action::LogOut => "LogOut",
+            Action::AttachFile => "AttachFile",
+            Action::RecordVoice => "RecordVoiceMessage",
+            Action::OpenStickers => "OpenStickerPicker",
         }
     }
 
@@ -219,6 +228,9 @@ impl Action {
             Action::RefreshScreen => "redraw",
             Action::ChatSwitcher => "find chat",
             Action::LogOut => "log out",
+            Action::AttachFile => "attach file",
+            Action::RecordVoice => "record voice message",
+            Action::OpenStickers => "stickers & GIFs",
         }
     }
 
@@ -255,6 +267,9 @@ impl Action {
             Action::RefreshScreen => &["<leader>r"],
             Action::ChatSwitcher => &["<leader><leader>"],
             Action::LogOut => &["<leader>L"],
+            Action::AttachFile => &["<leader>u"],
+            Action::RecordVoice => &["<leader>v"],
+            Action::OpenStickers => &["<leader>s"],
         }
     }
 }

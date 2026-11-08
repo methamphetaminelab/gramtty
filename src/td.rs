@@ -14,6 +14,8 @@ use crate::model::{
     Attachment, ChatInfo, ChatKind, Decode, Entity, EntityKind, FileRef, ListId, MediaKind, Msg,
     Position, RichText, SendState, Sender, Visual,
 };
+use crate::stickers::{Data as StickerData, Item, ItemKind};
+use crate::upload::{self, Kind as UploadKind, Pending, ToolResult};
 
 unsafe extern "C" {
     fn td_execute(request: *const c_char) -> *const c_char;
@@ -45,6 +47,15 @@ pub enum Event {
         result: Result<(), String>,
     },
     Saved(Result<String, String>),
+    Notice(String),
+    Clipboard(Result<crate::upload::Clip, String>),
+    DirListing {
+        dir: std::path::PathBuf,
+        result: Result<Vec<crate::upload::DirEntry>, String>,
+    },
+    Voice(Result<Option<crate::voice::VoiceNote>, String>),
+    Stickers(crate::stickers::Data),
+    StickersFailed(String),
 }
 
 fn execute(request: &serde_json::Value) -> Result<(), String> {
@@ -401,6 +412,394 @@ impl Td {
     }
 }
 
+fn reply_to_message(reply_to: Option<i64>) -> Option<enums::InputMessageReplyTo> {
+    reply_to.map(|message_id| {
+        enums::InputMessageReplyTo::Message(types::InputMessageReplyToMessage {
+            message_id,
+            quote: None,
+            checklist_task_id: 0,
+        })
+    })
+}
+
+fn local_file(path: &std::path::Path) -> enums::InputFile {
+    enums::InputFile::Local(types::InputFileLocal {
+        path: path.to_string_lossy().into_owned(),
+    })
+}
+
+async fn parse_caption(text: String, c: i32) -> Result<types::FormattedText, types::Error> {
+    let enums::FormattedText::FormattedText(f) = tdlib_rs::functions::parse_markdown(
+        types::FormattedText {
+            text,
+            entities: Vec::new(),
+        },
+        c,
+    )
+    .await?;
+    Ok(f)
+}
+
+async fn probe_or_note(p: &Pending, notes: &mut Vec<String>) -> upload::Probe {
+    match upload::probe(&p.path).await {
+        ToolResult::Ok(v) => v,
+        ToolResult::Missing => {
+            notes.push("ffprobe not found; sent without duration".to_owned());
+            upload::Probe::default()
+        }
+        ToolResult::Failed(e) => {
+            notes.push(format!("{}: {e}", p.name));
+            upload::Probe::default()
+        }
+    }
+}
+
+async fn build_content(
+    p: &Pending,
+    caption: Option<types::FormattedText>,
+    uploads: &std::path::Path,
+    notes: &mut Vec<String>,
+) -> enums::InputMessageContent {
+    use enums::InputMessageContent as I;
+    let file = local_file(&p.path);
+    match p.send_kind() {
+        UploadKind::Photo => {
+            let (w, h) = image::image_dimensions(&p.path)
+                .map(|(w, h)| (w as i32, h as i32))
+                .unwrap_or((0, 0));
+            I::InputMessagePhoto(types::InputMessagePhoto {
+                photo: file,
+                thumbnail: None,
+                added_sticker_file_ids: Vec::new(),
+                width: w,
+                height: h,
+                caption,
+                show_caption_above_media: false,
+                self_destruct_type: None,
+                has_spoiler: false,
+            })
+        }
+        UploadKind::Video => {
+            let info = probe_or_note(p, notes).await;
+            let thumbnail = match upload::thumbnail(&p.path, uploads).await {
+                ToolResult::Ok(t) => {
+                    let (w, h) = image::image_dimensions(&t)
+                        .map(|(w, h)| (w as i32, h as i32))
+                        .unwrap_or((0, 0));
+                    Some(types::InputThumbnail {
+                        thumbnail: local_file(&t),
+                        width: w,
+                        height: h,
+                    })
+                }
+                ToolResult::Missing => {
+                    notes.push("ffmpeg not found; video sent without thumbnail".to_owned());
+                    None
+                }
+                ToolResult::Failed(e) => {
+                    notes.push(format!("thumbnail for {}: {e}", p.name));
+                    None
+                }
+            };
+            I::InputMessageVideo(types::InputMessageVideo {
+                video: file,
+                thumbnail,
+                cover: None,
+                start_timestamp: 0,
+                added_sticker_file_ids: Vec::new(),
+                duration: info.duration,
+                width: info.width,
+                height: info.height,
+                supports_streaming: true,
+                caption,
+                show_caption_above_media: false,
+                self_destruct_type: None,
+                has_spoiler: false,
+            })
+        }
+        UploadKind::Animation => {
+            let (w, h) = image::image_dimensions(&p.path)
+                .map(|(w, h)| (w as i32, h as i32))
+                .unwrap_or((0, 0));
+            I::InputMessageAnimation(types::InputMessageAnimation {
+                animation: file,
+                thumbnail: None,
+                added_sticker_file_ids: Vec::new(),
+                duration: 0,
+                width: w,
+                height: h,
+                caption,
+                show_caption_above_media: false,
+                has_spoiler: false,
+            })
+        }
+        UploadKind::Audio => {
+            let info = probe_or_note(p, notes).await;
+            I::InputMessageAudio(types::InputMessageAudio {
+                audio: file,
+                album_cover_thumbnail: None,
+                duration: info.duration,
+                title: info.title,
+                performer: info.performer,
+                caption,
+            })
+        }
+        UploadKind::Document => I::InputMessageDocument(types::InputMessageDocument {
+            document: file,
+            thumbnail: None,
+            disable_content_type_detection: p.as_file,
+            caption,
+        }),
+    }
+}
+
+pub fn sticker_item(st: &types::Sticker) -> Item {
+    let mut att = sticker_attachment(st);
+    if let Some(t) = thumb_visual(&st.thumbnail).filter(|t| t.decode != Decode::Video) {
+        att.preview = Some(t);
+    }
+    Item {
+        kind: ItemKind::Sticker,
+        file_id: st.sticker.id,
+        emoji: st.emoji.clone(),
+        width: st.width,
+        height: st.height,
+        duration: 0,
+        att,
+    }
+}
+
+pub fn animation_item(a: &types::Animation) -> Item {
+    let att = video_like(
+        MediaKind::Animation,
+        &a.animation,
+        a.width,
+        a.height,
+        a.duration,
+        &a.file_name,
+        &a.mime_type,
+        &a.minithumbnail,
+        &a.thumbnail,
+    );
+    Item {
+        kind: ItemKind::Animation,
+        file_id: a.animation.id,
+        emoji: String::new(),
+        width: a.width,
+        height: a.height,
+        duration: a.duration,
+        att,
+    }
+}
+
+fn stickers_of(s: enums::Stickers) -> Vec<Item> {
+    let enums::Stickers::Stickers(s) = s;
+    s.stickers.iter().map(sticker_item).collect()
+}
+
+impl Td {
+    pub fn send_uploads(
+        &self,
+        chat_id: i64,
+        items: Vec<Pending>,
+        text: String,
+        reply_to: Option<i64>,
+        uploads: std::path::PathBuf,
+    ) {
+        let c = self.client_id;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let mut notes = Vec::new();
+            let result: Result<(), types::Error> = async {
+                let long = text.chars().count() > upload::CAPTION_MAX;
+                let mut caption = if text.trim().is_empty() || long {
+                    None
+                } else {
+                    Some(parse_caption(text.clone(), c).await?)
+                };
+                let mut reply = reply_to;
+                for group in upload::plan(&items) {
+                    let mut contents = Vec::with_capacity(group.len());
+                    for i in group {
+                        contents.push(
+                            build_content(&items[i], caption.take(), &uploads, &mut notes).await,
+                        );
+                    }
+                    let r = reply_to_message(reply.take());
+                    if contents.len() == 1 {
+                        let content = contents.pop().expect("one content");
+                        tdlib_rs::functions::send_message(chat_id, None, r, None, content, c)
+                            .await?;
+                    } else {
+                        tdlib_rs::functions::send_message_album(
+                            chat_id, None, r, None, contents, c,
+                        )
+                        .await?;
+                    }
+                }
+                if long {
+                    let formatted = parse_caption(text, c).await?;
+                    let content =
+                        enums::InputMessageContent::InputMessageText(types::InputMessageText {
+                            text: formatted,
+                            link_preview_options: None,
+                            clear_draft: true,
+                        });
+                    tdlib_rs::functions::send_message(chat_id, None, None, None, content, c)
+                        .await?;
+                }
+                Ok(())
+            }
+            .await;
+            notes.dedup();
+            if !notes.is_empty() {
+                let _ = tx.send(Event::Notice(notes.join("; ")));
+            }
+            if let Err(e) = result {
+                let _ = tx.send(Event::Error(format!("send: {}", friendly_error(&e))));
+            }
+        });
+    }
+
+    pub fn send_voice(&self, chat_id: i64, note: crate::voice::VoiceNote, reply_to: Option<i64>) {
+        use base64::Engine;
+        let c = self.client_id;
+        let waveform = base64::engine::general_purpose::STANDARD
+            .encode(crate::voice::pack_waveform(&note.waveform));
+        self.spawn("send voice", false, async move {
+            let content =
+                enums::InputMessageContent::InputMessageVoiceNote(types::InputMessageVoiceNote {
+                    voice_note: local_file(&note.path),
+                    duration: note.duration,
+                    waveform,
+                    caption: None,
+                    self_destruct_type: None,
+                });
+            tdlib_rs::functions::send_message(
+                chat_id,
+                None,
+                reply_to_message(reply_to),
+                None,
+                content,
+                c,
+            )
+            .await
+            .map(|_| ())
+        });
+    }
+
+    pub fn send_item(&self, chat_id: i64, item: Item, reply_to: Option<i64>) {
+        let c = self.client_id;
+        self.spawn("send sticker", false, async move {
+            let file = enums::InputFile::Id(types::InputFileId { id: item.file_id });
+            let content = match item.kind {
+                ItemKind::Sticker => {
+                    enums::InputMessageContent::InputMessageSticker(types::InputMessageSticker {
+                        sticker: file,
+                        thumbnail: None,
+                        width: item.width,
+                        height: item.height,
+                        emoji: item.emoji,
+                    })
+                }
+                ItemKind::Animation => enums::InputMessageContent::InputMessageAnimation(
+                    types::InputMessageAnimation {
+                        animation: file,
+                        thumbnail: None,
+                        added_sticker_file_ids: Vec::new(),
+                        duration: item.duration,
+                        width: item.width,
+                        height: item.height,
+                        caption: None,
+                        show_caption_above_media: false,
+                        has_spoiler: false,
+                    },
+                ),
+            };
+            tdlib_rs::functions::send_message(
+                chat_id,
+                None,
+                reply_to_message(reply_to),
+                None,
+                content,
+                c,
+            )
+            .await
+            .map(|_| ())
+        });
+    }
+
+    fn sticker_task<F>(&self, fut: F)
+    where
+        F: Future<Output = Result<StickerData, types::Error>> + Send + 'static,
+    {
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let ev = match fut.await {
+                Ok(d) => Event::Stickers(d),
+                Err(e) => Event::StickersFailed(friendly_error(&e)),
+            };
+            let _ = tx.send(ev);
+        });
+    }
+
+    pub fn load_stickers(&self) {
+        let c = self.client_id;
+        self.sticker_task(async move {
+            Ok(StickerData::Recent(stickers_of(
+                tdlib_rs::functions::get_recent_stickers(false, c).await?,
+            )))
+        });
+        self.sticker_task(async move {
+            Ok(StickerData::Favorite(stickers_of(
+                tdlib_rs::functions::get_favorite_stickers(c).await?,
+            )))
+        });
+        self.sticker_task(async move {
+            let enums::Animations::Animations(a) =
+                tdlib_rs::functions::get_saved_animations(c).await?;
+            Ok(StickerData::Gifs(
+                a.animations.iter().map(animation_item).collect(),
+            ))
+        });
+        self.sticker_task(async move {
+            let enums::StickerSets::StickerSets(s) =
+                tdlib_rs::functions::get_installed_sticker_sets(enums::StickerType::Regular, c)
+                    .await?;
+            Ok(StickerData::Sets(
+                s.sets.into_iter().map(|s| (s.id, s.title)).collect(),
+            ))
+        });
+    }
+
+    pub fn load_sticker_set(&self, set_id: i64) {
+        let c = self.client_id;
+        self.sticker_task(async move {
+            let enums::StickerSet::StickerSet(s) =
+                tdlib_rs::functions::get_sticker_set(set_id, c).await?;
+            Ok(StickerData::Set(
+                set_id,
+                s.stickers.iter().map(sticker_item).collect(),
+            ))
+        });
+    }
+
+    pub fn search_stickers(&self, query: String, chat_id: i64) {
+        let c = self.client_id;
+        self.sticker_task(async move {
+            let found = tdlib_rs::functions::get_stickers(
+                enums::StickerType::Regular,
+                query.clone(),
+                100,
+                chat_id,
+                c,
+            )
+            .await?;
+            Ok(StickerData::Search(query, stickers_of(found)))
+        });
+    }
+}
+
 pub fn to_chat_list(list: ListId) -> ChatList {
     match list {
         ListId::Main => ChatList::Main,
@@ -540,6 +939,8 @@ pub fn convert_file(f: &types::File) -> FileRef {
         done: f.local.is_downloading_completed,
         active: f.local.is_downloading_active,
         downloaded: f.local.downloaded_size,
+        uploading: f.remote.is_uploading_active,
+        uploaded: f.remote.uploaded_size,
     }
 }
 

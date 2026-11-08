@@ -34,6 +34,10 @@ impl TextInput {
         self.text.is_empty()
     }
 
+    pub fn at_end(&self) -> bool {
+        self.cursor >= self.len()
+    }
+
     fn byte_at(&self, char_idx: usize) -> usize {
         self.text
             .char_indices()

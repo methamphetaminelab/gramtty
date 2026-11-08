@@ -15,7 +15,10 @@ use crate::model::{
     Sender,
 };
 use crate::player;
+use crate::stickers::{self, Library, Tab};
 use crate::td::{self, Event, Td};
+use crate::upload::{self, Clip, DirEntry, Pending};
+use crate::voice::{self, Stop};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pane {
@@ -66,6 +69,7 @@ pub enum MenuAction {
     View,
     Save,
     OpenExternal,
+    CancelSend,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,6 +112,43 @@ pub enum Popup {
         sel: usize,
     },
     ConfirmLogout,
+    FilePicker(FilePicker),
+    Stickers(stickers::Picker),
+}
+
+pub struct FilePicker {
+    pub input: TextInput,
+    pub sel: usize,
+    pub dir: PathBuf,
+    pub entries: Vec<DirEntry>,
+    pub error: Option<String>,
+    requested: Option<PathBuf>,
+}
+
+impl FilePicker {
+    pub fn query(
+        &self,
+        cwd: &std::path::Path,
+        home: &std::path::Path,
+    ) -> (PathBuf, String, String) {
+        upload::split_query(self.input.text(), cwd, home)
+    }
+
+    pub fn matches(&self, cwd: &std::path::Path, home: &std::path::Path) -> Vec<usize> {
+        let (dir, _, filter) = self.query(cwd, home);
+        if dir != self.dir {
+            return Vec::new();
+        }
+        upload::filter_entries(&self.entries, &filter)
+    }
+}
+
+pub struct Recording {
+    pub started: Instant,
+    pub chat_id: i64,
+    pub reply_to: Option<i64>,
+    pub stopping: bool,
+    pub stop: Option<tokio::sync::oneshot::Sender<Stop>>,
 }
 
 #[derive(Default)]
@@ -116,6 +157,9 @@ pub struct Composer {
     pub reply_to: Option<i64>,
     pub edit: Option<i64>,
     pub active: bool,
+    pub attachments: Vec<Pending>,
+    pub att_sel: Option<usize>,
+    pub pasting: bool,
 }
 
 pub struct Filter {
@@ -169,6 +213,12 @@ pub struct App {
     file_jobs: Vec<(i32, FileJob)>,
     pub anim_start: Instant,
     pub animating: bool,
+    uploads_dir: PathBuf,
+    pub cwd: PathBuf,
+    pub home: PathBuf,
+    picker_last: String,
+    pub recording: Option<Recording>,
+    pub stickers: Library,
 }
 
 impl App {
@@ -180,6 +230,11 @@ impl App {
         picker: ratatui_image::picker::Picker,
     ) -> Self {
         let media = Media::new(picker, td.sender());
+        let home = std::env::var_os("HOME")
+            .filter(|h| !h.is_empty())
+            .map_or_else(|| PathBuf::from("/"), PathBuf::from);
+        let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
+        let uploads_dir = data_dir.join("uploads");
         Self {
             td,
             creds,
@@ -225,6 +280,26 @@ impl App {
             file_jobs: Vec::new(),
             anim_start: Instant::now(),
             animating: false,
+            uploads_dir,
+            cwd,
+            home,
+            picker_last: String::new(),
+            recording: None,
+            stickers: Library::default(),
+        }
+    }
+
+    pub fn uploads_dir(&self) -> &std::path::Path {
+        &self.uploads_dir
+    }
+
+    pub fn tick_interval(&self) -> Option<std::time::Duration> {
+        if self.animating {
+            Some(std::time::Duration::from_millis(50))
+        } else if self.recording.is_some() {
+            Some(std::time::Duration::from_millis(200))
+        } else {
+            None
         }
     }
 
@@ -260,6 +335,7 @@ impl App {
                         reply_to: None,
                         edit: Some(message_id),
                         active: true,
+                        ..Composer::default()
                     };
                     self.focus = Pane::Messages;
                 }
@@ -296,6 +372,12 @@ impl App {
                 Ok(path) => self.set_status(format!("saved to {path}"), false),
                 Err(e) => self.set_status(format!("save failed: {e}"), true),
             },
+            Event::Notice(text) => self.set_status(text, false),
+            Event::Clipboard(result) => self.on_clipboard(result),
+            Event::DirListing { dir, result } => self.on_dir_listing(dir, result),
+            Event::Voice(result) => self.on_voice(result),
+            Event::Stickers(data) => self.on_sticker_data(data),
+            Event::StickersFailed(e) => self.set_status(format!("stickers: {e}"), true),
         }
     }
 
@@ -411,11 +493,18 @@ impl App {
     fn on_paste(&mut self, text: &str) {
         if self.auth != Auth::Ready {
             self.login_input.insert_str(text.trim());
-        } else if self.composer.active {
-            self.composer.input.insert_str(text);
         } else if let Some(Popup::Switcher { input, sel }) = &mut self.popup {
             input.insert_str(&format::one_line(text));
             *sel = 0;
+        } else if let Some(Popup::FilePicker(fp)) = &mut self.popup {
+            fp.input.insert_str(&format::one_line(text));
+            fp.sel = 0;
+            self.refresh_picker_listing();
+        } else if let Some(Popup::Stickers(sp)) = &mut self.popup {
+            sp.query.insert_str(&format::one_line(text));
+            self.sticker_query_changed();
+        } else if self.composer.active && self.recording.is_none() {
+            self.composer.input.insert_str(text);
         } else if let Some(f) = self.filter.as_mut().filter(|f| f.active) {
             f.input.insert_str(&format::one_line(text));
         }
@@ -705,6 +794,8 @@ impl App {
         self.status = None;
         self.file_jobs.clear();
         self.stop_playback();
+        self.cancel_recording();
+        self.stickers = Library::default();
     }
 
     pub fn log_out(&mut self) {
@@ -724,6 +815,7 @@ impl App {
         }
         self.quitting = true;
         self.stop_playback();
+        self.cancel_recording();
         if let Some(chat) = self.open_chat {
             self.td.close_chat(chat);
         }
@@ -818,6 +910,10 @@ impl App {
         }
         if self.auth != Auth::Ready {
             self.on_login_key(key);
+            return;
+        }
+        if self.recording.is_some() {
+            self.on_record_key(key);
             return;
         }
         if self.popup.is_some() {
@@ -944,6 +1040,9 @@ impl App {
                     sel: 0,
                 })
             }
+            Action::AttachFile => self.open_file_picker(),
+            Action::RecordVoice => self.start_recording(),
+            Action::OpenStickers => self.open_sticker_picker(0),
         }
     }
 
@@ -1231,6 +1330,11 @@ impl App {
     }
 
     fn on_composer_key(&mut self, key: KeyEvent) {
+        if self.composer.att_sel.is_some() {
+            self.on_attachment_key(key);
+            return;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
             KeyCode::Esc => {
                 self.composer.active = false;
@@ -1240,9 +1344,63 @@ impl App {
                 self.composer.reply_to = None;
             }
             KeyCode::Enter if key.modifiers.is_empty() => self.submit_composer(),
+            KeyCode::Char('v') if ctrl => self.paste_clipboard(),
+            KeyCode::Char('o') if ctrl => self.open_file_picker(),
+            KeyCode::Char('r') if ctrl => self.start_recording(),
+            KeyCode::Char('s') if ctrl => self.open_sticker_picker(0),
+            KeyCode::Char('g') if ctrl => self.open_sticker_picker(2),
+            KeyCode::Tab if !self.composer.attachments.is_empty() => {
+                self.composer.att_sel = Some(self.composer.attachments.len() - 1);
+            }
+            KeyCode::Delete
+                if !self.composer.attachments.is_empty() && self.composer.input.at_end() =>
+            {
+                self.composer.attachments.pop();
+            }
             _ => {
                 self.composer.input.handle_key(&key, true);
             }
+        }
+    }
+
+    fn on_attachment_key(&mut self, key: KeyEvent) {
+        let c = &mut self.composer;
+        let len = c.attachments.len();
+        let Some(sel) = c.att_sel.filter(|s| *s < len) else {
+            c.att_sel = None;
+            return;
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Tab | KeyCode::BackTab | KeyCode::Char('i') => c.att_sel = None,
+            KeyCode::Enter => {
+                c.att_sel = None;
+                self.submit_composer();
+            }
+            KeyCode::Char('j') | KeyCode::Down => c.att_sel = Some((sel + 1).min(len - 1)),
+            KeyCode::Char('k') | KeyCode::Up => c.att_sel = Some(sel.saturating_sub(1)),
+            KeyCode::Char('J') if sel + 1 < len => {
+                c.attachments.swap(sel, sel + 1);
+                c.att_sel = Some(sel + 1);
+            }
+            KeyCode::Char('K') if sel > 0 => {
+                c.attachments.swap(sel, sel - 1);
+                c.att_sel = Some(sel - 1);
+            }
+            KeyCode::Char('f') => {
+                let a = &mut c.attachments[sel];
+                if a.can_toggle() {
+                    a.as_file = !a.as_file;
+                }
+            }
+            KeyCode::Char('d' | 'x') | KeyCode::Delete | KeyCode::Backspace => {
+                c.attachments.remove(sel);
+                c.att_sel = if c.attachments.is_empty() {
+                    None
+                } else {
+                    Some(sel.min(c.attachments.len() - 1))
+                };
+            }
+            _ => {}
         }
     }
 
@@ -1251,14 +1409,390 @@ impl App {
             return;
         };
         let text = self.composer.input.text().trim_end().to_owned();
-        if text.trim().is_empty() {
+        if !self.composer.attachments.is_empty() {
+            let items = std::mem::take(&mut self.composer.attachments);
+            self.td.send_uploads(
+                chat_id,
+                items,
+                text,
+                self.composer.reply_to,
+                self.uploads_dir.clone(),
+            );
+        } else if text.trim().is_empty() {
             return;
+        } else {
+            self.td
+                .send_text(chat_id, text, self.composer.reply_to, self.composer.edit);
         }
-        self.td
-            .send_text(chat_id, text, self.composer.reply_to, self.composer.edit);
         self.composer = Composer::default();
         self.msg_sel = None;
         self.bottom_offset = 0;
+    }
+
+    fn can_attach(&mut self) -> bool {
+        if self.open_chat.is_none() {
+            self.set_status("open a chat first", false);
+            return false;
+        }
+        if self.composer.edit.is_some() {
+            self.set_status("attachments can't be added while editing a message", true);
+            return false;
+        }
+        true
+    }
+
+    fn paste_clipboard(&mut self) {
+        if self.composer.pasting {
+            return;
+        }
+        self.composer.pasting = true;
+        let tx = self.td.sender();
+        let dir = self.uploads_dir.clone();
+        tokio::spawn(async move {
+            let result = upload::read_clipboard(dir).await;
+            let _ = tx.send(Event::Clipboard(result));
+        });
+    }
+
+    fn on_clipboard(&mut self, result: Result<Clip, String>) {
+        self.composer.pasting = false;
+        match result {
+            Ok(Clip::Text(text)) => {
+                if self.composer.active {
+                    self.composer.input.insert_str(&text);
+                }
+            }
+            Ok(Clip::Image(path)) => self.attach_paths(vec![path]),
+            Ok(Clip::Files(paths)) => self.attach_paths(paths),
+            Err(e) => self.set_status(e, true),
+        }
+    }
+
+    pub fn attach_paths(&mut self, paths: Vec<PathBuf>) {
+        if !self.can_attach() {
+            return;
+        }
+        let mut errors = Vec::new();
+        let mut added = 0;
+        for p in paths {
+            match Pending::from_path(&p) {
+                Ok(item) => {
+                    self.composer.attachments.push(item);
+                    added += 1;
+                }
+                Err(e) => errors.push(e),
+            }
+        }
+        if added > 0 {
+            self.composer.active = true;
+            self.focus = Pane::Messages;
+        }
+        if !errors.is_empty() {
+            self.set_status(errors.join("; "), true);
+        } else if added > 0 {
+            let n = self.composer.attachments.len();
+            self.set_status(
+                format!(
+                    "{n} attachment{} · Enter send · Tab select · Delete remove last",
+                    if n == 1 { "" } else { "s" }
+                ),
+                false,
+            );
+        }
+    }
+
+    fn open_file_picker(&mut self) {
+        if !self.can_attach() {
+            return;
+        }
+        self.start_composer(None, None);
+        self.popup = Some(Popup::FilePicker(FilePicker {
+            input: TextInput::with_text(&self.picker_last),
+            sel: 0,
+            dir: PathBuf::new(),
+            entries: Vec::new(),
+            error: None,
+            requested: None,
+        }));
+        self.refresh_picker_listing();
+    }
+
+    fn refresh_picker_listing(&mut self) {
+        let Some(Popup::FilePicker(fp)) = &mut self.popup else {
+            return;
+        };
+        let (dir, _, _) = fp.query(&self.cwd, &self.home);
+        if dir == fp.dir || fp.requested.as_ref() == Some(&dir) {
+            return;
+        }
+        fp.requested = Some(dir.clone());
+        let tx = self.td.sender();
+        tokio::task::spawn_blocking(move || {
+            let result = upload::list_dir(&dir);
+            let _ = tx.send(Event::DirListing { dir, result });
+        });
+    }
+
+    fn on_dir_listing(&mut self, dir: PathBuf, result: Result<Vec<DirEntry>, String>) {
+        let Some(Popup::FilePicker(fp)) = &mut self.popup else {
+            return;
+        };
+        if fp.requested.as_ref() != Some(&dir) {
+            return;
+        }
+        fp.requested = None;
+        fp.dir = dir;
+        fp.sel = 0;
+        match result {
+            Ok(entries) => {
+                fp.entries = entries;
+                fp.error = None;
+            }
+            Err(e) => {
+                fp.entries.clear();
+                fp.error = Some(e);
+            }
+        }
+    }
+
+    fn on_file_picker_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let (cwd, home) = (self.cwd.clone(), self.home.clone());
+        let Some(Popup::FilePicker(fp)) = &mut self.popup else {
+            return;
+        };
+        let matches = fp.matches(&cwd, &home);
+        let chosen = matches
+            .get(fp.sel.min(matches.len().saturating_sub(1)))
+            .map(|i| fp.entries[*i].clone());
+        let (_, prefix, _) = fp.query(&cwd, &home);
+        match key.code {
+            KeyCode::Esc => self.popup = None,
+            KeyCode::Down => fp.sel = (fp.sel + 1).min(matches.len().saturating_sub(1)),
+            KeyCode::Char('n') if ctrl => {
+                fp.sel = (fp.sel + 1).min(matches.len().saturating_sub(1))
+            }
+            KeyCode::Up => fp.sel = fp.sel.saturating_sub(1),
+            KeyCode::Char('p') if ctrl => fp.sel = fp.sel.saturating_sub(1),
+            KeyCode::Tab | KeyCode::Enter => {
+                let typed = upload::expand(fp.input.text(), &cwd, &home);
+                match chosen {
+                    Some(e) if e.dir => {
+                        fp.input = TextInput::with_text(&format!("{prefix}{}/", e.name));
+                        fp.sel = 0;
+                        self.refresh_picker_listing();
+                    }
+                    Some(e) if key.code == KeyCode::Tab => {
+                        fp.input = TextInput::with_text(&format!("{prefix}{}", e.name));
+                    }
+                    Some(e) => {
+                        let path = upload::expand(&format!("{prefix}{}", e.name), &cwd, &home);
+                        self.picker_last = prefix;
+                        self.popup = None;
+                        self.attach_paths(vec![path]);
+                    }
+                    None if key.code == KeyCode::Enter && typed.is_file() => {
+                        self.picker_last = prefix;
+                        self.popup = None;
+                        self.attach_paths(vec![typed]);
+                    }
+                    None => {}
+                }
+            }
+            _ => {
+                if let Edit::Changed = fp.input.handle_key(&key, false) {
+                    fp.sel = 0;
+                    self.refresh_picker_listing();
+                }
+            }
+        }
+    }
+
+    fn open_sticker_picker(&mut self, tab: usize) {
+        if !self.can_attach() {
+            return;
+        }
+        self.td.load_stickers();
+        self.popup = Some(Popup::Stickers(stickers::Picker::new(tab)));
+        self.ensure_tab_loaded();
+    }
+
+    fn ensure_tab_loaded(&mut self) {
+        let Some(Popup::Stickers(sp)) = &self.popup else {
+            return;
+        };
+        if let Tab::Set(id) = sp.current_tab(&self.stickers)
+            && let Some(set) = self.stickers.sets.iter_mut().find(|s| s.id == id)
+            && set.items.is_none()
+            && !set.loading
+        {
+            set.loading = true;
+            self.td.load_sticker_set(id);
+        }
+    }
+
+    fn on_sticker_data(&mut self, data: stickers::Data) {
+        if let Some((query, items)) = self.stickers.apply(data)
+            && let Some(Popup::Stickers(sp)) = &mut self.popup
+            && sp.query.text().trim() == query
+        {
+            sp.remote = items;
+            sp.remote_for = query;
+            sp.searching = false;
+        }
+        self.ensure_tab_loaded();
+    }
+
+    fn sticker_query_changed(&mut self) {
+        let chat = self.open_chat.unwrap_or(0);
+        let Some(Popup::Stickers(sp)) = &mut self.popup else {
+            return;
+        };
+        sp.sel = 0;
+        sp.scroll = 0;
+        let q = sp.query.text().trim().to_owned();
+        if !q.is_empty() && q != sp.remote_for {
+            sp.searching = true;
+            self.td.search_stickers(q, chat);
+        }
+    }
+
+    fn on_sticker_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(Popup::Stickers(sp)) = &mut self.popup else {
+            return;
+        };
+        let items = sp.visible(&self.stickers);
+        let cols = sp.cols.max(1) as isize;
+        match key.code {
+            KeyCode::Esc => self.popup = None,
+            KeyCode::Tab => {
+                sp.switch_tab(&self.stickers, 1);
+                self.ensure_tab_loaded();
+            }
+            KeyCode::BackTab => {
+                sp.switch_tab(&self.stickers, -1);
+                self.ensure_tab_loaded();
+            }
+            KeyCode::Right => sp.move_sel(1, items.len()),
+            KeyCode::Char('n') if ctrl => sp.move_sel(1, items.len()),
+            KeyCode::Left => sp.move_sel(-1, items.len()),
+            KeyCode::Char('p') if ctrl => sp.move_sel(-1, items.len()),
+            KeyCode::Down => sp.move_sel(cols, items.len()),
+            KeyCode::Up => sp.move_sel(-cols, items.len()),
+            KeyCode::PageDown => sp.move_sel(cols * sp.rows.max(1) as isize, items.len()),
+            KeyCode::PageUp => sp.move_sel(-cols * sp.rows.max(1) as isize, items.len()),
+            KeyCode::Enter => {
+                let Some(item) = items.get(sp.sel).cloned() else {
+                    return;
+                };
+                let Some(chat_id) = self.open_chat else {
+                    return;
+                };
+                self.popup = None;
+                let reply = self.composer.reply_to.take();
+                self.td.send_item(chat_id, item, reply);
+                self.msg_sel = None;
+                self.bottom_offset = 0;
+            }
+            _ => {
+                if let Edit::Changed = sp.query.handle_key(&key, false) {
+                    self.sticker_query_changed();
+                }
+            }
+        }
+    }
+
+    fn start_recording(&mut self) {
+        let Some(chat_id) = self.open_chat else {
+            self.set_status("open a chat first", false);
+            return;
+        };
+        if self.recording.is_some() {
+            return;
+        }
+        if self.composer.edit.is_some() {
+            self.set_status("finish editing before recording a voice message", true);
+            return;
+        }
+        let enc = match voice::check_tools() {
+            Ok(e) => e,
+            Err(e) => {
+                self.set_status(e, true);
+                return;
+            }
+        };
+        let rec = match voice::Recorder::start() {
+            Ok(r) => r,
+            Err(e) => {
+                self.set_status(e, true);
+                return;
+            }
+        };
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+        let tx = self.td.sender();
+        let dir = self.uploads_dir.clone();
+        tokio::spawn(async move {
+            let result = match rec.run(stop_rx).await {
+                Ok(Some(pcm)) => voice::encode(pcm, enc, &dir).await.map(Some),
+                Ok(None) => Ok(None),
+                Err(e) => Err(e),
+            };
+            let _ = tx.send(Event::Voice(result));
+        });
+        self.status = None;
+        self.focus = Pane::Messages;
+        self.recording = Some(Recording {
+            started: Instant::now(),
+            chat_id,
+            reply_to: self.composer.reply_to,
+            stopping: false,
+            stop: Some(stop_tx),
+        });
+    }
+
+    fn stop_recording(&mut self, how: Stop) {
+        if let Some(r) = self.recording.as_mut()
+            && let Some(stop) = r.stop.take()
+        {
+            r.stopping = true;
+            let _ = stop.send(how);
+        }
+    }
+
+    fn cancel_recording(&mut self) {
+        self.stop_recording(Stop::Cancel);
+    }
+
+    fn on_record_key(&mut self, key: KeyEvent) {
+        if self.recording.as_ref().is_some_and(|r| r.stopping) {
+            return;
+        }
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.stop_recording(Stop::Cancel),
+            KeyCode::Enter => self.stop_recording(Stop::Send),
+            KeyCode::Char('r') if ctrl => self.stop_recording(Stop::Send),
+            _ => {}
+        }
+    }
+
+    fn on_voice(&mut self, result: Result<Option<voice::VoiceNote>, String>) {
+        let Some(rec) = self.recording.take() else {
+            return;
+        };
+        match result {
+            Ok(Some(note)) => {
+                self.td.send_voice(rec.chat_id, note, rec.reply_to);
+                if rec.reply_to.is_some() && self.composer.reply_to == rec.reply_to {
+                    self.composer.reply_to = None;
+                }
+                self.msg_sel = None;
+                self.bottom_offset = 0;
+            }
+            Ok(None) => self.set_status("recording cancelled", false),
+            Err(e) => self.set_status(format!("voice message: {e}"), true),
+        }
     }
 
     fn on_filter_key(&mut self, key: KeyEvent) {
@@ -1402,6 +1936,8 @@ impl App {
             MenuAction::Edit => {
                 if !msg.outgoing {
                     self.set_status("you can only edit your own messages", false);
+                } else if !self.composer.attachments.is_empty() {
+                    self.set_status("send or remove the pending attachments first", true);
                 } else {
                     self.td
                         .fetch_edit_text(msg.chat_id, msg.id, msg.body.clone());
@@ -1436,6 +1972,20 @@ impl App {
                     None => self.set_status("no file in this message", false),
                 }
             }
+            MenuAction::CancelSend => {
+                let ids: Vec<i64> = self
+                    .selected_group()
+                    .iter()
+                    .filter(|m| m.state == model::SendState::Pending)
+                    .map(|m| m.id)
+                    .collect();
+                if ids.is_empty() {
+                    self.set_status("nothing is being sent", false);
+                } else {
+                    self.td.delete_messages(msg.chat_id, ids, true);
+                    self.set_status("sending cancelled", false);
+                }
+            }
             MenuAction::OpenUrl => match format::urls(&msg.body).first() {
                 Some(url) => player::xdg_open(&format::normalize_url(url)).unwrap_or_else(|e| {
                     self.set_status(format!("open url: {e}"), true);
@@ -1448,6 +1998,10 @@ impl App {
 
     fn open_action_menu(&mut self) {
         let has_media = !self.group_attachments().is_empty();
+        let sending = self
+            .selected_group()
+            .iter()
+            .any(|m| m.state == model::SendState::Pending);
         let items = match self.focus {
             Pane::Messages if self.msg_sel.is_some() => {
                 let mut items = vec![
@@ -1472,6 +2026,16 @@ impl App {
                         action: MenuAction::OpenUrl,
                     },
                 ];
+                if sending {
+                    items.insert(
+                        0,
+                        MenuItem {
+                            key: 'c',
+                            label: "Cancel sending",
+                            action: MenuAction::CancelSend,
+                        },
+                    );
+                }
                 if has_media {
                     items.extend([
                         MenuItem {
@@ -1538,7 +2102,8 @@ impl App {
             | MenuAction::Play
             | MenuAction::View
             | MenuAction::Save
-            | MenuAction::OpenExternal => self.message_action(action),
+            | MenuAction::OpenExternal
+            | MenuAction::CancelSend => self.message_action(action),
             MenuAction::OpenChat => self.on_enter(),
             MenuAction::MarkRead => {
                 self.refresh_lists();
@@ -1575,6 +2140,8 @@ impl App {
         };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match popup {
+            Popup::FilePicker(_) => self.on_file_picker_key(key),
+            Popup::Stickers(_) => self.on_sticker_key(key),
             Popup::Menu { items, sel, .. } => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.popup = None,
                 KeyCode::Char('j') | KeyCode::Down => *sel = (*sel + 1) % items.len(),

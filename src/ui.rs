@@ -61,6 +61,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     if matches!(app.popup, Some(Popup::Viewer { .. })) {
         draw_viewer(frame, area, app);
+    } else if matches!(app.popup, Some(Popup::Stickers(_))) {
+        draw_stickers(frame, area, app);
     } else {
         draw_popup(frame, area, app);
     }
@@ -400,7 +402,9 @@ fn meta_text(app: &App, m: &Msg, idx: usize, att: &Attachment, width: usize) -> 
                 .collect(),
         ),
     };
-    if let Some(p) = f.percent() {
+    if let Some(p) = f.upload_percent() {
+        text.push_str(&format!(" ⇡ {p}%"));
+    } else if let Some(p) = f.percent() {
         text.push_str(&format!(" ⇣ {p}%"));
     } else if f.active {
         text.push_str(" ⇣");
@@ -557,7 +561,21 @@ fn group_block(
     for g in group {
         match &g.state {
             SendState::Sent => {}
-            SendState::Pending => body.push(Line::from(Span::styled("sending...", theme::muted()))),
+            SendState::Pending => {
+                let up = g
+                    .attachments
+                    .iter()
+                    .any(|a| app.media.file(&a.file).uploading);
+                let text = if up {
+                    "uploading... (Enter → c to cancel)"
+                } else {
+                    "sending..."
+                };
+                body.push(Line::from(Span::styled(
+                    format::truncate(text, inner),
+                    theme::muted(),
+                )))
+            }
             SendState::Failed(e) => body.push(Line::from(Span::styled(
                 format::truncate(&format!("failed: {e}"), inner),
                 theme::error(),
@@ -615,9 +633,66 @@ fn card(body: Vec<Line<'static>>, width: usize, bottom_time: Option<&str>) -> Ve
     out
 }
 
+const MAX_ATTACHMENT_LINES: usize = 5;
+
+fn attachment_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let c = &app.composer;
+    let n = c.attachments.len();
+    let mut out = Vec::new();
+    let start = match c.att_sel {
+        Some(sel) if n > MAX_ATTACHMENT_LINES => sel
+            .saturating_sub(MAX_ATTACHMENT_LINES - 1)
+            .min(n - MAX_ATTACHMENT_LINES),
+        _ => n.saturating_sub(MAX_ATTACHMENT_LINES),
+    };
+    if start > 0 {
+        out.push(Line::from(Span::styled(
+            format!("  … {start} more above"),
+            theme::muted(),
+        )));
+    }
+    for (i, a) in c
+        .attachments
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(MAX_ATTACHMENT_LINES)
+    {
+        let kind = if a.as_file {
+            format!("{} as file", a.kind.label())
+        } else {
+            a.send_kind().label().to_owned()
+        };
+        let label = format!(
+            "📎 {} · {} · {kind}",
+            a.name,
+            format::file_size(a.size as i64)
+        );
+        let style = if c.att_sel == Some(i) {
+            theme::selection()
+        } else {
+            theme::warning()
+        };
+        out.push(Line::from(Span::styled(
+            format::truncate(&label, width),
+            style,
+        )));
+    }
+    if c.pasting {
+        out.push(Line::from(Span::styled(
+            "📋 reading clipboard...",
+            theme::muted(),
+        )));
+    }
+    out
+}
+
 fn composer_height(app: &App, width: usize) -> u16 {
     if app.open_chat.is_none() {
         return 0;
+    }
+    if app.recording.is_some() {
+        return 3;
     }
     let lines = app
         .composer
@@ -625,7 +700,8 @@ fn composer_height(app: &App, width: usize) -> u16 {
         .visual_lines(width.saturating_sub(2))
         .len()
         .max(1);
-    (lines.min(8) + 2) as u16
+    let extra = attachment_lines(app, width).len();
+    (lines.min(8) + 2 + extra) as u16
 }
 
 fn draw_messages(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -1049,7 +1125,38 @@ fn draw_viewer(frame: &mut Frame, area: Rect, app: &mut App) {
     );
 }
 
+fn draw_recording(frame: &mut Frame, area: Rect, rec: &crate::app::Recording) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(border::ROUNDED)
+        .border_style(theme::error())
+        .title(Span::styled(" Voice message ", theme::error()));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let secs = rec.started.elapsed().as_secs() as i32;
+    let line = if rec.stopping {
+        Line::from(Span::styled("⧗ encoding...", theme::muted()))
+    } else {
+        let dot = if secs % 2 == 0 { "●" } else { "○" };
+        Line::from(vec![
+            Span::styled(
+                format!("{dot} REC {} ", format::duration(secs)),
+                theme::error(),
+            ),
+            Span::styled(" Enter", theme::strong()),
+            Span::styled(" send · ", theme::muted()),
+            Span::styled("Esc", theme::strong()),
+            Span::styled(" cancel", theme::muted()),
+        ])
+    };
+    frame.render_widget(Paragraph::new(line), inner);
+}
+
 fn draw_composer(frame: &mut Frame, area: Rect, app: &App) {
+    if let Some(rec) = &app.recording {
+        draw_recording(frame, area, rec);
+        return;
+    }
     let c = &app.composer;
     let title = if c.edit.is_some() {
         Span::styled(" Edit message ", theme::editing())
@@ -1076,9 +1183,34 @@ fn draw_composer(frame: &mut Frame, area: Rect, app: &App) {
             theme::border()
         })
         .title(title);
+    let block = if c.att_sel.is_some() {
+        block.title_bottom(Span::styled(
+            " j/k select · J/K move · f as file · d remove · Tab text ",
+            theme::muted(),
+        ))
+    } else if !c.attachments.is_empty() && c.active {
+        block.title_bottom(Span::styled(
+            " Tab attachments · Del remove last · Enter send ",
+            theme::muted(),
+        ))
+    } else if c.active {
+        block.title_bottom(Span::styled(
+            " C-o file · C-v paste · C-r voice · C-s stickers · C-g GIFs ",
+            theme::muted(),
+        ))
+    } else {
+        block
+    };
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let width = inner.width as usize;
+    let att = attachment_lines(app, width);
+    let att_h = (att.len() as u16).min(inner.height.saturating_sub(1));
+    let [att_area, inner] =
+        Layout::vertical([Constraint::Length(att_h), Constraint::Min(0)]).areas(inner);
+    if att_h > 0 {
+        frame.render_widget(Paragraph::new(att), att_area);
+    }
     if c.input.is_empty() && !c.active {
         let label = app
             .keymap
@@ -1104,7 +1236,7 @@ fn draw_composer(frame: &mut Frame, area: Rect, app: &App) {
         .map(Line::from)
         .collect();
     frame.render_widget(Paragraph::new(shown), inner);
-    if c.active {
+    if c.active && c.att_sel.is_none() && h > 0 {
         frame.set_cursor_position(Position {
             x: inner.x + (col as u16).min(inner.width.saturating_sub(1)),
             y: inner.y + (row - skip) as u16,
@@ -1208,7 +1340,8 @@ fn draw_popup(frame: &mut Frame, area: Rect, app: &App) {
             let rect = centered(area, 34, lines.len() as u16 + 2);
             modal(frame, rect, title, lines);
         }
-        Popup::Viewer { .. } => {}
+        Popup::Viewer { .. } | Popup::Stickers(_) => {}
+        Popup::FilePicker(fp) => draw_file_picker(frame, area, app, fp),
         Popup::ConfirmDelete { message_ids, .. } => {
             let question = if message_ids.len() > 1 {
                 format!(" Delete these {} messages?", message_ids.len())
@@ -1287,6 +1420,235 @@ fn draw_popup(frame: &mut Frame, area: Rect, app: &App) {
             });
         }
     }
+}
+
+fn draw_file_picker(frame: &mut Frame, area: Rect, app: &App, fp: &crate::app::FilePicker) {
+    let (dir, _, _) = fp.query(&app.cwd, &app.home);
+    let matches = fp.matches(&app.cwd, &app.home);
+    let rect = centered(area, 72.min(area.width), 22.min(area.height));
+    let inner_w = rect.width.saturating_sub(2) as usize;
+    let rows = rect.height.saturating_sub(6) as usize;
+    let sel = fp.sel.min(matches.len().saturating_sub(1));
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("> ", theme::active_field()),
+            if fp.input.is_empty() {
+                Span::styled("type a path (~/ for home)...", theme::muted())
+            } else {
+                Span::raw(fp.input.text().to_owned())
+            },
+        ]),
+        Line::from(Span::styled(
+            format::truncate(&dir.display().to_string(), inner_w),
+            theme::muted(),
+        )),
+        Line::from(Span::styled("─".repeat(inner_w), theme::border())),
+    ];
+    if let Some(e) = fp.error.as_ref().filter(|_| dir == fp.dir) {
+        lines.push(Line::from(Span::styled(
+            format::truncate(&format!("⚠ {e}"), inner_w),
+            theme::error(),
+        )));
+    } else if dir != fp.dir {
+        lines.push(Line::from(Span::styled("⧗ reading...", theme::muted())));
+    } else if matches.is_empty() {
+        lines.push(Line::from(Span::styled("no matches", theme::muted())));
+    }
+    let start = list_window(sel, matches.len(), rows);
+    for (i, idx) in matches.iter().enumerate().skip(start).take(rows) {
+        let e = &fp.entries[*idx];
+        let span = if e.dir {
+            Span::styled(format!("{}/", e.name), theme::link())
+        } else {
+            Span::raw(e.name.clone())
+        };
+        lines.push(row_line(vec![span], i == sel, true, inner_w));
+    }
+    let used = lines.len();
+    let total = rect.height.saturating_sub(2) as usize;
+    lines.extend(std::iter::repeat_n(
+        Line::default(),
+        total.saturating_sub(used + 1),
+    ));
+    lines.push(Line::from(Span::styled(
+        format::truncate(
+            " Tab complete · Enter attach / open dir · Esc close",
+            inner_w,
+        ),
+        theme::muted(),
+    )));
+    let inner = modal(frame, rect, "Attach file", lines);
+    let (_, col) = fp.input.cursor_position(0);
+    frame.set_cursor_position(Position {
+        x: (inner.x + 2 + col as u16).min(inner.right().saturating_sub(1)),
+        y: inner.y,
+    });
+}
+
+const STICKER_CELL_COLS: u16 = 10;
+
+fn draw_stickers(frame: &mut Frame, area: Rect, app: &mut App) {
+    let Some(Popup::Stickers(mut sp)) = app.popup.take() else {
+        return;
+    };
+    let rect = centered(
+        area,
+        (area.width * 9 / 10).max(30),
+        (area.height * 9 / 10).max(12),
+    );
+    frame.render_widget(Clear, rect);
+    let tab = sp.current_tab(&app.stickers);
+    let title = if tab == crate::stickers::Tab::Gifs && sp.query.is_empty() {
+        " GIFs "
+    } else {
+        " Stickers "
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(border::ROUNDED)
+        .border_style(theme::focus_border())
+        .title(Span::styled(title, theme::strong()))
+        .title_bottom(Span::styled(
+            " Tab/S-Tab section · arrows move · Enter send · type emoji to search · Esc close ",
+            theme::muted(),
+        ));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    if inner.height < 4 || inner.width < 4 {
+        app.popup = Some(Popup::Stickers(sp));
+        return;
+    }
+    let [query_row, tabs_row, grid] = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .areas(inner);
+    let q = sp.query.text().to_owned();
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("> ", theme::active_field()),
+            if q.is_empty() {
+                Span::styled("emoji or word to search...", theme::muted())
+            } else {
+                Span::raw(q.clone())
+            },
+        ])),
+        query_row,
+    );
+    let (_, col) = sp.query.cursor_position(0);
+    frame.set_cursor_position(Position {
+        x: (query_row.x + 2 + col as u16).min(query_row.right().saturating_sub(1)),
+        y: query_row.y,
+    });
+    let tabs = app.stickers.tabs();
+    let cur = sp.tab.min(tabs.len() - 1);
+    let width = tabs_row.width as usize;
+    let label = |i: usize| format!(" {} ", format::truncate(&tabs[i].1, 20));
+    let mut first = cur;
+    let mut used = label(cur).width();
+    while first > 0 && used + label(first - 1).width() < width {
+        first -= 1;
+        used += label(first).width() + 1;
+    }
+    let mut spans = Vec::new();
+    for i in first..tabs.len() {
+        let l = label(i);
+        if spans
+            .iter()
+            .map(|s: &Span| s.content.width())
+            .sum::<usize>()
+            + l.width()
+            > width
+        {
+            break;
+        }
+        let style = if !q.is_empty() {
+            theme::muted()
+        } else if i == cur {
+            theme::active_field()
+        } else {
+            theme::normal()
+        };
+        spans.push(Span::styled(l, style));
+        spans.push(Span::raw(" "));
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), tabs_row);
+    let items = sp.visible(&app.stickers);
+    let font = app.media.font();
+    let cell_cols = STICKER_CELL_COLS;
+    let cell_rows = ((u32::from(cell_cols) * u32::from(font.0) / u32::from(font.1)) as u16).max(2);
+    let pitch_w = cell_cols + 2;
+    let pitch_h = cell_rows + 2;
+    let cols = (grid.width / pitch_w).max(1) as usize;
+    let rows = (grid.height / pitch_h).max(1) as usize;
+    sp.cols = cols;
+    sp.rows = rows;
+    sp.sel = sp.sel.min(items.len().saturating_sub(1));
+    sp.fix_scroll(cols, rows);
+    if items.is_empty() {
+        let loading = if !q.is_empty() {
+            sp.searching
+        } else {
+            app.stickers.items(tab).is_none()
+        };
+        let text = if loading {
+            "⧗ loading..."
+        } else {
+            "nothing here"
+        };
+        frame.render_widget(Paragraph::new(Span::styled(text, theme::muted())), grid);
+    }
+    for (i, item) in items
+        .iter()
+        .enumerate()
+        .skip(sp.scroll * cols)
+        .take(rows * cols)
+    {
+        let slot = i - sp.scroll * cols;
+        let (cx, cy) = (
+            (slot % cols) as u16 * pitch_w,
+            (slot / cols) as u16 * pitch_h,
+        );
+        if cy + pitch_h > grid.height {
+            break;
+        }
+        let cell = Rect {
+            x: grid.x + cx,
+            y: grid.y + cy,
+            width: pitch_w,
+            height: pitch_h,
+        };
+        if i == sp.sel {
+            frame.render_widget(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .border_set(border::ROUNDED)
+                    .border_style(theme::selection_border()),
+                cell,
+            );
+        }
+        let (w, h) = (item.width.max(1), item.height.max(1));
+        let (c, r) = fit_cells(w, h, font, cell_cols, cell_rows);
+        let t = ImageTarget {
+            area: grid,
+            x: cx + 1 + (cell_cols - c) / 2,
+            y: (cy + 1 + (cell_rows - r) / 2) as isize,
+            cols: c,
+            rows: r,
+        };
+        draw_attachment(
+            frame,
+            t,
+            &mut app.media,
+            &item.att,
+            (0, i64::from(item.file_id), 0),
+            false,
+            false,
+            Duration::ZERO,
+        );
+    }
+    app.popup = Some(Popup::Stickers(sp));
 }
 
 fn draw_key_hint(frame: &mut Frame, area: Rect, app: &App) {
@@ -1554,6 +1916,223 @@ mod tests {
         app
     }
 
+    fn press(app: &mut App, code: crossterm::event::KeyCode, mods: crossterm::event::KeyModifiers) {
+        app.handle(Event::Input(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::new(code, mods),
+        )));
+    }
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("gramtty-ui-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("Pictures")).unwrap();
+        std::fs::write(dir.join("a.jpg"), [1u8; 2048]).unwrap();
+        std::fs::write(dir.join("b.pdf"), [2u8; 100]).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn composer_attachments_select_reorder_toggle_remove() {
+        use crossterm::event::{KeyCode as K, KeyModifiers as M};
+        let dir = scratch("att");
+        let mut app = app();
+        app.composer.active = true;
+        app.attach_paths(vec![dir.join("a.jpg"), dir.join("b.pdf"), dir.join("nope")]);
+        assert_eq!(app.composer.attachments.len(), 2);
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|(t, e)| *e && t.contains("nope"))
+        );
+        let screen = render(&mut app, 120, 40);
+        assert!(screen.contains("a.jpg · 2 KB · photo"), "{screen}");
+        assert!(screen.contains("b.pdf · 100 B · file"));
+        assert!(screen.contains("Tab attachments"));
+        press(&mut app, K::Tab, M::NONE);
+        assert_eq!(app.composer.att_sel, Some(1));
+        press(&mut app, K::Char('K'), M::SHIFT);
+        assert_eq!(app.composer.attachments[0].name, "b.pdf");
+        assert_eq!(app.composer.att_sel, Some(0));
+        press(&mut app, K::Char('j'), M::NONE);
+        press(&mut app, K::Char('f'), M::NONE);
+        assert!(app.composer.attachments[1].as_file);
+        let screen = render(&mut app, 120, 40);
+        assert!(screen.contains("photo as file"));
+        assert!(screen.contains("f as file"));
+        press(&mut app, K::Char('d'), M::NONE);
+        assert_eq!(app.composer.attachments.len(), 1);
+        assert_eq!(app.composer.att_sel, Some(0));
+        press(&mut app, K::Esc, M::NONE);
+        assert_eq!(app.composer.att_sel, None);
+        assert!(app.composer.active);
+        press(&mut app, K::Char('h'), M::NONE);
+        press(&mut app, K::Left, M::NONE);
+        press(&mut app, K::Delete, M::NONE);
+        assert_eq!(app.composer.attachments.len(), 1);
+        assert_eq!(app.composer.input.text(), "");
+        press(&mut app, K::Delete, M::NONE);
+        assert!(app.composer.attachments.is_empty());
+        app.composer.edit = Some(5);
+        app.attach_paths(vec![dir.join("a.jpg")]);
+        assert!(app.composer.attachments.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn file_picker_lists_filters_and_attaches() {
+        use crossterm::event::{KeyCode as K, KeyModifiers as M};
+        let dir = scratch("picker");
+        let mut app = app();
+        app.cwd = dir.clone();
+        app.composer.active = true;
+        press(&mut app, K::Char('o'), M::CONTROL);
+        assert!(matches!(app.popup, Some(Popup::FilePicker(_))));
+        assert!(app.composer.active);
+        app.handle(Event::DirListing {
+            dir: dir.clone(),
+            result: crate::upload::list_dir(&dir),
+        });
+        let screen = render(&mut app, 120, 40);
+        assert!(screen.contains("Attach file"));
+        assert!(screen.contains("Pictures/"));
+        assert!(screen.contains("a.jpg"));
+        press(&mut app, K::Char('p'), M::NONE);
+        press(&mut app, K::Char('d'), M::NONE);
+        let screen = render(&mut app, 120, 40);
+        assert!(screen.contains("b.pdf"));
+        assert!(!screen.contains("Pictures/"));
+        press(&mut app, K::Enter, M::NONE);
+        assert!(app.popup.is_none());
+        assert_eq!(app.composer.attachments.len(), 1);
+        assert_eq!(app.composer.attachments[0].path, dir.join("b.pdf"));
+        press(&mut app, K::Char('o'), M::CONTROL);
+        let Some(Popup::FilePicker(fp)) = &app.popup else {
+            panic!("picker not reopened");
+        };
+        assert_eq!(fp.input.text(), "");
+        press(&mut app, K::Char('P'), M::SHIFT);
+        app.handle(Event::DirListing {
+            dir: dir.clone(),
+            result: crate::upload::list_dir(&dir),
+        });
+        press(&mut app, K::Tab, M::NONE);
+        let Some(Popup::FilePicker(fp)) = &app.popup else {
+            panic!("picker closed");
+        };
+        assert_eq!(fp.input.text(), "Pictures/");
+        press(&mut app, K::Esc, M::NONE);
+        assert!(app.popup.is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sticker_picker_renders_tabs_and_navigates() {
+        use crate::stickers::{Data, Item, ItemKind};
+        use crossterm::event::{KeyCode as K, KeyModifiers as M};
+        let item = |id: i32, emoji: &str| {
+            let mut att = Attachment::new(MediaKind::Sticker, file(id, false));
+            att.preview = Some(Visual {
+                file: file(id, false),
+                decode: Decode::Raster,
+                width: 512,
+                height: 512,
+            });
+            Item {
+                kind: ItemKind::Sticker,
+                file_id: id,
+                emoji: emoji.to_owned(),
+                width: 512,
+                height: 512,
+                duration: 0,
+                att,
+            }
+        };
+        let mut app = app();
+        app.pending = vec![app.keymap.leader];
+        press(&mut app, K::Char('s'), M::NONE);
+        assert!(matches!(app.popup, Some(Popup::Stickers(_))));
+        let screen = render(&mut app, 120, 40);
+        assert!(screen.contains("loading"));
+        app.handle(Event::Stickers(Data::Recent(
+            (1..=30)
+                .map(|i| item(i, if i % 2 == 0 { "🐱" } else { "😀" }))
+                .collect(),
+        )));
+        app.handle(Event::Stickers(Data::Sets(vec![(9, "Cats".into())])));
+        let screen = render(&mut app, 120, 40);
+        assert!(screen.contains("Recent"));
+        assert!(screen.contains("Favorites"));
+        assert!(screen.contains("Cats"));
+        assert!(screen.contains("Stickers"));
+        press(&mut app, K::Down, M::NONE);
+        let Some(Popup::Stickers(sp)) = &app.popup else {
+            panic!("picker closed");
+        };
+        assert!(sp.cols > 1);
+        assert_eq!(sp.sel, sp.cols);
+        press(&mut app, K::Char('🐱'), M::NONE);
+        let Some(Popup::Stickers(sp)) = &app.popup else {
+            panic!("picker closed");
+        };
+        assert_eq!(sp.visible(&app.stickers).len(), 15);
+        assert!(sp.searching);
+        press(&mut app, K::BackTab, M::NONE);
+        let Some(Popup::Stickers(sp)) = &app.popup else {
+            panic!("picker closed");
+        };
+        assert_eq!(sp.current_tab(&app.stickers), crate::stickers::Tab::Set(9));
+        assert!(app.stickers.sets[0].loading);
+        press(&mut app, K::Enter, M::NONE);
+        assert!(app.popup.is_none());
+        app.composer.active = true;
+        press(&mut app, K::Char('g'), M::CONTROL);
+        let screen = render(&mut app, 120, 40);
+        assert!(screen.contains("GIFs"));
+    }
+
+    #[test]
+    fn recording_indicator_and_upload_progress_render() {
+        let mut app = app();
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        app.recording = Some(crate::app::Recording {
+            started: std::time::Instant::now() - std::time::Duration::from_secs(7),
+            chat_id: 10,
+            reply_to: None,
+            stopping: false,
+            stop: Some(tx),
+        });
+        let screen = render(&mut app, 120, 40);
+        assert!(screen.contains("Voice message"));
+        assert!(screen.contains("REC 0:07"));
+        assert!(screen.contains("Esc cancel"));
+        app.recording.as_mut().unwrap().stopping = true;
+        assert!(render(&mut app, 120, 40).contains("encoding"));
+        app.recording = None;
+        let h = app.histories.get_mut(&10).unwrap();
+        let m = h.get_mut(40).unwrap();
+        let mut f = file(77, true);
+        f.uploading = true;
+        f.uploaded = 512;
+        let mut att = Attachment::new(MediaKind::Document, f);
+        att.name = "big.zip".to_owned();
+        m.attachments = vec![att];
+        m.state = SendState::Pending;
+        m.outgoing = true;
+        let screen = render(&mut app, 120, 40);
+        assert!(screen.contains("big.zip · 2 KB ⇡ 25%"), "{screen}");
+        assert!(screen.contains("uploading..."));
+        app.focus = Pane::Messages;
+        app.msg_sel = Some(39);
+        press(
+            &mut app,
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let Some(Popup::Menu { items, .. }) = &app.popup else {
+            panic!("no menu");
+        };
+        assert_eq!(items[0].label, "Cancel sending");
+    }
+
     fn render(app: &mut App, w: u16, h: u16) -> String {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| draw(f, app)).unwrap();
@@ -1628,6 +2207,7 @@ mod tests {
             done: local,
             active: false,
             downloaded: if local { 2048 } else { 0 },
+            ..crate::model::FileRef::default()
         }
     }
 
@@ -1870,6 +2450,7 @@ mod tests {
                 done: true,
                 active: false,
                 downloaded: 1,
+                ..crate::model::FileRef::default()
             };
             let mut a = Attachment::new(kind, f.clone());
             a.width = w;
