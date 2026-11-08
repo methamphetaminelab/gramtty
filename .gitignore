@@ -1,0 +1,9 @@
+target/
+/.work/
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
+*.log
+*.profraw

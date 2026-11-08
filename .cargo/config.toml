@@ -1,0 +1,2 @@
+[env]
+LIBCXX_DIR = { value = ".work/libcxx", relative = true }
