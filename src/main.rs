@@ -3,7 +3,9 @@ mod config;
 mod format;
 mod input;
 mod keymap;
+mod media;
 mod model;
+mod player;
 mod qr;
 mod td;
 mod theme;
@@ -17,9 +19,13 @@ use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, EventStream}
 use crossterm::execute;
 use futures::StreamExt;
 
+use ratatui_image::picker::{Picker, ProtocolType};
+
 use crate::app::App;
 use crate::keymap::Keymap;
 use crate::td::{Event, Td};
+
+const ANIMATION_TICK: Duration = Duration::from_millis(50);
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> ExitCode {
@@ -67,17 +73,51 @@ async fn run() -> Result<(), String> {
     let td = Td::new(tx.clone());
     td.start();
 
-    let mut app = App::new(td, creds, data_dir, keymap);
-    if !warnings.is_empty() {
-        app.set_status(format!("keymap: {}", warnings.join("; ")), true);
-    }
-
     let mut terminal = ratatui::init();
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+    let (picker, picker_warning) = image_picker();
+    let mut app = App::new(td, creds, data_dir, keymap, picker);
+    if !warnings.is_empty() {
+        app.set_status(format!("keymap: {}", warnings.join("; ")), true);
+    } else if let Some(w) = picker_warning {
+        app.set_status(w, true);
+    }
     let result = event_loop(&mut terminal, &mut app, &mut rx).await;
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
+}
+
+fn image_picker() -> (Picker, Option<String>) {
+    let forced = std::env::var(format!("{}_IMAGE_PROTOCOL", config::env_prefix())).ok();
+    let forced = match forced.as_deref().map(str::trim) {
+        None | Some("") | Some("auto") => None,
+        Some("halfblocks") => Some(ProtocolType::Halfblocks),
+        Some("kitty") => Some(ProtocolType::Kitty),
+        Some("sixel") => Some(ProtocolType::Sixel),
+        Some("iterm2") => Some(ProtocolType::Iterm2),
+        Some(other) => {
+            return (
+                Picker::halfblocks(),
+                Some(format!(
+                    "unknown image protocol {other:?}; use auto, kitty, sixel, iterm2 or halfblocks"
+                )),
+            );
+        }
+    };
+    let (mut picker, warning) = match Picker::from_query_stdio() {
+        Ok(p) => (p, None),
+        Err(e) => (
+            Picker::halfblocks(),
+            Some(format!(
+                "image protocol detection failed ({e}); using half-blocks"
+            )),
+        ),
+    };
+    if let Some(p) = forced {
+        picker.set_protocol_type(p);
+    }
+    (picker, warning)
 }
 
 async fn event_loop(
@@ -102,6 +142,9 @@ async fn event_loop(
         if app.quitting && deadline.is_none() {
             deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
         }
+        let tick = app
+            .animating
+            .then(|| tokio::time::Instant::now() + ANIMATION_TICK);
         tokio::select! {
             ev = input.next() => match ev {
                 Some(Ok(ev)) => app.handle(Event::Input(ev)),
@@ -112,6 +155,7 @@ async fn event_loop(
                 Some(ev) => app.handle(ev),
                 None => return Err("TDLib receiver stopped".to_owned()),
             },
+            _ = tokio::time::sleep_until(tick.unwrap_or_else(tokio::time::Instant::now)), if tick.is_some() => {}
             _ = tokio::time::sleep_until(deadline.unwrap_or_else(tokio::time::Instant::now)), if deadline.is_some() => {
                 return Err("TDLib did not close within 5 s; database may need recovery on next start".to_owned());
             }

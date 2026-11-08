@@ -2,13 +2,17 @@ use std::ffi::{CStr, CString, c_char};
 use std::future::Future;
 use std::path::Path;
 
-use tdlib_rs::enums::{self, ChatList, MessageContent, MessageSender, TextEntityType, Update};
+use tdlib_rs::enums::{
+    self, ChatList, MessageContent, MessageSender, StickerFormat, TextEntityType, ThumbnailFormat,
+    Update,
+};
 use tdlib_rs::types;
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::format::duration;
 use crate::model::{
-    ChatInfo, ChatKind, Entity, EntityKind, ListId, Msg, Position, RichText, SendState, Sender,
+    Attachment, ChatInfo, ChatKind, Decode, Entity, EntityKind, FileRef, ListId, MediaKind, Msg,
+    Position, RichText, SendState, Sender, Visual,
 };
 
 unsafe extern "C" {
@@ -30,6 +34,17 @@ pub enum Event {
     },
     AuthError(String),
     Error(String),
+    File(FileRef),
+    DownloadFailed {
+        file_id: i32,
+        error: String,
+    },
+    Image(crate::media::Done),
+    Player {
+        token: u64,
+        result: Result<(), String>,
+    },
+    Saved(Result<String, String>),
 }
 
 fn execute(request: &serde_json::Value) -> Result<(), String> {
@@ -358,10 +373,30 @@ impl Td {
         });
     }
 
-    pub fn delete_message(&self, chat_id: i64, message_id: i64, revoke: bool) {
+    pub fn delete_messages(&self, chat_id: i64, message_ids: Vec<i64>, revoke: bool) {
         let c = self.client_id;
         self.spawn("delete", false, async move {
-            tdlib_rs::functions::delete_messages(chat_id, vec![message_id], revoke, c).await
+            tdlib_rs::functions::delete_messages(chat_id, message_ids, revoke, c).await
+        });
+    }
+
+    pub fn sender(&self) -> UnboundedSender<Event> {
+        self.tx.clone()
+    }
+
+    pub fn download_file(&self, file_id: i32, priority: i32) {
+        let c = self.client_id;
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let ev =
+                match tdlib_rs::functions::download_file(file_id, priority, 0, 0, false, c).await {
+                    Ok(enums::File::File(f)) => Event::File(convert_file(&f)),
+                    Err(e) => Event::DownloadFailed {
+                        file_id,
+                        error: friendly_error(&e),
+                    },
+                };
+            let _ = tx.send(ev);
         });
     }
 }
@@ -473,92 +508,359 @@ pub fn convert_text(t: types::FormattedText) -> RichText {
     }
 }
 
-fn with_caption(label: String, caption: types::FormattedText) -> (Option<String>, RichText) {
-    (Some(label), convert_text(caption))
+pub struct Content {
+    pub media: Option<String>,
+    pub body: RichText,
+    pub attachments: Vec<Attachment>,
 }
 
-pub fn convert_content(content: MessageContent) -> (Option<String>, RichText) {
+impl Content {
+    fn label(label: impl Into<String>) -> Self {
+        Self {
+            media: Some(label.into()),
+            body: RichText::default(),
+            attachments: Vec::new(),
+        }
+    }
+
+    fn captioned(label: impl Into<String>, caption: types::FormattedText, att: Attachment) -> Self {
+        Self {
+            media: Some(label.into()),
+            body: convert_text(caption),
+            attachments: vec![att],
+        }
+    }
+}
+
+pub fn convert_file(f: &types::File) -> FileRef {
+    FileRef {
+        id: f.id,
+        size: if f.size > 0 { f.size } else { f.expected_size },
+        path: f.local.path.clone(),
+        done: f.local.is_downloading_completed,
+        active: f.local.is_downloading_active,
+        downloaded: f.local.downloaded_size,
+    }
+}
+
+fn b64(data: &str) -> Vec<u8> {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .unwrap_or_default()
+}
+
+fn mini(m: &Option<types::Minithumbnail>) -> Option<std::sync::Arc<[u8]>> {
+    let m = m.as_ref()?;
+    let bytes = b64(&m.data);
+    (!bytes.is_empty()).then(|| bytes.into())
+}
+
+fn thumb_visual(t: &Option<types::Thumbnail>) -> Option<Visual> {
+    let t = t.as_ref()?;
+    let decode = match t.format {
+        ThumbnailFormat::Jpeg
+        | ThumbnailFormat::Png
+        | ThumbnailFormat::Webp
+        | ThumbnailFormat::Gif => Decode::Raster,
+        ThumbnailFormat::Tgs => Decode::Tgs,
+        ThumbnailFormat::Mpeg4 | ThumbnailFormat::Webm => Decode::Video,
+    };
+    Some(Visual {
+        file: convert_file(&t.file),
+        decode,
+        width: t.width,
+        height: t.height,
+    })
+}
+
+const INLINE_PHOTO_PX: i32 = 640;
+const SMALL_VIDEO_BYTES: i64 = 4 * 1024 * 1024;
+
+pub fn photo_attachment(p: &types::Photo) -> Option<Attachment> {
+    let mut sizes: Vec<&types::PhotoSize> = p.sizes.iter().collect();
+    sizes.sort_by_key(|s| i64::from(s.width) * i64::from(s.height));
+    let largest = *sizes.last()?;
+    let inline = sizes
+        .iter()
+        .find(|s| s.width.max(s.height) >= INLINE_PHOTO_PX)
+        .copied()
+        .unwrap_or(largest);
+    let visual = |s: &types::PhotoSize| Visual {
+        file: convert_file(&s.photo),
+        decode: Decode::Raster,
+        width: s.width,
+        height: s.height,
+    };
+    let mut att = Attachment::new(MediaKind::Photo, convert_file(&largest.photo));
+    att.width = largest.width;
+    att.height = largest.height;
+    att.preview = Some(visual(inline));
+    att.full = Some(visual(largest));
+    att.mini = mini(&p.minithumbnail);
+    att.name = "photo.jpg".to_owned();
+    Some(att)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn video_like(
+    kind: MediaKind,
+    file: &types::File,
+    width: i32,
+    height: i32,
+    duration: i32,
+    name: &str,
+    mime: &str,
+    minithumb: &Option<types::Minithumbnail>,
+    thumbnail: &Option<types::Thumbnail>,
+) -> Attachment {
+    let mut att = Attachment::new(kind, convert_file(file));
+    att.width = width;
+    att.height = height;
+    att.duration = duration;
+    att.name = name.to_owned();
+    att.mime = mime.to_owned();
+    att.mini = mini(minithumb);
+    let thumb = thumb_visual(thumbnail).filter(|t| t.decode == Decode::Raster);
+    att.preview = thumb.or_else(|| {
+        (att.file.size > 0 && att.file.size <= SMALL_VIDEO_BYTES).then(|| Visual {
+            file: att.file.clone(),
+            decode: Decode::Video,
+            width,
+            height,
+        })
+    });
+    att.full = att.preview.clone();
+    att
+}
+
+pub fn sticker_attachment(st: &types::Sticker) -> Attachment {
+    let decode = match st.format {
+        StickerFormat::Webp => Decode::Raster,
+        StickerFormat::Tgs => Decode::Tgs,
+        StickerFormat::Webm => Decode::Video,
+    };
+    let mut att = Attachment::new(MediaKind::Sticker, convert_file(&st.sticker));
+    att.width = st.width;
+    att.height = st.height;
+    att.name = st.emoji.clone();
+    let main = Visual {
+        file: att.file.clone(),
+        decode,
+        width: st.width,
+        height: st.height,
+    };
+    att.preview = match decode {
+        Decode::Video => thumb_visual(&st.thumbnail)
+            .filter(|t| t.decode == Decode::Raster)
+            .or(Some(main.clone())),
+        _ => Some(main.clone()),
+    };
+    att.full = Some(main);
+    att
+}
+
+pub fn convert_content(content: MessageContent) -> Content {
     use MessageContent as C;
     match content {
-        C::MessageText(t) => (None, convert_text(t.text)),
-        C::MessagePhoto(p) => with_caption("[photo]".to_owned(), p.caption),
+        C::MessageText(t) => Content {
+            media: None,
+            body: convert_text(t.text),
+            attachments: Vec::new(),
+        },
+        C::MessagePhoto(p) => match photo_attachment(&p.photo) {
+            Some(att) => Content::captioned("[photo]", p.caption, att),
+            None => Content {
+                media: Some("[photo]".to_owned()),
+                body: convert_text(p.caption),
+                attachments: Vec::new(),
+            },
+        },
         C::MessageVideo(v) => {
-            with_caption(format!("[video {}]", duration(v.video.duration)), v.caption)
+            let x = &v.video;
+            let att = video_like(
+                MediaKind::Video,
+                &x.video,
+                x.width,
+                x.height,
+                x.duration,
+                &x.file_name,
+                &x.mime_type,
+                &x.minithumbnail,
+                &x.thumbnail,
+            );
+            Content::captioned(format!("[video {}]", duration(x.duration)), v.caption, att)
         }
-        C::MessageAnimation(a) => with_caption("[GIF]".to_owned(), a.caption),
-        C::MessageDocument(d) => {
-            with_caption(format!("[file {}]", d.document.file_name), d.caption)
+        C::MessageAnimation(a) => {
+            let x = &a.animation;
+            let att = video_like(
+                MediaKind::Animation,
+                &x.animation,
+                x.width,
+                x.height,
+                x.duration,
+                &x.file_name,
+                &x.mime_type,
+                &x.minithumbnail,
+                &x.thumbnail,
+            );
+            Content::captioned("[GIF]", a.caption, att)
         }
-        C::MessageAudio(a) => {
-            let name = match (a.audio.performer.is_empty(), a.audio.title.is_empty()) {
-                (false, false) => format!("{} – {}", a.audio.performer, a.audio.title),
-                (true, false) => a.audio.title.clone(),
-                _ => a.audio.file_name.clone(),
-            };
-            with_caption(
-                format!("[audio {name} {}]", duration(a.audio.duration)),
-                a.caption,
+        C::MessageVideoNote(v) => {
+            let x = &v.video_note;
+            let mut att = video_like(
+                MediaKind::VideoNote,
+                &x.video,
+                x.length,
+                x.length,
+                x.duration,
+                "video_note.mp4",
+                "video/mp4",
+                &x.minithumbnail,
+                &x.thumbnail,
+            );
+            if att.preview.is_none() {
+                att.preview = Some(Visual {
+                    file: att.file.clone(),
+                    decode: Decode::Video,
+                    width: x.length,
+                    height: x.length,
+                });
+                att.full = att.preview.clone();
+            }
+            Content::captioned(
+                format!("[video message {}]", duration(x.duration)),
+                types::FormattedText::default(),
+                att,
             )
         }
-        C::MessageVoiceNote(v) => with_caption(
-            format!("[voice {}]", duration(v.voice_note.duration)),
-            v.caption,
-        ),
-        C::MessageVideoNote(v) => (
-            Some(format!("[video note {}]", duration(v.video_note.duration))),
-            RichText::default(),
-        ),
-        C::MessageSticker(s) => (
-            Some(format!("[sticker {}]", s.sticker.emoji)),
-            RichText::default(),
-        ),
-        C::MessageAnimatedEmoji(e) => (None, RichText::plain(e.emoji)),
-        C::MessageLocation(_) => (Some("[location]".to_owned()), RichText::default()),
-        C::MessageVenue(_) => (Some("[venue]".to_owned()), RichText::default()),
-        C::MessageContact(c) => (
-            Some(format!(
-                "[contact {} {}]",
-                c.contact.first_name, c.contact.phone_number
-            )),
-            RichText::default(),
-        ),
-        C::MessagePoll(p) => (
-            Some(format!("[poll: {}]", p.poll.question.text)),
-            RichText::default(),
-        ),
-        C::MessageDice(d) => (Some(format!("[dice {}]", d.emoji)), RichText::default()),
-        C::MessageCall(c) => (
-            Some(format!("[call {}]", duration(c.duration))),
-            RichText::default(),
-        ),
-        C::MessagePinMessage(_) => (Some("[pinned a message]".to_owned()), RichText::default()),
-        C::MessageChatAddMembers(_) => (Some("[added members]".to_owned()), RichText::default()),
-        C::MessageChatJoinByLink | C::MessageChatJoinByRequest => {
-            (Some("[joined the chat]".to_owned()), RichText::default())
+        C::MessageVoiceNote(v) => {
+            let x = &v.voice_note;
+            let mut att = Attachment::new(MediaKind::Voice, convert_file(&x.voice));
+            att.duration = x.duration;
+            att.mime = x.mime_type.clone();
+            att.name = "voice.ogg".to_owned();
+            att.waveform = crate::model::decode_waveform(&b64(&x.waveform));
+            Content::captioned(format!("[voice {}]", duration(x.duration)), v.caption, att)
         }
-        C::MessageChatDeleteMember(_) => (Some("[left the chat]".to_owned()), RichText::default()),
-        C::MessageChatChangeTitle(t) => (
-            Some(format!("[changed title to {}]", t.title)),
-            RichText::default(),
-        ),
-        C::MessageChatChangePhoto(_) => (Some("[changed photo]".to_owned()), RichText::default()),
-        C::MessageExpiredPhoto => (Some("[expired photo]".to_owned()), RichText::default()),
-        C::MessageExpiredVideo => (Some("[expired video]".to_owned()), RichText::default()),
-        C::MessageExpiredVideoNote => {
-            (Some("[expired video note]".to_owned()), RichText::default())
+        C::MessageAudio(a) => {
+            let x = &a.audio;
+            let title = match (x.performer.is_empty(), x.title.is_empty()) {
+                (false, false) => format!("{} – {}", x.performer, x.title),
+                (true, false) => x.title.clone(),
+                _ => x.file_name.clone(),
+            };
+            let mut att = Attachment::new(MediaKind::Audio, convert_file(&x.audio));
+            att.duration = x.duration;
+            att.mime = x.mime_type.clone();
+            att.name = if x.file_name.is_empty() {
+                format!("{title}.mp3")
+            } else {
+                x.file_name.clone()
+            };
+            Content::captioned(format!("♪ {title}"), a.caption, att)
         }
-        C::MessageExpiredVoiceNote => (Some("[expired voice]".to_owned()), RichText::default()),
-        C::MessageScreenshotTaken => (Some("[took a screenshot]".to_owned()), RichText::default()),
+        C::MessageDocument(d) => {
+            let x = &d.document;
+            let mut att = Attachment::new(MediaKind::Document, convert_file(&x.document));
+            att.name = x.file_name.clone();
+            att.mime = x.mime_type.clone();
+            att.mini = mini(&x.minithumbnail);
+            att.preview = thumb_visual(&x.thumbnail).filter(|t| t.decode == Decode::Raster);
+            if let Some(t) = &att.preview {
+                att.width = t.width;
+                att.height = t.height;
+            }
+            att.full = att.preview.clone();
+            Content::captioned(format!("[file {}]", x.file_name), d.caption, att)
+        }
+        C::MessageSticker(s) => Content {
+            media: Some(format!("[sticker {}]", s.sticker.emoji)),
+            body: RichText::default(),
+            attachments: vec![sticker_attachment(&s.sticker)],
+        },
+        C::MessageAnimatedEmoji(e) => Content {
+            media: None,
+            body: RichText::plain(e.emoji),
+            attachments: Vec::new(),
+        },
+        C::MessageLocation(l) => Content::label(format!(
+            "📍 {}location {:.5}, {:.5}",
+            if l.live_period > 0 { "live " } else { "" },
+            l.location.latitude,
+            l.location.longitude
+        )),
+        C::MessageVenue(v) => Content::label(format!(
+            "📍 {} · {} ({:.5}, {:.5})",
+            v.venue.title, v.venue.address, v.venue.location.latitude, v.venue.location.longitude
+        )),
+        C::MessageContact(c) => Content::label(format!(
+            "👤 {} {} · {}",
+            c.contact.first_name, c.contact.last_name, c.contact.phone_number
+        )),
+        C::MessagePoll(p) => {
+            let poll = &p.poll;
+            let mut text = format!(
+                "📊 {}{}",
+                poll.question.text,
+                if poll.is_closed { " (closed)" } else { "" }
+            );
+            for o in &poll.options {
+                let mark = if o.is_chosen { '●' } else { '○' };
+                text.push_str(&format!(
+                    "\n  {mark} {} — {}%",
+                    o.text.text, o.vote_percentage
+                ));
+            }
+            text.push_str(&format!("\n  {} votes", poll.total_voter_count));
+            Content::label(text)
+        }
+        C::MessageDice(d) => Content::label(format!("{} rolled {}", d.emoji, d.value)),
+        C::MessageGame(g) => Content::label(format!("🎮 game: {}", g.game.title)),
+        C::MessageCall(c) => Content::label(format!("📞 call {}", duration(c.duration))),
+        C::MessagePinMessage(_) => Content::label("pinned a message"),
+        C::MessageChatAddMembers(m) => Content::label(if m.member_user_ids.len() == 1 {
+            "added a member".to_owned()
+        } else {
+            format!("added {} members", m.member_user_ids.len())
+        }),
+        C::MessageChatJoinByLink | C::MessageChatJoinByRequest => Content::label("joined the chat"),
+        C::MessageChatDeleteMember(_) => Content::label("left the chat"),
+        C::MessageChatChangeTitle(t) => Content::label(format!("changed title to «{}»", t.title)),
+        C::MessageChatChangePhoto(_) => Content::label("changed the chat photo"),
+        C::MessageChatDeletePhoto => Content::label("removed the chat photo"),
+        C::MessageBasicGroupChatCreate(_) | C::MessageSupergroupChatCreate(_) => {
+            Content::label("created the group")
+        }
+        C::MessageForumTopicCreated(t) => Content::label(format!("created topic «{}»", t.name)),
+        C::MessageContactRegistered => Content::label("joined Telegram"),
+        C::MessageScreenshotTaken => Content::label("took a screenshot"),
+        C::MessageExpiredPhoto => Content::label("[expired photo]"),
+        C::MessageExpiredVideo => Content::label("[expired video]"),
+        C::MessageExpiredVideoNote => Content::label("[expired video message]"),
+        C::MessageExpiredVoiceNote => Content::label("[expired voice message]"),
+        C::MessageUnsupported => Content::label("[message not supported, open an official app]"),
         other => {
             let name = format!("{other:?}");
             let name = name
-                .split('(')
+                .split(['(', ' ', '{'])
                 .next()
                 .unwrap_or("message")
                 .trim_start_matches("Message");
-            (Some(format!("[{name}]")), RichText::default())
+            Content::label(format!("[{}]", split_camel(name)))
         }
     }
+}
+
+pub fn split_camel(name: &str) -> String {
+    let mut out = String::new();
+    for (i, ch) in name.chars().enumerate() {
+        if ch.is_uppercase() && i > 0 {
+            out.push(' ');
+        }
+        out.extend(ch.to_lowercase());
+    }
+    out
 }
 
 pub fn convert_sender(s: &MessageSender) -> Sender {
@@ -569,7 +871,7 @@ pub fn convert_sender(s: &MessageSender) -> Sender {
 }
 
 pub fn convert_message(m: types::Message) -> Msg {
-    let (media, body) = convert_content(m.content);
+    let content = convert_content(m.content);
     let state = match m.sending_state {
         None => SendState::Sent,
         Some(enums::MessageSendingState::Pending(_)) => SendState::Pending,
@@ -589,8 +891,10 @@ pub fn convert_message(m: types::Message) -> Msg {
             }
             _ => None,
         },
-        media,
-        body,
+        album: m.media_album_id,
+        media: content.media,
+        attachments: content.attachments,
+        body: content.body,
     }
 }
 
@@ -602,5 +906,199 @@ pub fn user_name(u: &types::User) -> String {
         "Deleted Account".to_owned()
     } else {
         name
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{Value, json};
+
+    fn file(id: i32, size: i64, done: bool) -> Value {
+        json!({
+            "@type": "file", "id": id, "size": size, "expected_size": size,
+            "local": {
+                "@type": "localFile",
+                "path": if done { format!("/tmp/f{id}") } else { String::new() },
+                "can_be_downloaded": true, "can_be_deleted": false,
+                "is_downloading_active": false, "is_downloading_completed": done,
+                "download_offset": 0, "downloaded_prefix_size": 0,
+                "downloaded_size": if done { size } else { 0 }
+            },
+            "remote": {
+                "@type": "remoteFile", "id": "r", "unique_id": "u",
+                "is_uploading_active": false, "is_uploading_completed": true, "uploaded_size": size
+            }
+        })
+    }
+
+    fn thumb(format: &str, id: i32) -> Value {
+        json!({"@type": "thumbnail", "format": {"@type": format}, "width": 320, "height": 180, "file": file(id, 5000, false)})
+    }
+
+    fn caption(text: &str) -> Value {
+        json!({"@type": "formattedText", "text": text, "entities": []})
+    }
+
+    fn content(v: Value) -> Content {
+        convert_content(serde_json::from_value(v).expect("valid MessageContent JSON"))
+    }
+
+    #[test]
+    fn photo_picks_inline_and_full_sizes() {
+        let size = |t: &str, id: i32, w: i32, h: i32| json!({"@type": "photoSize", "type": t, "photo": file(id, i64::from(w) * 10, false), "width": w, "height": h, "progressive_sizes": []});
+        let c = content(json!({
+            "@type": "messagePhoto",
+            "photo": {
+                "@type": "photo", "has_stickers": false,
+                "minithumbnail": {"@type": "minithumbnail", "width": 40, "height": 30, "data": "AQID"},
+                "sizes": [size("m", 1, 320, 240), size("y", 3, 1280, 960), size("x", 2, 800, 600)]
+            },
+            "caption": caption("look"),
+            "show_caption_above_media": false, "has_spoiler": false, "is_secret": false
+        }));
+        assert_eq!(c.body.text, "look");
+        let a = &c.attachments[0];
+        assert_eq!(a.kind, MediaKind::Photo);
+        assert_eq!(a.preview.as_ref().unwrap().file.id, 2);
+        assert_eq!(a.full.as_ref().unwrap().file.id, 3);
+        assert_eq!(a.file.id, 3);
+        assert_eq!((a.width, a.height), (1280, 960));
+        assert_eq!(a.mini.as_deref(), Some(&[1u8, 2, 3][..]));
+    }
+
+    #[test]
+    fn video_uses_image_thumbnail_or_small_file() {
+        let video = |thumbnail: Value, size: i64| {
+            json!({
+                "@type": "messageVideo",
+                "video": {
+                    "@type": "video", "duration": 83, "width": 1280, "height": 720,
+                    "file_name": "clip.mp4", "mime_type": "video/mp4", "has_stickers": false,
+                    "supports_streaming": true, "minithumbnail": null, "thumbnail": thumbnail,
+                    "video": file(9, size, false)
+                },
+                "alternative_videos": [], "storyboards": [], "cover": null, "start_timestamp": 0,
+                "caption": caption(""), "show_caption_above_media": false,
+                "has_spoiler": false, "is_secret": false
+            })
+        };
+        let c = content(video(thumb("thumbnailFormatJpeg", 10), 50_000_000));
+        let a = &c.attachments[0];
+        assert_eq!(a.kind, MediaKind::Video);
+        assert_eq!(a.duration, 83);
+        assert_eq!(a.preview.as_ref().unwrap().file.id, 10);
+        assert_eq!(a.preview.as_ref().unwrap().decode, Decode::Raster);
+        assert_eq!(c.media.as_deref(), Some("[video 1:23]"));
+        let big = content(video(thumb("thumbnailFormatMpeg4", 10), 50_000_000));
+        assert!(big.attachments[0].preview.is_none());
+        let small = content(video(Value::Null, 300_000));
+        let p = small.attachments[0].preview.as_ref().unwrap();
+        assert_eq!((p.file.id, p.decode), (9, Decode::Video));
+    }
+
+    #[test]
+    fn stickers_map_formats() {
+        let sticker = |format: &str, thumbnail: Value| {
+            json!({
+                "@type": "messageSticker", "is_premium": false,
+                "sticker": {
+                    "@type": "sticker", "id": "1", "set_id": "2", "width": 512, "height": 512,
+                    "emoji": "😀", "format": {"@type": format},
+                    "full_type": {"@type": "stickerFullTypeRegular", "premium_animation": null},
+                    "thumbnail": thumbnail, "sticker": file(5, 30_000, true)
+                }
+            })
+        };
+        let tgs = content(sticker("stickerFormatTgs", Value::Null));
+        let a = &tgs.attachments[0];
+        assert_eq!(a.kind, MediaKind::Sticker);
+        assert_eq!(a.preview.as_ref().unwrap().decode, Decode::Tgs);
+        assert_eq!(a.file.local(), Some("/tmp/f5"));
+        assert_eq!(a.name, "😀");
+        let webm = content(sticker(
+            "stickerFormatWebm",
+            thumb("thumbnailFormatWebp", 6),
+        ));
+        let a = &webm.attachments[0];
+        assert_eq!(a.preview.as_ref().unwrap().file.id, 6);
+        assert_eq!(a.full.as_ref().unwrap().decode, Decode::Video);
+        let webm_bare = content(sticker("stickerFormatWebm", Value::Null));
+        assert_eq!(
+            webm_bare.attachments[0].preview.as_ref().unwrap().decode,
+            Decode::Video
+        );
+        let webp = content(sticker("stickerFormatWebp", Value::Null));
+        assert_eq!(
+            webp.attachments[0].preview.as_ref().unwrap().decode,
+            Decode::Raster
+        );
+    }
+
+    #[test]
+    fn voice_document_and_note() {
+        let voice = content(json!({
+            "@type": "messageVoiceNote",
+            "voice_note": {
+                "@type": "voiceNote", "duration": 7, "waveform": "/wE=", "mime_type": "audio/ogg",
+                "speech_recognition_result": null, "voice": file(1, 9000, false)
+            },
+            "caption": caption(""), "is_listened": false
+        }));
+        let a = &voice.attachments[0];
+        assert_eq!(a.kind, MediaKind::Voice);
+        assert!(!a.is_visual());
+        assert_eq!(a.waveform, vec![31, 15, 0]);
+        let doc = content(json!({
+            "@type": "messageDocument",
+            "document": {
+                "@type": "document", "file_name": "report.pdf", "mime_type": "application/pdf",
+                "minithumbnail": null, "thumbnail": null, "document": file(4, 123_456, false)
+            },
+            "caption": caption("q3")
+        }));
+        let a = &doc.attachments[0];
+        assert_eq!(
+            (a.kind, a.name.as_str()),
+            (MediaKind::Document, "report.pdf")
+        );
+        assert!(!a.viewable());
+        assert_eq!(doc.body.text, "q3");
+        let note = content(json!({
+            "@type": "messageVideoNote",
+            "video_note": {
+                "@type": "videoNote", "duration": 12, "waveform": "", "length": 384,
+                "minithumbnail": null, "thumbnail": thumb("thumbnailFormatJpeg", 8),
+                "speech_recognition_result": null, "video": file(7, 900_000, false)
+            },
+            "is_viewed": false, "is_secret": false
+        }));
+        let a = &note.attachments[0];
+        assert_eq!(a.kind, MediaKind::VideoNote);
+        assert_eq!((a.width, a.height), (384, 384));
+        assert_eq!(a.preview.as_ref().unwrap().file.id, 8);
+    }
+
+    #[test]
+    fn other_content_is_one_readable_line() {
+        let loc = content(json!({
+            "@type": "messageLocation",
+            "location": {"@type": "location", "latitude": 55.75, "longitude": 37.62, "horizontal_accuracy": 0.0},
+            "live_period": 0, "expires_in": 0, "heading": 0, "proximity_alert_radius": 0
+        }));
+        assert_eq!(loc.media.as_deref(), Some("📍 location 55.75000, 37.62000"));
+        let pin = content(json!({"@type": "messagePinMessage", "message_id": 5}));
+        assert_eq!(pin.media.as_deref(), Some("pinned a message"));
+        let join = content(json!({"@type": "messageChatJoinByLink"}));
+        assert_eq!(join.media.as_deref(), Some("joined the chat"));
+        let dice = content(json!({
+            "@type": "messageDice", "initial_state": null, "final_state": null,
+            "emoji": "🎲", "value": 4, "success_animation_frame_number": 0
+        }));
+        assert_eq!(dice.media.as_deref(), Some("🎲 rolled 4"));
+        let theme = content(json!({"@type": "messageScreenshotTaken"}));
+        assert_eq!(theme.media.as_deref(), Some("took a screenshot"));
+        assert_eq!(split_camel("ChatSetTheme"), "chat set theme");
+        assert!(loc.attachments.is_empty());
     }
 }

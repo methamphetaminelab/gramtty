@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use tdlib_rs::enums::{AuthorizationState, ConnectionState, OptionValue, Update};
@@ -8,7 +9,12 @@ use crate::config::ApiCredentials;
 use crate::format;
 use crate::input::{Edit, TextInput};
 use crate::keymap::{Action, Chord, Feed, Keymap};
-use crate::model::{self, ChatInfo, History, ListId, MAX_WINDOW, Msg, Sender};
+use crate::media::Media;
+use crate::model::{
+    self, Attachment, ChatInfo, Decode, FileRef, History, ListId, MAX_WINDOW, MediaKind, Msg,
+    Sender,
+};
+use crate::player;
 use crate::td::{self, Event, Td};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +62,24 @@ pub enum MenuAction {
     OpenChat,
     MarkRead,
     LoadMore,
+    Play,
+    View,
+    Save,
+    OpenExternal,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FileJob {
+    Play(MediaKind, (i64, usize)),
+    Open,
+    Save(String),
+}
+
+pub struct Playing {
+    pub token: u64,
+    pub target: (i64, usize),
+    pub label: String,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
 }
 
 pub struct MenuItem {
@@ -72,7 +96,12 @@ pub enum Popup {
     },
     ConfirmDelete {
         chat_id: i64,
-        message_id: i64,
+        message_ids: Vec<i64>,
+    },
+    Viewer {
+        chat_id: i64,
+        items: Vec<(i64, usize)>,
+        pos: usize,
     },
     Switcher {
         input: TextInput,
@@ -134,10 +163,23 @@ pub struct App {
     pub pending: Vec<Chord>,
     pub popup: Option<Popup>,
     pub status: Option<(String, bool)>,
+    pub media: Media,
+    pub playing: Option<Playing>,
+    next_token: u64,
+    file_jobs: Vec<(i32, FileJob)>,
+    pub anim_start: Instant,
+    pub animating: bool,
 }
 
 impl App {
-    pub fn new(td: Td, creds: ApiCredentials, data_dir: PathBuf, keymap: Keymap) -> Self {
+    pub fn new(
+        td: Td,
+        creds: ApiCredentials,
+        data_dir: PathBuf,
+        keymap: Keymap,
+        picker: ratatui_image::picker::Picker,
+    ) -> Self {
+        let media = Media::new(picker, td.sender());
         Self {
             td,
             creds,
@@ -177,6 +219,12 @@ impl App {
             pending: Vec::new(),
             popup: None,
             status: None,
+            media,
+            playing: None,
+            next_token: 0,
+            file_jobs: Vec::new(),
+            anim_start: Instant::now(),
+            animating: false,
         }
     }
 
@@ -226,7 +274,138 @@ impl App {
                 }
             }
             Event::Error(e) => self.set_status(e, true),
+            Event::File(f) => self.on_file(f),
+            Event::DownloadFailed { file_id, error } => {
+                self.media.download_failed(file_id, error.clone());
+                let had_job = self.file_jobs.iter().any(|(id, _)| *id == file_id);
+                self.file_jobs.retain(|(id, _)| *id != file_id);
+                if had_job {
+                    self.set_status(format!("download failed: {error}"), true);
+                }
+            }
+            Event::Image(done) => self.media.on_done(done),
+            Event::Player { token, result } => {
+                if self.playing.as_ref().is_some_and(|p| p.token == token) {
+                    self.playing = None;
+                }
+                if let Err(e) = result {
+                    self.set_status(e, true);
+                }
+            }
+            Event::Saved(result) => match result {
+                Ok(path) => self.set_status(format!("saved to {path}"), false),
+                Err(e) => self.set_status(format!("save failed: {e}"), true),
+            },
         }
+    }
+
+    fn on_file(&mut self, f: FileRef) {
+        let id = f.id;
+        if !self.media.on_file(f) {
+            return;
+        }
+        let Some(path) = self
+            .media
+            .file(&FileRef {
+                id,
+                ..FileRef::default()
+            })
+            .local()
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let jobs: Vec<FileJob> = self
+            .file_jobs
+            .iter()
+            .filter(|(fid, _)| *fid == id)
+            .map(|(_, j)| j.clone())
+            .collect();
+        self.file_jobs.retain(|(fid, _)| *fid != id);
+        for job in jobs {
+            self.run_file_job(&path, job);
+        }
+    }
+
+    fn run_file_job(&mut self, path: &str, job: FileJob) {
+        match job {
+            FileJob::Play(kind, target) => {
+                self.stop_playback();
+                self.next_token += 1;
+                let token = self.next_token;
+                let label = std::path::Path::new(path)
+                    .file_name()
+                    .map_or_else(|| "media".to_owned(), |n| n.to_string_lossy().into_owned());
+                match player::spawn_mpv(player::mpv_args(kind, path), token, self.td.sender()) {
+                    Ok(stop) => {
+                        let audio = matches!(kind, MediaKind::Voice | MediaKind::Audio);
+                        self.playing = Some(Playing {
+                            token,
+                            target,
+                            label: label.clone(),
+                            stop: Some(stop),
+                        });
+                        if audio {
+                            self.set_status(format!("▶ playing {label} (x to stop)"), false);
+                        } else {
+                            self.set_status(format!("opened {label} in mpv"), false);
+                        }
+                    }
+                    Err(e) => self.set_status(e, true),
+                }
+            }
+            FileJob::Open => match player::xdg_open(path) {
+                Ok(()) => self.set_status("opened with xdg-open", false),
+                Err(e) => self.set_status(e, true),
+            },
+            FileJob::Save(name) => {
+                let tx = self.td.sender();
+                let src = PathBuf::from(path);
+                let dir = match player::downloads_dir() {
+                    Ok(d) => d,
+                    Err(e) => {
+                        self.set_status(format!("save failed: {e}"), true);
+                        return;
+                    }
+                };
+                tokio::task::spawn_blocking(move || {
+                    let result =
+                        player::save_copy(&src, &dir, &name).map(|p| p.display().to_string());
+                    let _ = tx.send(Event::Saved(result));
+                });
+                self.set_status("saving...", false);
+            }
+        }
+    }
+
+    pub fn stop_playback(&mut self) {
+        if let Some(mut p) = self.playing.take()
+            && let Some(stop) = p.stop.take()
+        {
+            let _ = stop.send(());
+        }
+    }
+
+    fn queue_file_job(&mut self, file: &FileRef, name: &str, job: FileJob) {
+        let file = self.media.file(file);
+        if let Some(path) = file.local().map(str::to_owned) {
+            self.run_file_job(&path, job);
+            return;
+        }
+        if file.id == 0 {
+            self.set_status("this file is not available", true);
+            return;
+        }
+        if !self.file_jobs.contains(&(file.id, job.clone())) {
+            self.file_jobs.push((file.id, job));
+        }
+        self.media.force_download(file.id, 32);
+        let size = if file.size > 0 {
+            format!(" ({})", format::file_size(file.size))
+        } else {
+            String::new()
+        };
+        self.set_status(format!("downloading {name}{size}..."), false);
     }
 
     fn on_paste(&mut self, text: &str) {
@@ -357,9 +536,10 @@ impl App {
                     .get_mut(&u.chat_id)
                     .and_then(|h| h.get_mut(u.message_id))
                 {
-                    let (media, body) = td::convert_content(u.new_content);
-                    m.media = media;
-                    m.body = body;
+                    let content = td::convert_content(u.new_content);
+                    m.media = content.media;
+                    m.attachments = content.attachments;
+                    m.body = content.body;
                 }
             }
             Update::MessageEdited(u) => {
@@ -371,6 +551,7 @@ impl App {
                     m.edited = u.edit_date > 0;
                 }
             }
+            Update::File(u) => self.on_file(td::convert_file(&u.file)),
             Update::DeleteMessages(u) => {
                 if !u.is_permanent || u.from_cache {
                     return;
@@ -522,6 +703,8 @@ impl App {
         self.pending.clear();
         self.popup = None;
         self.status = None;
+        self.file_jobs.clear();
+        self.stop_playback();
     }
 
     pub fn log_out(&mut self) {
@@ -540,6 +723,7 @@ impl App {
             return;
         }
         self.quitting = true;
+        self.stop_playback();
         if let Some(chat) = self.open_chat {
             self.td.close_chat(chat);
         }
@@ -737,6 +921,8 @@ impl App {
             Action::DeleteMessage => self.message_action(MenuAction::Delete),
             Action::EditMessage => self.message_action(MenuAction::Edit),
             Action::OpenMessageUrl => self.message_action(MenuAction::OpenUrl),
+            Action::PlayMedia => self.message_action(MenuAction::Play),
+            Action::ViewAttachment => self.message_action(MenuAction::View),
             Action::ToggleFolderPane => {
                 self.show_folders = !self.show_folders;
                 self.fix_focus();
@@ -872,17 +1058,23 @@ impl App {
         let Some(chat_id) = self.open_chat else {
             return;
         };
-        let len = self.histories.get(&chat_id).map_or(0, History::len);
-        if len == 0 {
+        let Some(h) = self.histories.get(&chat_id) else {
+            return;
+        };
+        let groups = model::groups(h.msgs());
+        if groups.is_empty() {
             return;
         }
         self.bottom_offset = 0;
-        let cur = self.msg_sel.unwrap_or(len);
+        let cur = match self.msg_sel {
+            Some(i) => model::group_of(&groups, i),
+            None => groups.len(),
+        };
         let next = cur as isize + delta;
-        if next >= len as isize {
+        if next >= groups.len() as isize {
             self.msg_sel = None;
         } else {
-            self.msg_sel = Some(next.max(0) as usize);
+            self.msg_sel = Some(groups[next.max(0) as usize].start);
         }
         self.mark_read();
         self.maybe_load_older();
@@ -1095,9 +1287,106 @@ impl App {
         }
     }
 
+    pub fn selected_group(&self) -> Vec<&Msg> {
+        let Some(h) = self.open_chat.and_then(|c| self.histories.get(&c)) else {
+            return Vec::new();
+        };
+        let Some(sel) = self.msg_sel.filter(|s| *s < h.len()) else {
+            return Vec::new();
+        };
+        let groups = model::groups(h.msgs());
+        let g = groups[model::group_of(&groups, sel)].clone();
+        h.msgs()[g].iter().collect()
+    }
+
     pub fn selected_message(&self) -> Option<&Msg> {
-        let h = self.histories.get(&self.open_chat?)?;
-        h.msgs().get(self.msg_sel?)
+        self.selected_group().first().copied()
+    }
+
+    fn group_attachments(&self) -> Vec<(i64, usize, Attachment)> {
+        self.selected_group()
+            .iter()
+            .flat_map(|m| {
+                m.attachments
+                    .iter()
+                    .enumerate()
+                    .map(|(i, a)| (m.id, i, a.clone()))
+            })
+            .collect()
+    }
+
+    pub fn attachment(&self, chat_id: i64, msg_id: i64, idx: usize) -> Option<&Attachment> {
+        self.histories
+            .get(&chat_id)?
+            .get(msg_id)?
+            .attachments
+            .get(idx)
+    }
+
+    fn open_viewer(&mut self, chat_id: i64, items: Vec<(i64, usize)>, pos: usize) {
+        if items.is_empty() {
+            self.set_status("nothing to view in this message", false);
+            return;
+        }
+        self.anim_start = Instant::now();
+        self.popup = Some(Popup::Viewer {
+            chat_id,
+            pos: pos.min(items.len() - 1),
+            items,
+        });
+    }
+
+    fn play_attachment(&mut self, chat_id: i64, msg_id: i64, idx: usize, att: Attachment) {
+        if self
+            .playing
+            .as_ref()
+            .is_some_and(|p| p.target == (msg_id, idx))
+        {
+            self.stop_playback();
+            self.set_status("stopped", false);
+            return;
+        }
+        let in_viewer = matches!(self.popup, Some(Popup::Viewer { .. }));
+        let still = match att.kind {
+            MediaKind::Photo => true,
+            MediaKind::Sticker => att.full.as_ref().is_none_or(|v| v.decode != Decode::Video),
+            _ => false,
+        };
+        let name = attachment_name(&att, msg_id);
+        if still && !in_viewer {
+            let items = self.viewable_items();
+            let pos = items
+                .iter()
+                .position(|it| *it == (msg_id, idx))
+                .unwrap_or(0);
+            self.open_viewer(chat_id, items, pos);
+        } else if still || att.kind == MediaKind::Document {
+            self.queue_file_job(&att.file, &name, FileJob::Open);
+        } else {
+            self.queue_file_job(&att.file, &name, FileJob::Play(att.kind, (msg_id, idx)));
+        }
+    }
+
+    fn viewable_items(&self) -> Vec<(i64, usize)> {
+        self.group_attachments()
+            .into_iter()
+            .filter(|(_, _, a)| a.viewable())
+            .map(|(m, i, _)| (m, i))
+            .collect()
+    }
+
+    fn viewer_current(&self) -> Option<(i64, i64, usize, Attachment)> {
+        let Some(Popup::Viewer {
+            chat_id,
+            items,
+            pos,
+        }) = &self.popup
+        else {
+            return None;
+        };
+        let (msg_id, idx) = *items.get(*pos)?;
+        let att = self.attachment(*chat_id, msg_id, idx)?.clone();
+        Some((*chat_id, msg_id, idx, att))
     }
 
     fn message_action(&mut self, action: MenuAction) {
@@ -1119,13 +1408,36 @@ impl App {
                 }
             }
             MenuAction::Delete => {
+                let message_ids = self.selected_group().iter().map(|m| m.id).collect();
                 self.popup = Some(Popup::ConfirmDelete {
                     chat_id: msg.chat_id,
-                    message_id: msg.id,
+                    message_ids,
                 })
             }
+            MenuAction::Play => match self.group_attachments().into_iter().next() {
+                Some((msg_id, idx, att)) => self.play_attachment(msg.chat_id, msg_id, idx, att),
+                None => self.set_status("no media in this message", false),
+            },
+            MenuAction::View => {
+                let items = self.viewable_items();
+                self.open_viewer(msg.chat_id, items, 0);
+            }
+            MenuAction::Save | MenuAction::OpenExternal => {
+                match self.group_attachments().into_iter().next() {
+                    Some((msg_id, _, att)) => {
+                        let name = attachment_name(&att, msg_id);
+                        let job = if action == MenuAction::Save {
+                            FileJob::Save(name.clone())
+                        } else {
+                            FileJob::Open
+                        };
+                        self.queue_file_job(&att.file, &name, job);
+                    }
+                    None => self.set_status("no file in this message", false),
+                }
+            }
             MenuAction::OpenUrl => match format::urls(&msg.body).first() {
-                Some(url) => open_url(&format::normalize_url(url)).unwrap_or_else(|e| {
+                Some(url) => player::xdg_open(&format::normalize_url(url)).unwrap_or_else(|e| {
                     self.set_status(format!("open url: {e}"), true);
                 }),
                 None => self.set_status("no link in this message", false),
@@ -1135,29 +1447,57 @@ impl App {
     }
 
     fn open_action_menu(&mut self) {
+        let has_media = !self.group_attachments().is_empty();
         let items = match self.focus {
-            Pane::Messages if self.msg_sel.is_some() => vec![
-                MenuItem {
-                    key: 'R',
-                    label: "Reply",
-                    action: MenuAction::Reply,
-                },
-                MenuItem {
-                    key: 'e',
-                    label: "Edit",
-                    action: MenuAction::Edit,
-                },
-                MenuItem {
-                    key: 'd',
-                    label: "Delete",
-                    action: MenuAction::Delete,
-                },
-                MenuItem {
-                    key: 'o',
-                    label: "Open link",
-                    action: MenuAction::OpenUrl,
-                },
-            ],
+            Pane::Messages if self.msg_sel.is_some() => {
+                let mut items = vec![
+                    MenuItem {
+                        key: 'R',
+                        label: "Reply",
+                        action: MenuAction::Reply,
+                    },
+                    MenuItem {
+                        key: 'e',
+                        label: "Edit",
+                        action: MenuAction::Edit,
+                    },
+                    MenuItem {
+                        key: 'd',
+                        label: "Delete",
+                        action: MenuAction::Delete,
+                    },
+                    MenuItem {
+                        key: 'o',
+                        label: "Open link",
+                        action: MenuAction::OpenUrl,
+                    },
+                ];
+                if has_media {
+                    items.extend([
+                        MenuItem {
+                            key: 'x',
+                            label: "Play / open media",
+                            action: MenuAction::Play,
+                        },
+                        MenuItem {
+                            key: 'v',
+                            label: "View attachment",
+                            action: MenuAction::View,
+                        },
+                        MenuItem {
+                            key: 's',
+                            label: "Save to Downloads",
+                            action: MenuAction::Save,
+                        },
+                        MenuItem {
+                            key: 'O',
+                            label: "Open with xdg-open",
+                            action: MenuAction::OpenExternal,
+                        },
+                    ]);
+                }
+                items
+            }
             Pane::Chats => vec![
                 MenuItem {
                     key: 'o',
@@ -1191,9 +1531,14 @@ impl App {
 
     fn run_menu_action(&mut self, action: MenuAction) {
         match action {
-            MenuAction::Reply | MenuAction::Edit | MenuAction::Delete | MenuAction::OpenUrl => {
-                self.message_action(action)
-            }
+            MenuAction::Reply
+            | MenuAction::Edit
+            | MenuAction::Delete
+            | MenuAction::OpenUrl
+            | MenuAction::Play
+            | MenuAction::View
+            | MenuAction::Save
+            | MenuAction::OpenExternal => self.message_action(action),
             MenuAction::OpenChat => self.on_enter(),
             MenuAction::MarkRead => {
                 self.refresh_lists();
@@ -1250,19 +1595,54 @@ impl App {
                 }
                 _ => {}
             },
+            Popup::Viewer { items, pos, .. } => {
+                let len = items.len();
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('v') => self.popup = None,
+                    KeyCode::Char('j' | 'l' | 'n') | KeyCode::Down | KeyCode::Right => {
+                        if *pos + 1 < len {
+                            *pos += 1;
+                            self.anim_start = Instant::now();
+                        }
+                    }
+                    KeyCode::Char('k' | 'h' | 'p') | KeyCode::Up | KeyCode::Left => {
+                        if *pos > 0 {
+                            *pos -= 1;
+                            self.anim_start = Instant::now();
+                        }
+                    }
+                    KeyCode::Char('x') | KeyCode::Enter => {
+                        if let Some((chat_id, msg_id, idx, att)) = self.viewer_current() {
+                            self.play_attachment(chat_id, msg_id, idx, att);
+                        }
+                    }
+                    KeyCode::Char('s') | KeyCode::Char('o') | KeyCode::Char('O') => {
+                        if let Some((_, msg_id, _, att)) = self.viewer_current() {
+                            let name = attachment_name(&att, msg_id);
+                            let job = if key.code == KeyCode::Char('s') {
+                                FileJob::Save(name.clone())
+                            } else {
+                                FileJob::Open
+                            };
+                            self.queue_file_job(&att.file, &name, job);
+                        }
+                    }
+                    _ => {}
+                }
+            }
             Popup::ConfirmDelete {
                 chat_id,
-                message_id,
+                message_ids,
             } => {
-                let (chat_id, message_id) = (*chat_id, *message_id);
+                let (chat_id, message_ids) = (*chat_id, message_ids.clone());
                 match key.code {
                     KeyCode::Char('y') | KeyCode::Enter => {
                         self.popup = None;
-                        self.td.delete_message(chat_id, message_id, true);
+                        self.td.delete_messages(chat_id, message_ids, true);
                     }
                     KeyCode::Char('m') => {
                         self.popup = None;
-                        self.td.delete_message(chat_id, message_id, false);
+                        self.td.delete_messages(chat_id, message_ids, false);
                     }
                     KeyCode::Char('n') | KeyCode::Char('q') | KeyCode::Esc => self.popup = None,
                     _ => {}
@@ -1324,7 +1704,37 @@ impl App {
         if self.want_older {
             self.maybe_load_older();
         }
+        self.media.end_frame(&self.td);
     }
+}
+
+pub fn attachment_name(att: &Attachment, msg_id: i64) -> String {
+    if !att.name.is_empty() && att.kind != MediaKind::Sticker && att.kind != MediaKind::Photo {
+        return att.name.clone();
+    }
+    let ext = match att.kind {
+        MediaKind::Photo => "jpg",
+        MediaKind::Video | MediaKind::Animation | MediaKind::VideoNote => "mp4",
+        MediaKind::Voice => "ogg",
+        MediaKind::Audio => "mp3",
+        MediaKind::Sticker => match att.full.as_ref().map(|v| v.decode) {
+            Some(Decode::Tgs) => "tgs",
+            Some(Decode::Video) => "webm",
+            _ => "webp",
+        },
+        MediaKind::Document => "bin",
+    };
+    let stem = match att.kind {
+        MediaKind::Photo => "photo",
+        MediaKind::Video => "video",
+        MediaKind::Animation => "animation",
+        MediaKind::VideoNote => "video_message",
+        MediaKind::Voice => "voice",
+        MediaKind::Audio => "audio",
+        MediaKind::Sticker => "sticker",
+        MediaKind::Document => "file",
+    };
+    format!("{stem}_{}.{ext}", msg_id >> 20)
 }
 
 fn step(cur: usize, delta: isize, len: usize) -> usize {
@@ -1334,17 +1744,4 @@ fn step(cur: usize, delta: isize, len: usize) -> usize {
     (cur as isize)
         .saturating_add(delta)
         .clamp(0, len as isize - 1) as usize
-}
-
-fn open_url(url: &str) -> Result<(), String> {
-    std::process::Command::new("xdg-open")
-        .arg(url)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .map(|mut child| {
-            std::thread::spawn(move || child.wait());
-        })
-        .map_err(|e| format!("xdg-open: {e}"))
 }

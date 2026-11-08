@@ -21,7 +21,7 @@ struct ApiFile {
     api_hash: String,
 }
 
-fn env_prefix() -> String {
+pub fn env_prefix() -> String {
     APP_NAME.to_uppercase().replace('-', "_")
 }
 
@@ -44,6 +44,11 @@ pub fn config_dir() -> Result<PathBuf, String> {
 }
 
 pub fn data_dir() -> Result<PathBuf, String> {
+    if let Some(dir) =
+        std::env::var_os(format!("{}_DATA_DIR", env_prefix())).filter(|v| !v.is_empty())
+    {
+        return Ok(PathBuf::from(dir));
+    }
     Ok(xdg_dir("XDG_DATA_HOME", ".local/share")?.join(APP_NAME))
 }
 

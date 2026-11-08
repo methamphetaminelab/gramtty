@@ -100,6 +100,8 @@ pub enum Action {
     DeleteMessage,
     EditMessage,
     OpenMessageUrl,
+    PlayMedia,
+    ViewAttachment,
     ToggleFolderPane,
     ToggleChatPane,
     ToggleInfoPane,
@@ -110,7 +112,7 @@ pub enum Action {
 }
 
 impl Action {
-    pub const ALL: [Action; 29] = [
+    pub const ALL: [Action; 31] = [
         Action::StartComposer,
         Action::OpenPaneFilter,
         Action::ClosePopup,
@@ -133,6 +135,8 @@ impl Action {
         Action::DeleteMessage,
         Action::EditMessage,
         Action::OpenMessageUrl,
+        Action::PlayMedia,
+        Action::ViewAttachment,
         Action::ToggleFolderPane,
         Action::ToggleChatPane,
         Action::ToggleInfoPane,
@@ -166,6 +170,8 @@ impl Action {
             Action::DeleteMessage => "DeleteMessage",
             Action::EditMessage => "EditMessage",
             Action::OpenMessageUrl => "OpenMessageUrl",
+            Action::PlayMedia => "PlayMedia",
+            Action::ViewAttachment => "ViewMessageAttachment",
             Action::ToggleFolderPane => "ToggleFolderPane",
             Action::ToggleChatPane => "ToggleChatPane",
             Action::ToggleInfoPane => "ToggleInfoPane",
@@ -204,6 +210,8 @@ impl Action {
             Action::DeleteMessage => "delete",
             Action::EditMessage => "edit",
             Action::OpenMessageUrl => "open url",
+            Action::PlayMedia => "play / open media",
+            Action::ViewAttachment => "view attachment",
             Action::ToggleFolderPane => "toggle folders",
             Action::ToggleChatPane => "toggle chats",
             Action::ToggleInfoPane => "toggle chat info",
@@ -238,6 +246,8 @@ impl Action {
             Action::DeleteMessage => &["d"],
             Action::EditMessage => &["e"],
             Action::OpenMessageUrl => &["o"],
+            Action::PlayMedia => &["x"],
+            Action::ViewAttachment => &["v"],
             Action::ToggleFolderPane => &["<leader>1"],
             Action::ToggleChatPane => &["<leader>2"],
             Action::ToggleInfoPane => &["<leader>4"],
@@ -640,10 +650,11 @@ Bogus = "x"
     fn leader_l_logs_out() {
         let map = Keymap::default();
         assert_eq!(map.feed(&[space()], key('L')), Feed::Action(Action::LogOut));
-        assert!(map
-            .continuations(&[space()])
-            .iter()
-            .any(|(k, d)| k == "L" && d == "log out"));
+        assert!(
+            map.continuations(&[space()])
+                .iter()
+                .any(|(k, d)| k == "L" && d == "log out")
+        );
     }
 
     #[test]

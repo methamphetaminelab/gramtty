@@ -10,8 +10,13 @@ use crate::app::{App, Auth, Pane, Popup};
 use crate::config::APP_NAME;
 
 const QR_CAPTION: &str = "Scan in Telegram → Settings → Devices → Link Desktop Device";
+use std::time::Duration;
+
+use ratatui_image::sliced::{SignedPosition, SlicedImage, SlicedProtocol};
+
 use crate::format::{self, render_text};
-use crate::model::{ChatKind, Msg, SendState, Sender};
+use crate::media::{self, Input, Key, Look, Media, Src, album_layout, fit_cells, layout_height};
+use crate::model::{self, Attachment, ChatKind, Decode, MediaKind, Msg, SendState, Sender, Visual};
 use crate::qr;
 use crate::theme;
 
@@ -27,6 +32,7 @@ const AUTHOR_COLORS: [Color; 7] = [
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    app.animating = false;
     frame.render_widget(Block::default().style(theme::normal()), area);
     if app.auth != Auth::Ready {
         draw_login(frame, area, app);
@@ -53,7 +59,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if app.show_info {
         draw_info(frame, info, app);
     }
-    draw_popup(frame, area, app);
+    if matches!(app.popup, Some(Popup::Viewer { .. })) {
+        draw_viewer(frame, area, app);
+    } else {
+        draw_popup(frame, area, app);
+    }
     draw_key_hint(frame, main, app);
 }
 
@@ -80,6 +90,9 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
     } else if let Some(name) = app.me_name() {
         spans.push(Span::styled(" Connected as ", theme::muted()));
         spans.push(Span::styled(format!("{name} "), theme::strong()));
+    }
+    if let Some(p) = &app.playing {
+        spans.push(Span::styled(format!(" ▶ {} ", p.label), theme::media()));
     }
     if let Some((text, error)) = &app.status {
         let style = if *error {
@@ -283,15 +296,142 @@ fn author_style(sender: Sender) -> Style {
     theme::strong().fg(AUTHOR_COLORS[id.unsigned_abs() as usize % AUTHOR_COLORS.len()])
 }
 
-struct Rendered {
-    lines: Vec<Line<'static>>,
+#[derive(Clone, Copy, Debug)]
+struct Place {
+    line: usize,
+    col: u16,
+    cols: u16,
+    rows: u16,
+    msg: usize,
+    att: usize,
 }
 
-fn message_block(app: &App, msgs: &[Msg], i: usize, width: usize, selected: bool) -> Rendered {
-    let m = &msgs[i];
-    let prev = i.checked_sub(1).map(|j| &msgs[j]);
+struct Rendered {
+    lines: Vec<Line<'static>>,
+    images: Vec<Place>,
+}
+
+const PHOTO_COLS: u16 = 60;
+const PHOTO_ROWS: u16 = 15;
+const STICKER_COLS: u16 = 32;
+const STICKER_ROWS: u16 = 8;
+const NOTE_ROWS: u16 = 8;
+const ALBUM_COLS: u16 = 80;
+const ALBUM_ROWS: u16 = 7;
+const DOC_THUMB_COLS: u16 = 10;
+const DOC_THUMB_ROWS: u16 = 4;
+
+fn visual_dims(att: &Attachment) -> (i32, i32) {
+    if att.width > 0 && att.height > 0 {
+        return (att.width, att.height);
+    }
+    att.preview.as_ref().map_or((0, 0), |v| (v.width, v.height))
+}
+
+fn media_box(att: &Attachment, font: (u16, u16), max_w: u16) -> (u16, u16) {
+    let (w, h) = visual_dims(att);
+    match att.kind {
+        MediaKind::Sticker => fit_cells(w, h, font, max_w.min(STICKER_COLS), STICKER_ROWS),
+        MediaKind::VideoNote => fit_cells(w, h, font, max_w, NOTE_ROWS),
+        MediaKind::Document => fit_cells(w, h, font, max_w.min(DOC_THUMB_COLS), DOC_THUMB_ROWS),
+        _ => fit_cells(w, h, font, max_w.min(PHOTO_COLS), PHOTO_ROWS),
+    }
+}
+
+fn kind_label(kind: MediaKind) -> &'static str {
+    match kind {
+        MediaKind::Photo => "photo",
+        MediaKind::Video => "video",
+        MediaKind::Animation => "GIF",
+        MediaKind::VideoNote => "video message",
+        MediaKind::Voice => "voice message",
+        MediaKind::Audio => "audio",
+        MediaKind::Sticker => "sticker",
+        MediaKind::Document => "file",
+    }
+}
+
+fn meta_text(app: &App, m: &Msg, idx: usize, att: &Attachment, width: usize) -> Option<String> {
+    let f = app.media.file(&att.file);
+    let size = (f.size > 0).then(|| format::file_size(f.size));
+    let dur = format::duration(att.duration);
+    let join = |parts: Vec<String>| parts.join(" · ");
+    let mut text = match att.kind {
+        MediaKind::Photo | MediaKind::Sticker => String::new(),
+        MediaKind::Video => join(
+            [Some(format!("▶ video {dur}")), size]
+                .into_iter()
+                .flatten()
+                .collect(),
+        ),
+        MediaKind::Animation => join(
+            [Some("GIF".to_owned()), size]
+                .into_iter()
+                .flatten()
+                .collect(),
+        ),
+        MediaKind::VideoNote => format!("◉ video message {dur}"),
+        MediaKind::Voice => {
+            let bars_w = width.saturating_sub(24).clamp(0, 32);
+            let bars = model::waveform_bars(&att.waveform, bars_w);
+            join(
+                [Some(format!("🎤 {dur} {bars}").trim_end().to_owned()), size]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+            )
+        }
+        MediaKind::Audio => {
+            let title = m
+                .media
+                .as_deref()
+                .map_or(att.name.as_str(), |l| l.trim_start_matches("♪ "));
+            join(
+                [Some(format!("♪ {title}")), Some(dur), size]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+            )
+        }
+        MediaKind::Document => join(
+            [Some(format!("📄 {}", att.name)), size]
+                .into_iter()
+                .flatten()
+                .collect(),
+        ),
+    };
+    if let Some(p) = f.percent() {
+        text.push_str(&format!(" ⇣ {p}%"));
+    } else if f.active {
+        text.push_str(" ⇣");
+    }
+    if let Some(e) = app.media.file_error(f.id) {
+        text.push_str(&format!(" ⚠ {e}"));
+    }
+    if app
+        .playing
+        .as_ref()
+        .is_some_and(|p| p.target == (m.id, idx))
+    {
+        text.push_str(" ▶ playing");
+    }
+    let text = text.trim().to_owned();
+    (!text.is_empty()).then_some(text)
+}
+
+fn group_block(
+    app: &App,
+    msgs: &[Msg],
+    range: std::ops::Range<usize>,
+    width: usize,
+    selected: bool,
+) -> Rendered {
+    let m = &msgs[range.start];
+    let group = &msgs[range.clone()];
+    let prev = range.start.checked_sub(1).map(|j| &msgs[j]);
     let new_day = prev.is_none_or(|p| !format::same_day(p.date, m.date));
     let show_header = new_day || prev.is_none_or(|p| p.sender != m.sender || m.date - p.date > 300);
+    let edited = group.iter().any(|g| g.edited);
     let mut lines: Vec<Line<'static>> = Vec::new();
     if new_day {
         lines.push(Line::from(Span::styled(
@@ -318,7 +458,7 @@ fn message_block(app: &App, msgs: &[Msg], i: usize, width: usize, selected: bool
             Span::raw(" "),
             Span::styled(time.clone(), theme::muted()),
         ];
-        if m.edited {
+        if edited {
             header.push(Span::styled(
                 " (edited)",
                 theme::muted().add_modifier(ratatui::style::Modifier::ITALIC),
@@ -343,36 +483,106 @@ fn message_block(app: &App, msgs: &[Msg], i: usize, width: usize, selected: bool
             theme::muted(),
         )));
     }
-    if let Some(media) = &m.media {
-        body.extend(render_text(
-            &crate::model::RichText::plain(media.clone()),
-            theme::media(),
-            inner,
+    let media_w = width.saturating_sub(4).max(1) as u16;
+    let font = app.media.font();
+    let visuals: Vec<(usize, usize)> = range
+        .clone()
+        .flat_map(|mi| {
+            msgs[mi]
+                .attachments
+                .iter()
+                .enumerate()
+                .filter(|(_, a)| a.is_visual())
+                .map(move |(ai, _)| (mi, ai))
+        })
+        .collect();
+    let mut images = Vec::new();
+    if let [(mi, ai)] = visuals.as_slice() {
+        let (cols, rows) = media_box(&msgs[*mi].attachments[*ai], font, media_w);
+        images.push(Place {
+            line: body.len(),
+            col: 0,
+            cols,
+            rows,
+            msg: *mi,
+            att: *ai,
+        });
+        body.extend(std::iter::repeat_n(Line::default(), rows as usize));
+    } else if visuals.len() > 1 {
+        let dims: Vec<(i32, i32)> = visuals
+            .iter()
+            .map(|(mi, ai)| visual_dims(&msgs[*mi].attachments[*ai]))
+            .collect();
+        let cells = album_layout(&dims, font, media_w.min(ALBUM_COLS), ALBUM_ROWS);
+        let base = body.len();
+        for (c, (mi, ai)) in cells.iter().zip(&visuals) {
+            images.push(Place {
+                line: base + c.y as usize,
+                col: c.x,
+                cols: c.w,
+                rows: c.h,
+                msg: *mi,
+                att: *ai,
+            });
+        }
+        body.extend(std::iter::repeat_n(
+            Line::default(),
+            layout_height(&cells) as usize,
         ));
     }
-    if !m.body.text.is_empty() {
-        body.extend(render_text(&m.body, theme::normal(), inner));
+    for g in group {
+        for (ai, att) in g.attachments.iter().enumerate() {
+            if let Some(text) = meta_text(app, g, ai, att, inner) {
+                body.push(Line::from(Span::styled(
+                    format::truncate(&text, inner),
+                    theme::media(),
+                )));
+            }
+        }
+        if g.attachments.is_empty()
+            && let Some(media) = &g.media
+        {
+            body.extend(render_text(
+                &crate::model::RichText::plain(media.clone()),
+                theme::media(),
+                inner,
+            ));
+        }
     }
-    match &m.state {
-        SendState::Sent => {}
-        SendState::Pending => body.push(Line::from(Span::styled("sending...", theme::muted()))),
-        SendState::Failed(e) => body.push(Line::from(Span::styled(
-            format::truncate(&format!("failed: {e}"), inner),
-            theme::error(),
-        ))),
+    for g in group {
+        if !g.body.text.is_empty() {
+            body.extend(render_text(&g.body, theme::normal(), inner));
+        }
+    }
+    for g in group {
+        match &g.state {
+            SendState::Sent => {}
+            SendState::Pending => body.push(Line::from(Span::styled("sending...", theme::muted()))),
+            SendState::Failed(e) => body.push(Line::from(Span::styled(
+                format::truncate(&format!("failed: {e}"), inner),
+                theme::error(),
+            ))),
+        }
     }
     if !show_header
-        && m.edited
+        && edited
         && let Some(last) = body.last_mut()
     {
         last.spans.push(Span::styled(" (edited)", theme::muted()));
+    }
+    let offset = lines.len() + usize::from(selected);
+    for p in &mut images {
+        p.line += offset;
+        if selected {
+            p.col += 2;
+        }
     }
     if selected {
         lines.extend(card(body, width, (!show_header).then_some(time.as_str())));
     } else {
         lines.extend(body);
     }
-    Rendered { lines }
+    Rendered { lines, images }
 }
 
 fn card(body: Vec<Line<'static>>, width: usize, bottom_time: Option<&str>) -> Vec<Line<'static>> {
@@ -480,56 +690,61 @@ fn draw_message_list(frame: &mut Frame, area: Rect, app: &mut App) {
     }
     let reached_start = h.reached_start;
     let loading = h.loading_older;
+    let groups = model::groups(msgs);
+    let block = |app: &App, g: usize, sel: Option<usize>| {
+        group_block(app, msgs, groups[g].clone(), width, sel == Some(g))
+    };
     let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut placed: Vec<(usize, Place)> = Vec::new();
+    let mut first_line = 0usize;
     let mut want_older = false;
     match app.msg_sel {
         None => {
-            let mut blocks: Vec<Vec<Line<'static>>> = Vec::new();
+            let mut blocks: Vec<Rendered> = Vec::new();
             let mut total = 0;
-            let mut i = msgs.len();
-            while i > 0 && total < height + app.bottom_offset {
-                i -= 1;
-                let b = message_block(app, msgs, i, width, false).lines;
-                total += b.len();
+            let mut g = groups.len();
+            while g > 0 && total < height + app.bottom_offset {
+                g -= 1;
+                let b = block(app, g, None);
+                total += b.lines.len();
                 blocks.push(b);
             }
             if total < height + app.bottom_offset && !reached_start {
                 want_older = true;
             }
-            let all: Vec<Line<'static>> = blocks.into_iter().rev().flatten().collect();
+            let mut all: Vec<Line<'static>> = Vec::with_capacity(total);
+            for b in blocks.into_iter().rev() {
+                let base = all.len();
+                placed.extend(b.images.into_iter().map(|p| (base + p.line, p)));
+                all.extend(b.lines);
+            }
             let max_offset = all.len().saturating_sub(height);
             app.bottom_offset = app.bottom_offset.min(max_offset);
             let end = all.len() - app.bottom_offset;
             let start = end.saturating_sub(height);
-            lines.extend(all[start..end].iter().cloned());
+            first_line = start;
+            all.truncate(end);
+            lines.extend(all.drain(start..));
         }
         Some(sel) => {
-            let sel = sel.min(msgs.len() - 1);
+            let gsel = model::group_of(&groups, sel.min(msgs.len() - 1));
             let heights = |from: usize, to: usize, app: &App| -> usize {
                 (from..=to)
-                    .map(|i| message_block(app, msgs, i, width, i == sel).lines.len())
+                    .map(|g| block(app, g, Some(gsel)).lines.len())
                     .sum()
             };
-            let mut top = app.msg_top.min(sel);
-            let mut cache: Option<usize> = None;
-            while top < sel {
-                let used = *cache.get_or_insert_with(|| heights(top, sel, app));
-                if used <= height {
-                    break;
-                }
+            let mut top = model::group_of(&groups, app.msg_top).min(gsel);
+            while top < gsel && heights(top, gsel, app) > height {
                 top += 1;
-                cache = None;
             }
             let mut below = 0;
             let mut j = top;
-            while j < msgs.len() && below <= height {
-                below += message_block(app, msgs, j, width, j == sel).lines.len();
+            while j < groups.len() && below <= height {
+                below += block(app, j, Some(gsel)).lines.len();
                 j += 1;
             }
             while top > 0 && below < height {
-                let add = message_block(app, msgs, top - 1, width, top - 1 == sel)
-                    .lines
-                    .len();
+                let add = block(app, top - 1, Some(gsel)).lines.len();
                 if below + add > height {
                     break;
                 }
@@ -539,13 +754,16 @@ fn draw_message_list(frame: &mut Frame, area: Rect, app: &mut App) {
             if top == 0 && !reached_start {
                 want_older = true;
             }
-            let mut i = top;
-            while i < msgs.len() && lines.len() < height {
-                lines.extend(message_block(app, msgs, i, width, i == sel).lines);
-                i += 1;
+            let mut g = top;
+            while g < groups.len() && lines.len() < height {
+                let b = block(app, g, Some(gsel));
+                let base = lines.len();
+                placed.extend(b.images.into_iter().map(|p| (base + p.line, p)));
+                lines.extend(b.lines);
+                g += 1;
             }
             lines.truncate(height);
-            app.msg_top = top;
+            app.msg_top = groups[top].start;
         }
     }
     if loading && !reached_start && lines.len() >= height {
@@ -558,9 +776,277 @@ fn draw_message_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut shown: Vec<Line<'static>> = vec![Line::from(""); pad];
     shown.extend(lines);
     frame.render_widget(Paragraph::new(shown), area);
+    let overlay = app.popup.is_some() || !app.pending.is_empty();
+    for (abs, p) in placed {
+        let y = pad as isize + abs as isize - first_line as isize;
+        if y + p.rows as isize <= 0 || y >= height as isize {
+            continue;
+        }
+        let m = &msgs[p.msg];
+        let Some(att) = m.attachments.get(p.att) else {
+            continue;
+        };
+        let target = ImageTarget {
+            area,
+            x: p.col,
+            y,
+            cols: p.cols,
+            rows: p.rows,
+        };
+        draw_attachment(
+            frame,
+            target,
+            &mut app.media,
+            att,
+            (chat_id, m.id, p.att),
+            overlay,
+            false,
+            Duration::ZERO,
+        );
+    }
     if want_older {
         app.want_older = true;
     }
+}
+
+#[derive(Clone, Copy)]
+struct ImageTarget {
+    area: Rect,
+    x: u16,
+    y: isize,
+    cols: u16,
+    rows: u16,
+}
+
+fn render_proto(frame: &mut Frame, t: ImageTarget, proto: &SlicedProtocol) {
+    let (Ok(x), Ok(y)) = (i16::try_from(t.x), i16::try_from(t.y)) else {
+        return;
+    };
+    frame.render_widget(SlicedImage::new(proto, SignedPosition { x, y }), t.area);
+}
+
+fn box_note(frame: &mut Frame, t: ImageTarget, text: &str) {
+    if t.y < 0 || t.y >= t.area.height as isize || t.x >= t.area.width {
+        return;
+    }
+    let w = t.cols.min(t.area.width - t.x).max(1);
+    let rect = Rect {
+        x: t.area.x + t.x,
+        y: t.area.y + t.y as u16,
+        width: w,
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            format::truncate(text, w as usize),
+            theme::muted(),
+        )),
+        rect,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_attachment(
+    frame: &mut Frame,
+    t: ImageTarget,
+    media: &mut Media,
+    att: &Attachment,
+    (chat_id, msg_id, idx): (i64, i64, usize),
+    overlay: bool,
+    full: bool,
+    elapsed: Duration,
+) -> bool {
+    let round = att.kind == MediaKind::VideoNote;
+    let mut note: Option<String> = None;
+    let mut animated = false;
+    let sources: Vec<&Visual> = if full {
+        att.full.iter().chain(att.preview.iter()).collect()
+    } else {
+        att.preview.iter().collect()
+    };
+    let priority = if full { 32 } else { 1 };
+    for (n, v) in sources.iter().enumerate() {
+        let f = media.file(&v.file);
+        let Some(input) = media::input_for(&f, v.decode) else {
+            if n == 0 {
+                match media.file_error(v.file.id) {
+                    Some(e) => note = Some(format!("⚠ {e}")),
+                    None => {
+                        media.want_download(v.file.id, priority);
+                        note = Some(match f.percent() {
+                            Some(p) => format!("⇣ {} {p}%", kind_label(att.kind)),
+                            None => format!("⇣ {}", kind_label(att.kind)),
+                        });
+                    }
+                }
+            }
+            continue;
+        };
+        let key = Key {
+            src: Src::File(v.file.id),
+            cols: t.cols,
+            rows: t.rows,
+            round,
+            animate: full && v.decode == Decode::Tgs,
+        };
+        match media.look(key, input, overlay) {
+            Look::Ready(frames) => {
+                if let Some(proto) = frames.at(elapsed) {
+                    render_proto(frame, t, proto);
+                    animated = frames.animated();
+                }
+                return animated;
+            }
+            Look::Failed(e) => {
+                if n == 0 {
+                    note = Some(format!("⚠ {e}"));
+                }
+            }
+            Look::Hidden => return false,
+            Look::Pending => {
+                if n == 0 && note.is_none() {
+                    note = Some(format!("⧗ {}", kind_label(att.kind)));
+                }
+            }
+        }
+    }
+    if let Some(bytes) = &att.mini {
+        let key = Key {
+            src: Src::Mini {
+                chat: chat_id,
+                msg: msg_id,
+                idx: idx.min(255) as u8,
+            },
+            cols: t.cols,
+            rows: t.rows,
+            round,
+            animate: false,
+        };
+        match media.look(key, Input::Bytes(bytes.clone()), overlay) {
+            Look::Ready(frames) => {
+                if let Some(proto) = frames.at(Duration::ZERO) {
+                    render_proto(frame, t, proto);
+                    return false;
+                }
+            }
+            Look::Hidden => return false,
+            Look::Pending | Look::Failed(_) => {}
+        }
+    }
+    let text = note.unwrap_or_else(|| format!("[{}]", kind_label(att.kind)));
+    box_note(frame, t, &text);
+    animated
+}
+
+fn draw_viewer(frame: &mut Frame, area: Rect, app: &mut App) {
+    let Some(Popup::Viewer {
+        chat_id,
+        items,
+        pos,
+    }) = &app.popup
+    else {
+        return;
+    };
+    let (chat_id, len, pos) = (*chat_id, items.len(), *pos);
+    let Some(&(msg_id, idx)) = items.get(pos) else {
+        return;
+    };
+    frame.render_widget(Clear, area);
+    let att = app.attachment(chat_id, msg_id, idx).cloned();
+    let title = match &att {
+        Some(a) => format!(" {} {}/{} ", kind_label(a.kind), pos + 1, len),
+        None => format!(" attachment {}/{} ", pos + 1, len),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_set(border::ROUNDED)
+        .border_style(theme::focus_border())
+        .title(Span::styled(title, theme::strong()))
+        .title_bottom(Span::styled(
+            " j/k prev/next · x play/open · s save · o xdg-open · Esc close ",
+            theme::muted(),
+        ));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    let Some(att) = att else {
+        frame.render_widget(
+            Paragraph::new(Span::styled(" message is gone", theme::muted())),
+            inner,
+        );
+        return;
+    };
+    if inner.height < 2 || inner.width < 2 {
+        return;
+    }
+    let image_h = inner.height - 1;
+    let dims = att
+        .full
+        .as_ref()
+        .filter(|v| v.width > 0 && v.height > 0)
+        .map_or_else(|| visual_dims(&att), |v| (v.width, v.height));
+    let (cols, rows) = fit_cells(dims.0, dims.1, app.media.font(), inner.width, image_h);
+    let image_area = Rect {
+        height: image_h,
+        ..inner
+    };
+    let t = ImageTarget {
+        area: image_area,
+        x: (inner.width - cols) / 2,
+        y: ((image_h - rows) / 2) as isize,
+        cols,
+        rows,
+    };
+    let elapsed = app.anim_start.elapsed();
+    let animated = if att.viewable() {
+        draw_attachment(
+            frame,
+            t,
+            &mut app.media,
+            &att,
+            (chat_id, msg_id, idx),
+            false,
+            true,
+            elapsed,
+        )
+    } else {
+        box_note(frame, t, "nothing to preview; x to open");
+        false
+    };
+    app.animating |= animated;
+    let f = app.media.file(&att.file);
+    let mut meta = vec![if att.name.is_empty() || att.kind == MediaKind::Photo {
+        kind_label(att.kind).to_owned()
+    } else {
+        att.name.clone()
+    }];
+    if dims.0 > 0 {
+        meta.push(format!("{}×{}", dims.0, dims.1));
+    }
+    if att.duration > 0 {
+        meta.push(format::duration(att.duration));
+    }
+    if f.size > 0 {
+        meta.push(format::file_size(f.size));
+    }
+    if let Some(p) = att
+        .full
+        .as_ref()
+        .and_then(|v| app.media.file(&v.file).percent())
+    {
+        meta.push(format!("⇣ {p}%"));
+    }
+    let line = Rect {
+        y: inner.y + image_h,
+        height: 1,
+        ..inner
+    };
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            format::truncate(&format!(" {}", meta.join(" · ")), inner.width as usize),
+            theme::muted(),
+        )),
+        line,
+    );
 }
 
 fn draw_composer(frame: &mut Frame, area: Rect, app: &App) {
@@ -661,6 +1147,15 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &App) {
     if let Some(h) = app.histories.get(&chat.id) {
         lines.push(field("Loaded", format!("{} messages", h.len())));
     }
+    let (images, bytes) = app.media.stats();
+    lines.push(field(
+        "Images",
+        format!(
+            "{} · {images} cached · {}",
+            app.media.protocol_name(),
+            format::file_size(bytes as i64)
+        ),
+    ));
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -713,9 +1208,15 @@ fn draw_popup(frame: &mut Frame, area: Rect, app: &App) {
             let rect = centered(area, 34, lines.len() as u16 + 2);
             modal(frame, rect, title, lines);
         }
-        Popup::ConfirmDelete { .. } => {
+        Popup::Viewer { .. } => {}
+        Popup::ConfirmDelete { message_ids, .. } => {
+            let question = if message_ids.len() > 1 {
+                format!(" Delete these {} messages?", message_ids.len())
+            } else {
+                " Delete this message?".to_owned()
+            };
             let lines = vec![
-                Line::from(" Delete this message?"),
+                Line::from(question),
                 Line::from(""),
                 Line::from(vec![
                     Span::styled(" y ", theme::active_field()),
@@ -972,6 +1473,7 @@ mod tests {
     use crate::config::ApiCredentials;
     use crate::keymap::{Chord, Keymap};
     use crate::model::{ChatInfo, Entity, EntityKind, History, ListId, Position, RichText};
+    use crate::td::Event;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -985,7 +1487,9 @@ mod tests {
             outgoing: sender == 1,
             state: SendState::Sent,
             reply_to: (id == 4).then_some(2),
+            album: 0,
             media: (id == 5).then(|| "[photo]".to_owned()),
+            attachments: Vec::new(),
             body: RichText {
                 text: text.to_owned(),
                 entities: vec![Entity {
@@ -1008,6 +1512,7 @@ mod tests {
             creds,
             std::env::temp_dir(),
             Keymap::default(),
+            ratatui_image::picker::Picker::halfblocks(),
         );
         app.auth = Auth::Ready;
         app.users.insert(1, "Me".to_owned());
@@ -1098,6 +1603,326 @@ mod tests {
         });
         let screen = render(&mut app, 120, 40);
         assert!(screen.contains("Find chat"));
+    }
+
+    fn shows_image(app: &mut App, w: u16, h: u16) -> bool {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        let red = Color::Rgb(200, 30, 30);
+        term.backend()
+            .buffer()
+            .content
+            .iter()
+            .any(|c| c.fg == red || c.bg == red)
+    }
+
+    fn file(id: i32, local: bool) -> crate::model::FileRef {
+        crate::model::FileRef {
+            id,
+            size: 2048,
+            path: if local {
+                format!("/nonexistent/{id}")
+            } else {
+                String::new()
+            },
+            done: local,
+            active: false,
+            downloaded: if local { 2048 } else { 0 },
+        }
+    }
+
+    fn photo(id: i32) -> Attachment {
+        let mut a = Attachment::new(MediaKind::Photo, file(id, true));
+        a.width = 800;
+        a.height = 600;
+        a.preview = Some(Visual {
+            file: file(id, true),
+            decode: Decode::Raster,
+            width: 800,
+            height: 600,
+        });
+        a.full = a.preview.clone();
+        a
+    }
+
+    fn ready_frames(app: &App, cols: u16, rows: u16) -> media::Frames {
+        let img = image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+            u32::from(cols) * 10,
+            u32::from(rows) * 20,
+            image::Rgba([200, 30, 30, 255]),
+        ));
+        let _ = app;
+        media::Frames {
+            frames: vec![(
+                SlicedProtocol::new_with_resize(
+                    &ratatui_image::picker::Picker::halfblocks(),
+                    img,
+                    ratatui::layout::Size::new(cols, rows),
+                    ratatui_image::Resize::Fit(None),
+                )
+                .unwrap(),
+                Duration::ZERO,
+            )],
+            bytes: 1,
+        }
+    }
+
+    fn media_app() -> App {
+        let mut app = app();
+        app.show_info = false;
+        app.show_folders = false;
+        app.show_chats = false;
+        let h = app.histories.get_mut(&10).unwrap();
+        for (i, id) in [41i64, 42, 43].iter().enumerate() {
+            let mut m = msg(*id, 2, 1_700_100_000 + i as i64, "");
+            m.body = RichText::default();
+            m.album = 777;
+            m.attachments = vec![photo(100 + i as i32)];
+            h.upsert(m);
+        }
+        let mut voice = msg(44, 2, 1_700_100_010, "");
+        voice.body = RichText::default();
+        let mut va = Attachment::new(MediaKind::Voice, file(200, false));
+        va.duration = 7;
+        va.waveform = vec![0, 10, 31, 20, 5, 0, 31];
+        voice.attachments = vec![va];
+        h.upsert(voice);
+        let mut doc = msg(45, 2, 1_700_100_020, "the caption");
+        let mut da = Attachment::new(MediaKind::Document, file(300, false));
+        da.name = "report.pdf".to_owned();
+        doc.attachments = vec![da];
+        h.upsert(doc);
+        let mut poll = msg(46, 2, 1_700_100_030, "");
+        poll.body = RichText::default();
+        poll.media = Some("📊 Lunch?\n  ○ pizza — 60%\n  ○ sushi — 40%".to_owned());
+        h.upsert(poll);
+        app
+    }
+
+    #[tokio::test]
+    async fn album_renders_as_one_block_with_images() {
+        let mut app = media_app();
+        let screen = render(&mut app, 100, 40);
+        assert!(screen.contains("⧗ photo"));
+        assert!(screen.contains(" 0:07 ▁▁▁▁▁▃▃▃▃▃"));
+        assert!(screen.contains(" report.pdf · 2 KB"));
+        assert!(screen.contains("the caption"));
+        assert!(screen.contains("pizza — 60%"));
+        let font = app.media.font();
+        let cells = album_layout(&[(800, 600); 3], font, 92u16.min(ALBUM_COLS), ALBUM_ROWS);
+        for (i, c) in cells.iter().enumerate() {
+            let key = Key {
+                src: Src::File(100 + i as i32),
+                cols: c.w,
+                rows: c.h,
+                round: false,
+                animate: false,
+            };
+            let frames = ready_frames(&app, c.w, c.h);
+            app.media.insert_ready(key, frames, 0);
+        }
+        let screen = render(&mut app, 100, 40);
+        assert!(!screen.contains("⧗ photo"));
+        assert!(shows_image(&mut app, 100, 40));
+
+        let len = app.histories[&10].len();
+        app.msg_sel = None;
+        app.focus = Pane::Messages;
+        app.handle(Event::Input(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('k')),
+        )));
+        assert_eq!(app.msg_sel, Some(len - 1));
+        for _ in 0..3 {
+            app.handle(Event::Input(crossterm::event::Event::Key(
+                crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('k')),
+            )));
+        }
+        let sel = app.msg_sel.unwrap();
+        assert_eq!(app.histories[&10].msgs()[sel].id, 41);
+        assert_eq!(app.selected_group().len(), 3);
+        let screen = render(&mut app, 100, 40);
+        assert!(screen.contains('╭'));
+
+        app.handle(Event::Input(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('v')),
+        )));
+        assert!(
+            matches!(app.popup, Some(Popup::Viewer { pos: 0, ref items, .. }) if items.len() == 3)
+        );
+        let screen = render(&mut app, 100, 40);
+        assert!(screen.contains("photo 1/3"));
+        assert!(screen.contains("800×600"));
+        app.handle(Event::Input(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('j')),
+        )));
+        assert!(render(&mut app, 100, 40).contains("photo 2/3"));
+        app.handle(Event::Input(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Esc),
+        )));
+        assert!(app.popup.is_none());
+
+        app.handle(Event::Input(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('d')),
+        )));
+        assert!(
+            matches!(&app.popup, Some(Popup::ConfirmDelete { message_ids, .. }) if message_ids == &vec![41, 42, 43])
+        );
+        assert!(render(&mut app, 100, 40).contains("Delete these 3 messages?"));
+    }
+
+    #[tokio::test]
+    async fn media_menu_and_sizes_render_everywhere() {
+        let mut app = media_app();
+        for (w, h) in [(160, 50), (80, 24), (40, 10), (12, 5), (1, 1)] {
+            app.msg_sel = None;
+            render(&mut app, w, h);
+            app.msg_sel = Some(app.histories[&10].len() - 2);
+            render(&mut app, w, h);
+        }
+        app.focus = Pane::Messages;
+        app.msg_sel = Some(app.histories[&10].len() - 2);
+        app.handle(Event::Input(crossterm::event::Event::Key(
+            crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Enter),
+        )));
+        let screen = render(&mut app, 100, 40);
+        assert!(screen.contains("Save to Downloads"));
+        assert!(screen.contains("Play / open media"));
+    }
+
+    #[test]
+    fn hidden_until_drawn_without_overlay() {
+        let mut app = media_app();
+        app.histories.get_mut(&10).unwrap().remove(&[44]);
+        app.msg_sel = None;
+        let font = app.media.font();
+        let cells = album_layout(&[(800, 600); 3], font, 92u16.min(ALBUM_COLS), ALBUM_ROWS);
+        for (i, c) in cells.iter().enumerate() {
+            let key = Key {
+                src: Src::File(100 + i as i32),
+                cols: c.w,
+                rows: c.h,
+                round: false,
+                animate: false,
+            };
+            let frames = ready_frames(&app, c.w, c.h);
+            app.media.insert_ready(key, frames, 0);
+        }
+        app.popup = Some(Popup::ConfirmLogout);
+        assert!(!shows_image(&mut app, 100, 40));
+        app.popup = None;
+        assert!(shows_image(&mut app, 100, 40));
+        app.popup = Some(Popup::ConfirmLogout);
+        assert!(shows_image(&mut app, 100, 40));
+    }
+
+    fn rss_kb() -> u64 {
+        std::fs::read_to_string("/proc/self/status")
+            .unwrap()
+            .lines()
+            .find_map(|l| l.strip_prefix("VmRSS:"))
+            .and_then(|v| v.trim().trim_end_matches("kB").trim().parse().ok())
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn fixture_scroll_memory() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".work/fixtures");
+        let sources = [
+            (
+                "photo_big.jpg",
+                Decode::Raster,
+                MediaKind::Photo,
+                2560,
+                1920,
+            ),
+            ("photo.jpg", Decode::Raster, MediaKind::Photo, 320, 200),
+            ("sticker.webp", Decode::Raster, MediaKind::Sticker, 256, 256),
+            ("sticker.tgs", Decode::Tgs, MediaKind::Sticker, 512, 512),
+            ("sticker.webm", Decode::Video, MediaKind::Sticker, 128, 128),
+            ("video.mp4", Decode::Video, MediaKind::VideoNote, 320, 240),
+        ];
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut picker = ratatui_image::picker::Picker::halfblocks();
+        picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+        let mut app = App::new(
+            crate::td::Td::new(tx),
+            ApiCredentials {
+                api_id: 1,
+                api_hash: "x".to_owned(),
+            },
+            std::env::temp_dir(),
+            Keymap::default(),
+            picker,
+        );
+        app.auth = Auth::Ready;
+        app.show_folders = false;
+        app.show_chats = false;
+        let mut h = History::default();
+        h.reached_start = true;
+        for i in 0..400i64 {
+            let (name, decode, kind, w, ht) = sources[i as usize % sources.len()];
+            let path = dir.join(name).to_string_lossy().into_owned();
+            let f = crate::model::FileRef {
+                id: 1000 + i as i32,
+                size: 1,
+                path,
+                done: true,
+                active: false,
+                downloaded: 1,
+            };
+            let mut a = Attachment::new(kind, f.clone());
+            a.width = w;
+            a.height = ht;
+            a.preview = Some(Visual {
+                file: f,
+                decode,
+                width: w,
+                height: ht,
+            });
+            let mut m = msg(i + 1, 2 + i % 2, 1_700_000_000 + i * 400, "");
+            m.body = RichText::default();
+            m.attachments = vec![a];
+            h.upsert(m);
+        }
+        let len = h.len();
+        app.histories.insert(10, h);
+        app.open_chat = Some(10);
+        app.focus = Pane::Messages;
+        let mut term = Terminal::new(TestBackend::new(160, 50)).unwrap();
+        let start_rss = rss_kb();
+        let mut peak = start_rss;
+        let started = std::time::Instant::now();
+        for step in 0..len {
+            app.msg_sel = Some(len - 1 - step);
+            for _ in 0..50 {
+                term.draw(|f| draw(f, &mut app)).unwrap();
+                app.after_draw();
+                let ev = tokio::time::timeout(Duration::from_millis(150), rx.recv()).await;
+                match ev {
+                    Ok(Some(ev)) => app.handle(ev),
+                    _ => break,
+                }
+                while let Ok(ev) = rx.try_recv() {
+                    app.handle(ev);
+                }
+                if step % 2 == 1 {
+                    break;
+                }
+            }
+            peak = peak.max(rss_kb());
+            assert!(app.media.stats().0 <= crate::media::MAX_ENTRIES + 4);
+        }
+        let (entries, bytes) = app.media.stats();
+        eprintln!(
+            "scrolled {len} media messages in {:?}: rss start {} MB, peak {} MB, end {} MB; cache {entries} entries, {} MB",
+            started.elapsed(),
+            start_rss / 1024,
+            peak / 1024,
+            rss_kb() / 1024,
+            bytes / 1024 / 1024
+        );
+        assert!(bytes <= crate::media::MAX_BYTES);
     }
 
     #[test]

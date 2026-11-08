@@ -57,8 +57,154 @@ pub struct Msg {
     pub outgoing: bool,
     pub state: SendState,
     pub reply_to: Option<i64>,
+    pub album: i64,
     pub media: Option<String>,
+    pub attachments: Vec<Attachment>,
     pub body: RichText,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileRef {
+    pub id: i32,
+    pub size: i64,
+    pub path: String,
+    pub done: bool,
+    pub active: bool,
+    pub downloaded: i64,
+}
+
+impl FileRef {
+    pub fn local(&self) -> Option<&str> {
+        (self.done && !self.path.is_empty()).then_some(self.path.as_str())
+    }
+
+    pub fn percent(&self) -> Option<u8> {
+        if self.done || self.size <= 0 || !self.active {
+            return None;
+        }
+        Some((self.downloaded.clamp(0, self.size) * 100 / self.size) as u8)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Decode {
+    Raster,
+    Tgs,
+    Video,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Visual {
+    pub file: FileRef,
+    pub decode: Decode,
+    pub width: i32,
+    pub height: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaKind {
+    Photo,
+    Video,
+    Animation,
+    VideoNote,
+    Voice,
+    Audio,
+    Sticker,
+    Document,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attachment {
+    pub kind: MediaKind,
+    pub file: FileRef,
+    pub preview: Option<Visual>,
+    pub full: Option<Visual>,
+    pub mini: Option<std::sync::Arc<[u8]>>,
+    pub width: i32,
+    pub height: i32,
+    pub duration: i32,
+    pub name: String,
+    pub mime: String,
+    pub waveform: Vec<u8>,
+}
+
+impl Attachment {
+    pub fn new(kind: MediaKind, file: FileRef) -> Self {
+        Self {
+            kind,
+            file,
+            preview: None,
+            full: None,
+            mini: None,
+            width: 0,
+            height: 0,
+            duration: 0,
+            name: String::new(),
+            mime: String::new(),
+            waveform: Vec::new(),
+        }
+    }
+
+    pub fn is_visual(&self) -> bool {
+        self.preview.is_some() || self.mini.is_some()
+    }
+
+    pub fn viewable(&self) -> bool {
+        self.full.is_some() || self.preview.is_some() || self.mini.is_some()
+    }
+}
+
+pub fn groups(msgs: &[Msg]) -> Vec<std::ops::Range<usize>> {
+    let mut out: Vec<std::ops::Range<usize>> = Vec::new();
+    for (i, m) in msgs.iter().enumerate() {
+        if let Some(last) = out.last_mut() {
+            let prev = &msgs[last.end - 1];
+            if m.album != 0 && prev.album == m.album && prev.sender == m.sender {
+                last.end = i + 1;
+                continue;
+            }
+        }
+        out.push(i..i + 1);
+    }
+    out
+}
+
+pub fn group_of(groups: &[std::ops::Range<usize>], index: usize) -> usize {
+    groups
+        .partition_point(|g| g.end <= index)
+        .min(groups.len().saturating_sub(1))
+}
+
+pub fn decode_waveform(bytes: &[u8]) -> Vec<u8> {
+    let count = bytes.len() * 8 / 5;
+    (0..count)
+        .map(|i| {
+            let bit = i * 5;
+            let lo = u16::from(bytes[bit / 8]);
+            let hi = u16::from(bytes.get(bit / 8 + 1).copied().unwrap_or(0));
+            (((lo | (hi << 8)) >> (bit % 8)) & 31) as u8
+        })
+        .collect()
+}
+
+pub fn waveform_bars(values: &[u8], width: usize) -> String {
+    const BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+    if values.is_empty() || width == 0 {
+        return String::new();
+    }
+    let peak = values.iter().copied().max().unwrap_or(0).max(1) as usize;
+    (0..width)
+        .map(|col| {
+            let from = col * values.len() / width;
+            let to = ((col + 1) * values.len() / width).max(from + 1);
+            let v = values[from..to.min(values.len())]
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(0) as usize;
+            BARS[(v * (BARS.len() - 1) + peak / 2) / peak]
+        })
+        .collect()
 }
 
 #[derive(Debug, Default)]
@@ -265,7 +411,9 @@ mod tests {
             outgoing: false,
             state: SendState::Sent,
             reply_to: None,
+            album: 0,
             media: None,
+            attachments: Vec::new(),
             body: RichText::plain(format!("m{id}")),
         }
     }
@@ -361,6 +509,65 @@ mod tests {
         });
         assert_eq!(sorted_chat_ids(chats.iter(), ListId::Main), vec![3, 1]);
         assert!(sorted_chat_ids(chats.iter(), ListId::Archive).is_empty());
+    }
+
+    #[test]
+    fn albums_group_consecutive_same_sender() {
+        let mut ms: Vec<Msg> = (1..=7).map(msg).collect();
+        for m in &mut ms[1..4] {
+            m.album = 99;
+        }
+        ms[4].album = 99;
+        ms[4].sender = Sender::User(8);
+        ms[5].album = 5;
+        ms[6].album = 5;
+        let g = groups(&ms);
+        assert_eq!(g, vec![0..1, 1..4, 4..5, 5..7]);
+        assert_eq!(group_of(&g, 0), 0);
+        assert_eq!(group_of(&g, 2), 1);
+        assert_eq!(group_of(&g, 3), 1);
+        assert_eq!(group_of(&g, 6), 3);
+        assert_eq!(group_of(&g, 50), 3);
+        assert!(groups(&[]).is_empty());
+    }
+
+    #[test]
+    fn waveform_unpacks_five_bit_values() {
+        let values = [31u8, 0, 17, 5, 31, 2, 9, 30];
+        let mut bits: u64 = 0;
+        for (i, v) in values.iter().enumerate() {
+            bits |= u64::from(*v) << (i * 5);
+        }
+        let bytes: Vec<u8> = bits.to_le_bytes()[..5].to_vec();
+        assert_eq!(decode_waveform(&bytes), values.to_vec());
+        let bars = waveform_bars(&values, 4);
+        assert_eq!(bars.chars().count(), 4);
+        assert_eq!(bars.chars().next(), Some('█'));
+        assert_eq!(waveform_bars(&[], 10), "");
+        assert_eq!(waveform_bars(&[0, 0], 3), "▁▁▁");
+    }
+
+    #[test]
+    fn file_progress() {
+        let mut f = FileRef {
+            id: 1,
+            size: 200,
+            downloaded: 50,
+            active: true,
+            ..FileRef::default()
+        };
+        assert_eq!(f.percent(), Some(25));
+        assert_eq!(f.local(), None);
+        let done = FileRef {
+            done: true,
+            path: "/x".to_owned(),
+            downloaded: 200,
+            ..f.clone()
+        };
+        assert_eq!(done.local(), Some("/x"));
+        assert_eq!(done.percent(), None);
+        f.active = false;
+        assert_eq!(f.percent(), None);
     }
 
     #[test]

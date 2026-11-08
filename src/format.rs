@@ -188,6 +188,19 @@ pub fn duration(secs: i32) -> String {
     }
 }
 
+pub fn file_size(bytes: i64) -> String {
+    let b = bytes.max(0) as f64;
+    if b < 1024.0 {
+        format!("{} B", bytes.max(0))
+    } else if b < 1024.0 * 1024.0 {
+        format!("{:.0} KB", b / 1024.0)
+    } else if b < 1024.0 * 1024.0 * 1024.0 {
+        format!("{:.1} MB", b / 1024.0 / 1024.0)
+    } else {
+        format!("{:.2} GB", b / 1024.0 / 1024.0 / 1024.0)
+    }
+}
+
 fn local(ts: i64) -> Option<DateTime<Local>> {
     Local.timestamp_opt(ts, 0).single()
 }
