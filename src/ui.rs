@@ -1,15 +1,22 @@
-use ratatui::Frame;
+use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
+use crossterm::{execute, queue};
+use ratatui::backend::{Backend, ClearType, CrosstermBackend};
+use ratatui::buffer::{Buffer, CellDiffOption};
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style};
-use ratatui::symbols::border;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{
+    Block, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+};
+use ratatui::{Frame, Terminal};
 use unicode_width::UnicodeWidthStr;
 
-use crate::app::{App, Auth, Pane, Popup};
-use crate::config::APP_NAME;
+use crate::app::{App, Auth, Pane, Popup, Row};
+use crate::config::{APP_NAME, MessageLayout};
 
 const QR_CAPTION: &str = "Scan in Telegram → Settings → Devices → Link Desktop Device";
+use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::Duration;
 
 use ratatui_image::sliced::{SignedPosition, SlicedImage, SlicedProtocol};
@@ -17,23 +24,52 @@ use ratatui_image::sliced::{SignedPosition, SlicedImage, SlicedProtocol};
 use crate::format::{self, render_text};
 use crate::media::{self, Input, Key, Look, Media, Src, album_layout, fit_cells, layout_height};
 use crate::model::{self, Attachment, ChatKind, Decode, MediaKind, Msg, SendState, Sender, Visual};
+use crate::popups::draw as draw_stage4_popup;
 use crate::qr;
 use crate::theme;
 
-const AUTHOR_COLORS: [Color; 7] = [
-    Color::Red,
-    Color::Green,
-    Color::Yellow,
-    Color::Blue,
-    Color::Magenta,
-    Color::Cyan,
-    theme::ORANGE,
-];
+#[path = "layouts.rs"]
+mod layouts;
+
+pub fn draw_frame<W: std::io::Write>(
+    terminal: &mut Terminal<CrosstermBackend<W>>,
+    app: &mut App,
+    layout: &mut u64,
+    drawn: impl FnOnce(&Buffer),
+) -> std::io::Result<()> {
+    queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
+    let force = std::mem::take(&mut app.force_clear);
+    let frame = terminal.draw(|f| draw(f, app))?;
+    let next = image_layout(frame.buffer);
+    if next == *layout && !force {
+        drawn(frame.buffer);
+    } else {
+        *layout = next;
+        terminal.draw(|_| {})?;
+        terminal.backend_mut().clear_region(ClearType::All)?;
+        drawn(terminal.draw(|f| draw(f, app))?.buffer);
+    }
+    execute!(terminal.backend_mut(), EndSynchronizedUpdate)
+}
+
+pub fn image_layout(buf: &Buffer) -> u64 {
+    let mut h = DefaultHasher::new();
+    buf.area.hash(&mut h);
+    for (i, c) in buf.content.iter().enumerate() {
+        if !matches!(c.diff_option, CellDiffOption::None) {
+            i.hash(&mut h);
+        }
+    }
+    h.finish()
+}
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
+    let th = app.frame_theme();
+    theme::install(th.clone());
     app.animating = false;
-    frame.render_widget(Block::default().style(theme::normal()), area);
+    app.prune_typing(std::time::Instant::now());
+    frame.render_widget(Block::default().style(theme::surface()), area);
     if app.auth != Auth::Ready {
         draw_login(frame, area, app);
         return;
@@ -41,12 +77,19 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.refresh_lists();
     let [header, main] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
     draw_header(frame, header, app);
-    let width = |visible: bool, w: u16| Constraint::Length(if visible { w } else { 0 });
+    let width = |visible: bool, w: theme::PaneWidth| {
+        if visible {
+            w.constraint()
+        } else {
+            Constraint::Length(0)
+        }
+    };
+    let l = &th.layout;
     let [folders, chats, messages, info] = Layout::horizontal([
-        width(app.show_folders, 18),
-        width(app.show_chats, 30),
+        width(app.show_folders, l.folders_width),
+        width(app.show_chats, l.chats_width),
         Constraint::Min(30),
-        width(app.show_info, 30),
+        width(app.show_info, l.info_width),
     ])
     .areas(main);
     if app.show_folders {
@@ -65,21 +108,23 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_stickers(frame, area, app);
     } else {
         draw_popup(frame, area, app);
+        draw_profile_avatar(frame, area, app);
     }
     draw_key_hint(frame, main, app);
 }
 
 fn pane_block(title: String, focused: bool) -> Block<'static> {
-    let (style, title_style) = if focused {
-        (theme::focus_border(), theme::strong())
+    let style = if focused {
+        theme::focus_border()
     } else {
-        (theme::border(), theme::strong())
+        theme::border()
     };
+    let title_style = theme::title(focused);
     Block::default()
         .borders(Borders::ALL)
-        .border_set(border::ROUNDED)
+        .border_set(theme::border_set())
         .border_style(style)
-        .title(Span::styled(title, title_style))
+        .title(Span::styled(format::sanitize(&title), title_style))
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
@@ -93,14 +138,29 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::styled(" Connected as ", theme::muted()));
         spans.push(Span::styled(format!("{name} "), theme::strong()));
     }
+    let g = &theme::get().glyphs;
+    if app.settings.privacy.ghost_mode {
+        spans.push(Span::styled(
+            format!(" {} ghost ", g.ghost),
+            theme::warning(),
+        ));
+    } else if app.settings.privacy.dont_mark_read {
+        spans.push(Span::styled(
+            format!(" {} no-read ", g.no_read),
+            theme::muted(),
+        ));
+    }
     if let Some(p) = &app.playing {
-        spans.push(Span::styled(format!(" ▶ {} ", p.label), theme::media()));
+        spans.push(Span::styled(
+            format!(" {} {} ", g.playing, p.label),
+            theme::media(),
+        ));
     }
     if let Some((text, error)) = &app.status {
         let style = if *error {
             theme::error()
         } else {
-            theme::warning()
+            theme::status()
         };
         spans.push(Span::styled(format!(" {} ", format::one_line(text)), style));
     }
@@ -108,20 +168,14 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
 }
 
 fn split_filter(area: Rect, active: bool) -> (Rect, Option<Rect>) {
-    if active && area.height >= 2 {
-        let list = Rect {
-            height: area.height - 1,
-            ..area
-        };
-        let bar = Rect {
-            y: area.y + area.height - 1,
-            height: 1,
-            ..area
-        };
-        (list, Some(bar))
-    } else {
-        (area, None)
+    if !active || area.height < 2 {
+        return (area, None);
     }
+    let bar_y = area.bottom() - 1;
+    (
+        Rect::new(area.x, area.y, area.width, bar_y - area.y),
+        Some(Rect::new(area.x, bar_y, area.width, 1)),
+    )
 }
 
 fn draw_filter_bar(frame: &mut Frame, area: Option<Rect>, app: &App, pane: Pane) {
@@ -151,7 +205,7 @@ fn draw_filter_bar(frame: &mut Frame, area: Option<Rect>, app: &App, pane: Pane)
     }
 }
 
-fn list_window(selected: usize, len: usize, height: usize) -> usize {
+pub(crate) fn list_window(selected: usize, len: usize, height: usize) -> usize {
     if height == 0 || len <= height {
         0
     } else {
@@ -159,28 +213,27 @@ fn list_window(selected: usize, len: usize, height: usize) -> usize {
     }
 }
 
-fn row_line(
+pub(crate) fn row_line(
     label: Vec<Span<'static>>,
     selected: bool,
     focused: bool,
     width: usize,
 ) -> Line<'static> {
+    let mark = theme::selection_marker();
+    let mut used = mark.width();
     let marker = if selected && focused {
-        Span::styled(theme::SELECTION_MARKER, theme::selection())
+        Span::styled(mark, theme::selection())
     } else {
-        Span::raw(" ".repeat(theme::SELECTION_MARKER.width()))
+        Span::raw(" ".repeat(used))
     };
     let mut spans = vec![marker];
-    let mut used = theme::SELECTION_MARKER.width();
     for mut span in label {
         let avail = width.saturating_sub(used);
         if avail == 0 {
             break;
         }
-        if span.content.width() > avail {
-            span = Span::styled(format::truncate(&span.content, avail), span.style);
-        }
-        used += span.content.width();
+        span = Span::styled(format::truncate(&span.content, avail), span.style);
+        used += format::cells(&span.content);
         if selected {
             span.style = span.style.patch(theme::selection());
         }
@@ -198,15 +251,27 @@ fn draw_folders(frame: &mut Frame, area: Rect, app: &App) {
     let (list, bar) = split_filter(inner, filter_on);
     let entries = app.folder_entries();
     let h = list.height as usize;
+    app.folder_rows.set(h);
     let start = list_window(app.folder_sel, entries.len(), h);
     let lines: Vec<Line> = entries
         .iter()
         .enumerate()
         .skip(start)
         .take(h)
-        .map(|(i, (_, name))| {
+        .map(|(i, (id, name))| {
+            let w = (list.width as usize).saturating_sub(theme::selection_marker().width());
+            let badge = app
+                .folder_badge(*id)
+                .map(|n| format!(" {n}"))
+                .unwrap_or_default();
+            let title = format::truncate(name, w.saturating_sub(badge.width()));
+            let pad = w.saturating_sub(title.width() + badge.width());
             row_line(
-                vec![Span::raw(name.clone())],
+                vec![
+                    Span::raw(title),
+                    Span::raw(" ".repeat(pad)),
+                    Span::styled(badge, theme::muted()),
+                ],
                 i == app.folder_sel,
                 focused,
                 list.width as usize,
@@ -228,60 +293,114 @@ fn draw_chats(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(block, area);
     let filter_on = app.filter.as_ref().is_some_and(|f| f.pane == Pane::Chats);
     let (list, bar) = split_filter(inner, filter_on);
-    let ids = app.visible_chats();
-    if ids.is_empty() {
+    let rows = app.chat_rows();
+    if rows.is_empty() {
         frame.render_widget(
             Paragraph::new(Span::styled(" Loading chats...", theme::muted())),
             list,
         );
     }
     let h = list.height as usize;
+    app.chat_rows.set(h);
     let w = list.width as usize;
-    let sel = app.chat_sel.min(ids.len().saturating_sub(1));
-    let start = list_window(sel, ids.len(), h);
-    let lines: Vec<Line> = ids
+    let sel = app.chat_sel.min(rows.len().saturating_sub(1));
+    let start = list_window(sel, rows.len(), h);
+    let lines: Vec<Line> = rows
         .iter()
         .enumerate()
         .skip(start)
         .take(h)
-        .filter_map(|(i, id)| {
-            let c = app.chats.get(id)?;
+        .filter_map(|(i, row)| {
+            let id = match *row {
+                Row::Chat(id) => id,
+                Row::Topic(chat, t) => {
+                    return Some(topic_line(app, chat, t, i == sel, focused, w));
+                }
+                Row::Loading(_) => {
+                    return Some(row_line(
+                        vec![Span::styled("   loading topics...", theme::muted())],
+                        i == sel,
+                        focused,
+                        w,
+                    ));
+                }
+            };
+            let c = app.chats.get(&id)?;
+            let muted = app.is_muted(c.id);
+            let th = theme::get();
+            let g = &th.glyphs;
             let mut badge = String::new();
-            let mut badge_style = theme::muted();
+            let mut badge_style = theme::muted_badge();
             if c.mentions > 0 {
-                badge = " @".to_owned();
+                badge = format!(" {}", g.mention_dot);
                 badge_style = theme::mention_badge();
             }
             if c.unread > 0 {
-                badge.push_str(&format!(" {}", c.unread));
-                if c.mentions == 0 && !c.muted {
-                    badge_style = theme::strong();
+                if g.unread_dot.is_empty() {
+                    badge.push_str(&format!(" {}", app.count(i64::from(c.unread))));
+                } else {
+                    badge.push_str(&format!(
+                        " {} {}",
+                        g.unread_dot,
+                        app.count(i64::from(c.unread))
+                    ));
+                }
+                if c.mentions == 0 && !muted {
+                    badge_style = theme::unread_badge();
                 }
             }
-            let mut title_style = if c.unread > 0 && !c.muted {
+            let mut title_style = if c.unread > 0 && !muted {
                 theme::unread()
-            } else if c.muted {
+            } else if muted {
                 theme::muted()
             } else {
                 theme::normal()
             };
             if app.open_chat == Some(c.id) {
-                title_style = title_style.patch(Style::default().fg(Color::Green));
+                title_style = title_style.patch(theme::open_chat());
             }
-            let prefix = match c.kind {
-                ChatKind::Secret(_) => "🔒 ",
-                _ => "",
+            let (prefix, prefix_style) = match c.kind {
+                _ if app.typing.contains_key(&c.id) => (g.typing.as_str(), theme::typing()),
+                ChatKind::Private(uid) | ChatKind::Secret(uid) if app.is_online(uid) => {
+                    (g.online.as_str(), theme::online())
+                }
+                ChatKind::Secret(_) => (g.secret.as_str(), Style::default()),
+                _ if c.forum && app.expanded == Some(c.id) => {
+                    (g.forum_open.as_str(), theme::muted())
+                }
+                _ if c.forum => (g.forum_closed.as_str(), theme::muted()),
+                _ => ("", Style::default()),
+            };
+            let state = app
+                .secret_chat(c.id)
+                .map(|s| s.state.short())
+                .filter(|s| !s.is_empty())
+                .map(|s| format!(" ({s})"))
+                .unwrap_or_default();
+            let prefix = if prefix.is_empty() {
+                String::new()
+            } else {
+                format!("{prefix} ")
             };
             let pinned = c.position_in(app.current_list()).is_some_and(|p| p.pinned);
+            let pin_mark = format!(" {}", g.pinned_chat);
             let avail = w
-                .saturating_sub(theme::SELECTION_MARKER.width())
+                .saturating_sub(theme::selection_marker().width())
                 .saturating_sub(badge.width())
-                .saturating_sub(usize::from(pinned) * 2);
-            let title = format::truncate(&format!("{prefix}{}", c.title), avail);
-            let pad = avail.saturating_sub(title.width());
-            let mut spans = vec![Span::styled(title, title_style), Span::raw(" ".repeat(pad))];
+                .saturating_sub(if pinned { pin_mark.width() } else { 0 });
+            let prefix = format::truncate(&prefix, avail);
+            let room = avail.saturating_sub(prefix.width());
+            let state = format::truncate(&state, room / 2);
+            let title = format::truncate(&c.title, room.saturating_sub(state.width()));
+            let pad = avail.saturating_sub(prefix.width() + title.width() + state.width());
+            let mut spans = vec![
+                Span::styled(prefix, title_style.patch(prefix_style)),
+                Span::styled(title, title_style),
+                Span::styled(state, theme::muted()),
+                Span::raw(" ".repeat(pad)),
+            ];
             if pinned {
-                spans.push(Span::styled(" ▴", theme::muted()));
+                spans.push(Span::styled(pin_mark, theme::muted()));
             }
             spans.push(Span::styled(badge, badge_style));
             Some(row_line(spans, i == sel, focused, w))
@@ -291,11 +410,106 @@ fn draw_chats(frame: &mut Frame, area: Rect, app: &App) {
     draw_filter_bar(frame, bar, app, Pane::Chats);
 }
 
-fn author_style(sender: Sender) -> Style {
-    let id = match sender {
-        Sender::User(id) | Sender::Chat(id) => id,
+fn topic_line(
+    app: &App,
+    chat: i64,
+    topic: i32,
+    selected: bool,
+    focused: bool,
+    w: usize,
+) -> Line<'static> {
+    let th = theme::get();
+    let g = &th.glyphs;
+    let Some(t) = app.topic(chat, topic) else {
+        return row_line(Vec::new(), selected, focused, w);
     };
-    theme::strong().fg(AUTHOR_COLORS[id.unsigned_abs() as usize % AUTHOR_COLORS.len()])
+    let muted = app.topic_muted(chat, topic);
+    let open = app.open_chat == Some(chat) && app.open_topic == Some(topic);
+    let mut style = if t.unread > 0 && !muted {
+        theme::unread()
+    } else if muted || (t.general && t.hidden) {
+        theme::muted()
+    } else {
+        theme::normal()
+    };
+    if open {
+        style = style.patch(theme::open_chat());
+    }
+    let (icon, icon_style) = if t.icon.is_empty() {
+        (g.topic.clone(), theme::topic_icon(t.color))
+    } else {
+        (t.icon.clone(), Style::default())
+    };
+    let mut badge = String::new();
+    let mut badge_style = theme::muted_badge();
+    if t.mentions > 0 {
+        badge = format!(" {}", g.mention_dot);
+        badge_style = theme::mention_badge();
+    }
+    if t.unread > 0 {
+        badge.push_str(&format!(" {}", app.count(i64::from(t.unread))));
+        if t.mentions == 0 && !muted {
+            badge_style = theme::unread_badge();
+        }
+    }
+    let mut marks = String::new();
+    if t.pinned {
+        marks.push_str(&format!(" {}", g.pinned_chat));
+    }
+    if t.closed && !t.hidden {
+        marks.push_str(&format!(" {}", g.topic_closed));
+    }
+    if t.general && t.hidden {
+        marks.push_str(" (hidden)");
+    }
+    let lead = format!("  {icon} ");
+    let avail = w
+        .saturating_sub(theme::selection_marker().width())
+        .saturating_sub(badge.width())
+        .saturating_sub(marks.width());
+    let lead = format::truncate(&lead, avail);
+    let name = format::truncate(&t.name, avail.saturating_sub(lead.width()));
+    let rest = avail.saturating_sub(lead.width() + name.width());
+    let preview = match t.last_message.as_ref() {
+        Some(m) if rest > 6 => {
+            let text = model::preview(m);
+            let who = if m.outgoing {
+                String::new()
+            } else {
+                let n = app.sender_name(m.sender);
+                format!("{}: ", n.split(' ').next().unwrap_or(&n))
+            };
+            format::truncate(&format!(" {who}{text}"), rest)
+        }
+        _ => String::new(),
+    };
+    let pad = rest.saturating_sub(preview.width());
+    let spans = vec![
+        Span::styled(lead, style.patch(icon_style)),
+        Span::styled(name, style),
+        Span::styled(preview, theme::muted()),
+        Span::raw(" ".repeat(pad)),
+        Span::styled(marks, theme::muted()),
+        Span::styled(badge, badge_style),
+    ];
+    row_line(spans, selected, focused, w)
+}
+
+fn sender_id(sender: Sender) -> i64 {
+    match sender {
+        Sender::User(id) | Sender::Chat(id) => id,
+    }
+}
+
+fn author_style(app: &App, sender: Sender) -> Style {
+    let own = matches!(sender, Sender::User(id) if app.my_id == Some(id));
+    theme::author(sender_id(sender), own)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Pic {
+    Att { rel: usize, att: usize },
+    Avatar(Sender),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -304,10 +518,10 @@ struct Place {
     col: u16,
     cols: u16,
     rows: u16,
-    msg: usize,
-    att: usize,
+    pic: Pic,
 }
 
+#[derive(Clone)]
 struct Rendered {
     lines: Vec<Line<'static>>,
     images: Vec<Place>,
@@ -353,35 +567,60 @@ fn kind_label(kind: MediaKind) -> &'static str {
     }
 }
 
-fn meta_text(app: &App, m: &Msg, idx: usize, att: &Attachment, width: usize) -> Option<String> {
+fn truncate_spans(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    let mut used = 0;
+    for span in spans {
+        let room = width.saturating_sub(used);
+        if room == 0 {
+            break;
+        }
+        let safe = format::sanitize(&span.content);
+        let w = format::cells(&safe);
+        if w > room {
+            out.push(Span::styled(format::truncate(&safe, room), span.style));
+            break;
+        }
+        used += w;
+        out.push(Span::styled(safe, span.style));
+    }
+    out
+}
+
+fn meta_line(
+    app: &App,
+    m: &Msg,
+    idx: usize,
+    att: &Attachment,
+    width: usize,
+) -> Option<Line<'static>> {
+    let th = theme::get();
+    let g = &th.glyphs;
     let f = app.media.file(&att.file);
     let size = (f.size > 0).then(|| format::file_size(f.size));
     let dur = format::duration(att.duration);
     let join = |parts: Vec<String>| parts.join(" · ");
-    let mut text = match att.kind {
+    let media = theme::media();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let text = match att.kind {
         MediaKind::Photo | MediaKind::Sticker => String::new(),
         MediaKind::Video => join(
-            [Some(format!("▶ video {dur}")), size]
+            [Some(format!("{} video {dur}", g.video)), size]
                 .into_iter()
                 .flatten()
                 .collect(),
         ),
-        MediaKind::Animation => join(
-            [Some("GIF".to_owned()), size]
-                .into_iter()
-                .flatten()
-                .collect(),
-        ),
-        MediaKind::VideoNote => format!("◉ video message {dur}"),
+        MediaKind::Animation => join([Some(g.gif.clone()), size].into_iter().flatten().collect()),
+        MediaKind::VideoNote => format!("{} video message {dur}", g.video_note),
         MediaKind::Voice => {
             let bars_w = width.saturating_sub(24).clamp(0, 32);
             let bars = model::waveform_bars(&att.waveform, bars_w);
-            join(
-                [Some(format!("🎤 {dur} {bars}").trim_end().to_owned()), size]
-                    .into_iter()
-                    .flatten()
-                    .collect(),
-            )
+            spans.push(Span::styled(format!("{} {dur}", g.voice), media));
+            if !bars.trim().is_empty() {
+                spans.push(Span::styled(" ", media));
+                spans.push(Span::styled(bars.trim_end().to_owned(), theme::waveform()));
+            }
+            size.map(|s| format!(" · {s}")).unwrap_or_default()
         }
         MediaKind::Audio => {
             let title = m
@@ -389,105 +628,306 @@ fn meta_text(app: &App, m: &Msg, idx: usize, att: &Attachment, width: usize) -> 
                 .as_deref()
                 .map_or(att.name.as_str(), |l| l.trim_start_matches("♪ "));
             join(
-                [Some(format!("♪ {title}")), Some(dur), size]
+                [Some(format!("{} {title}", g.audio)), Some(dur), size]
                     .into_iter()
                     .flatten()
                     .collect(),
             )
         }
         MediaKind::Document => join(
-            [Some(format!("📄 {}", att.name)), size]
+            [Some(format!("{} {}", g.file, att.name)), size]
                 .into_iter()
                 .flatten()
                 .collect(),
         ),
     };
+    let mut tail = text;
     if let Some(p) = f.upload_percent() {
-        text.push_str(&format!(" ⇡ {p}%"));
+        tail.push_str(&format!(" {} {p}%", g.upload));
     } else if let Some(p) = f.percent() {
-        text.push_str(&format!(" ⇣ {p}%"));
+        tail.push_str(&format!(" {} {p}%", g.download));
     } else if f.active {
-        text.push_str(" ⇣");
+        tail.push_str(&format!(" {}", g.download));
     }
     if let Some(e) = app.media.file_error(f.id) {
-        text.push_str(&format!(" ⚠ {e}"));
+        tail.push_str(&format!(" {} {e}", g.tick_failed));
     }
     if app
         .playing
         .as_ref()
         .is_some_and(|p| p.target == (m.id, idx))
     {
-        text.push_str(" ▶ playing");
+        tail.push_str(&format!(" {} playing", g.playing));
     }
-    let text = text.trim().to_owned();
-    (!text.is_empty()).then_some(text)
+    if spans.is_empty() {
+        tail = tail.trim().to_owned();
+    }
+    if !tail.is_empty() {
+        spans.push(Span::styled(tail, media));
+    }
+    (!spans.is_empty()).then(|| Line::from(truncate_spans(spans, width)))
+}
+
+fn gutter() -> usize {
+    theme::get().layout.message_gutter as usize
+}
+
+fn composer_pad() -> u16 {
+    theme::get().layout.composer_padding
+}
+
+const CLASSIC_AVATAR_COLS: u16 = 2;
+const MIN_AVATAR_ROWS: u16 = 2;
+const CLASSIC_RUN_SECS: i64 = 300;
+
+fn tick_span(app: &App, last: &Msg) -> Option<Span<'static>> {
+    if !last.outgoing {
+        return None;
+    }
+    let read = app
+        .chats
+        .get(&last.chat_id)
+        .is_some_and(|c| c.last_read_outbox >= last.id);
+    let (glyph, style) = theme::tick(match &last.state {
+        SendState::Pending => theme::Tick::Pending,
+        SendState::Failed(_) => theme::Tick::Failed,
+        SendState::Sent if read => theme::Tick::Read,
+        SendState::Sent => theme::Tick::Sent,
+    });
+    Some(Span::styled(glyph, style))
+}
+
+fn edited_label(lang: format::Lang) -> String {
+    let glyph = theme::get().glyphs.edited.clone();
+    if glyph != "auto" {
+        return glyph;
+    }
+    match lang {
+        format::Lang::Ru => "изм.",
+        format::Lang::En => "edited",
+    }
+    .to_owned()
+}
+
+fn edited_span(lang: format::Lang) -> Span<'static> {
+    Span::styled(edited_label(lang), theme::edited())
+}
+
+fn pin_span() -> Span<'static> {
+    Span::styled(theme::get().glyphs.pinned.clone(), theme::pinned())
+}
+
+fn day_separator(ctx: Ctx, ts: i64) -> Vec<Line<'static>> {
+    let width = ctx.width;
+    let label = format!(" {} ", format::day_label(ctx.lang, ts, ctx.now));
+    let mode = match theme::get().layout.date_separator {
+        theme::DateSeparator::Auto => match ctx.layout {
+            MessageLayout::Bubbles => theme::DateSeparator::Badge,
+            MessageLayout::Minimal => theme::DateSeparator::Plain,
+            _ => theme::DateSeparator::Line,
+        },
+        other => other,
+    };
+    let pad = width.saturating_sub(label.width()) / 2;
+    match mode {
+        theme::DateSeparator::None => Vec::new(),
+        theme::DateSeparator::Line | theme::DateSeparator::Auto => vec![Line::from(Span::styled(
+            format::separator(&label, width),
+            theme::date_separator(),
+        ))],
+        theme::DateSeparator::Badge => vec![Line::from(vec![
+            Span::raw(" ".repeat(pad)),
+            Span::styled(label, theme::date_badge()),
+        ])],
+        theme::DateSeparator::Plain => vec![Line::from(vec![
+            Span::raw(" ".repeat(pad)),
+            Span::styled(label, theme::date_separator()),
+        ])],
+    }
+}
+
+fn forward_line(app: &App, m: &Msg, lang: format::Lang, width: usize) -> Option<Line<'static>> {
+    let origin = m.forward.as_ref()?;
+    Some(Line::from(Span::styled(
+        format::truncate(&forward_text(app, origin, lang), width),
+        theme::forwarded(),
+    )))
+}
+
+fn forward_text(app: &App, origin: &model::Origin, lang: format::Lang) -> String {
+    let label = match lang {
+        format::Lang::Ru => "Переслано от",
+        format::Lang::En => "Forwarded from",
+    };
+    let glyph = &theme::get().glyphs.forwarded;
+    format!("{glyph} {label} {}", origin_name(app, origin))
+        .trim_start()
+        .to_owned()
+}
+
+fn reply_strip(app: &App, m: &Msg, lang: format::Lang, width: usize) -> Option<Line<'static>> {
+    let (sender, name, text) = reply_parts(app, m)?;
+    let bar_style = theme::reply_bar(sender.map(sender_id));
+    let bar = format!("{} ", theme::get().glyphs.reply_bar);
+    let room = width.saturating_sub(bar.width());
+    let mut spans = vec![Span::styled(bar, bar_style)];
+    if name.is_empty() {
+        let label = match lang {
+            format::Lang::Ru => "ответ на сообщение",
+            format::Lang::En => "reply to a message",
+        };
+        spans.push(Span::styled(
+            format::truncate(label, room),
+            theme::reply_text(),
+        ));
+        return Some(Line::from(spans));
+    }
+    let name = format::truncate(&name, room);
+    let rest = room.saturating_sub(name.width());
+    spans.push(Span::styled(name, theme::strong().patch(bar_style)));
+    if !text.is_empty() && rest > 3 {
+        spans.push(Span::styled(
+            format::truncate(&format!(": {text}"), rest),
+            theme::reply_text(),
+        ));
+    }
+    Some(Line::from(spans))
+}
+
+fn classic_avatar(app: &App, sender: Sender) -> Span<'static> {
+    let letter: String = initials(&app.sender_name(sender)).chars().take(1).collect();
+    let cols = CLASSIC_AVATAR_COLS as usize;
+    let pad = cols.saturating_sub(letter.width());
+    Span::styled(
+        format!(
+            "{}{letter}{}",
+            " ".repeat(pad / 2),
+            " ".repeat(pad - pad / 2)
+        ),
+        theme::avatar(sender_id(sender)),
+    )
 }
 
 fn group_block(
     app: &App,
     msgs: &[Msg],
     range: std::ops::Range<usize>,
-    width: usize,
+    ctx: Ctx,
     selected: bool,
 ) -> Rendered {
+    let width = ctx.width;
     let m = &msgs[range.start];
     let group = &msgs[range.clone()];
+    let last = &msgs[range.end - 1];
     let prev = range.start.checked_sub(1).map(|j| &msgs[j]);
     let new_day = prev.is_none_or(|p| !format::same_day(p.date, m.date));
-    let show_header = new_day || prev.is_none_or(|p| p.sender != m.sender || m.date - p.date > 300);
+    let show_header =
+        new_day || prev.is_none_or(|p| p.sender != m.sender || m.date - p.date > CLASSIC_RUN_SECS);
     let edited = group.iter().any(|g| g.edited);
+    let pinned = group.iter().any(|g| g.pinned);
+    let tick = tick_span(app, last);
+    let group_chat = app
+        .chats
+        .get(&m.chat_id)
+        .is_some_and(|c| matches!(c.kind, ChatKind::Group | ChatKind::Supergroup));
     let mut lines: Vec<Line<'static>> = Vec::new();
     if new_day {
-        lines.push(Line::from(Span::styled(
-            format::separator(&format!(" {} ", format::date_label(m.date)), width),
-            theme::muted(),
-        )));
+        if prev.is_some() {
+            lines.push(Line::default());
+        }
+        lines.extend(day_separator(ctx, m.date));
     } else if show_header {
-        lines.push(Line::from(""));
+        lines.push(Line::default());
     }
-    let inner = if selected {
-        width.saturating_sub(4).max(4)
-    } else {
-        width.max(1)
-    };
+    let gutter = gutter();
+    let inner = width.saturating_sub(2 * gutter.max(2)).max(4);
     let mut body: Vec<Line<'static>> = Vec::new();
+    let mut images = Vec::new();
     let time = format::time_label(m.date);
     if show_header {
-        let name = format::truncate(
-            &app.sender_name(m.sender),
-            inner.saturating_sub(time.width() + 1).max(1),
-        );
-        let mut header = vec![
-            Span::styled(name, author_style(m.sender)),
-            Span::raw(" "),
-            Span::styled(time.clone(), theme::muted()),
-        ];
-        if edited {
-            header.push(Span::styled(
-                " (edited)",
-                theme::muted().add_modifier(ratatui::style::Modifier::ITALIC),
-            ));
+        let mut header = Vec::new();
+        let mut tail = vec![Span::raw(" "), Span::styled(time, theme::time())];
+        if let Some(t) = tick.clone() {
+            tail.push(Span::raw(" "));
+            tail.push(t);
         }
+        if edited {
+            tail.push(Span::styled(" · ", theme::muted()));
+            tail.push(edited_span(ctx.lang));
+        }
+        if pinned {
+            tail.push(Span::raw(" "));
+            tail.push(pin_span());
+        }
+        let room = inner
+            .saturating_sub(spans_width(&header) + spans_width(&tail))
+            .max(1);
+        header.push(Span::styled(
+            format::truncate(&app.sender_name(m.sender), room),
+            if selected {
+                theme::active_field()
+            } else {
+                author_style(app, m.sender)
+            },
+        ));
+        header.extend(tail);
         body.push(Line::from(header));
     }
-    if let Some(reply_id) = m.reply_to {
-        let snippet = match app.histories.get(&m.chat_id).and_then(|h| h.get(reply_id)) {
-            Some(r) => {
-                let text = if r.body.text.is_empty() {
-                    r.media.clone().unwrap_or_default()
-                } else {
-                    format::one_line(&r.body.text)
-                };
-                format!("↳ {}: {}", app.sender_name(r.sender), text)
-            }
-            None => "↳ reply".to_owned(),
-        };
-        body.push(Line::from(Span::styled(
-            format::truncate(&snippet, inner),
-            theme::muted(),
-        )));
+    body.extend(forward_line(app, m, ctx.lang, inner));
+    body.extend(reply_strip(app, m, ctx.lang, inner));
+    let before = body.len();
+    group_content(
+        app,
+        msgs,
+        range.clone(),
+        inner,
+        true,
+        &mut body,
+        &mut images,
+    );
+    if !show_header {
+        let from = before.max(layouts::media_end(&images));
+        layouts::attach_right(
+            &mut body,
+            from,
+            layouts::marks(edited, pinned, tick, ctx.lang),
+            inner,
+        );
     }
-    let media_w = width.saturating_sub(4).max(1) as u16;
+    let offset = lines.len();
+    let lead = gutter.max(usize::from(selected));
+    for p in &mut images {
+        p.line += offset;
+        p.col += lead as u16;
+    }
+    lines.extend(body.into_iter().map(|mut l| {
+        l.spans.insert(0, Span::raw(" ".repeat(lead)));
+        if selected { select_row(l, width) } else { l }
+    }));
+    if !selected
+        && show_header
+        && group_chat
+        && theme::get().layout.avatars
+        && gutter >= CLASSIC_AVATAR_COLS as usize
+    {
+        let rest = gutter - CLASSIC_AVATAR_COLS as usize;
+        lines[offset].spans[0] = Span::raw(" ".repeat(rest));
+        lines[offset].spans.insert(0, classic_avatar(app, m.sender));
+    }
+    Rendered { lines, images }
+}
+
+fn group_content(
+    app: &App,
+    msgs: &[Msg],
+    range: std::ops::Range<usize>,
+    inner: usize,
+    ticks: bool,
+    body: &mut Vec<Line<'static>>,
+    images: &mut Vec<Place>,
+) {
+    let group = &msgs[range.clone()];
+    let media_w = inner as u16;
     let font = app.media.font();
     let visuals: Vec<(usize, usize)> = range
         .clone()
@@ -500,7 +940,6 @@ fn group_block(
                 .map(move |(ai, _)| (mi, ai))
         })
         .collect();
-    let mut images = Vec::new();
     if let [(mi, ai)] = visuals.as_slice() {
         let (cols, rows) = media_box(&msgs[*mi].attachments[*ai], font, media_w);
         images.push(Place {
@@ -508,8 +947,10 @@ fn group_block(
             col: 0,
             cols,
             rows,
-            msg: *mi,
-            att: *ai,
+            pic: Pic::Att {
+                rel: *mi - range.start,
+                att: *ai,
+            },
         });
         body.extend(std::iter::repeat_n(Line::default(), rows as usize));
     } else if visuals.len() > 1 {
@@ -525,8 +966,10 @@ fn group_block(
                 col: c.x,
                 cols: c.w,
                 rows: c.h,
-                msg: *mi,
-                att: *ai,
+                pic: Pic::Att {
+                    rel: *mi - range.start,
+                    att: *ai,
+                },
             });
         }
         body.extend(std::iter::repeat_n(
@@ -536,11 +979,8 @@ fn group_block(
     }
     for g in group {
         for (ai, att) in g.attachments.iter().enumerate() {
-            if let Some(text) = meta_text(app, g, ai, att, inner) {
-                body.push(Line::from(Span::styled(
-                    format::truncate(&text, inner),
-                    theme::media(),
-                )));
+            if let Some(line) = meta_line(app, g, ai, att, inner) {
+                body.push(line);
             }
         }
         if g.attachments.is_empty()
@@ -557,6 +997,38 @@ fn group_block(
         if !g.body.text.is_empty() {
             body.extend(render_text(&g.body, theme::normal(), inner));
         }
+        if g.ttl != 0 {
+            let text = format!("{} {}", theme::get().glyphs.timer, format::ttl(g.ttl));
+            body.push(Line::from(Span::styled(
+                format::truncate(&text, inner),
+                theme::muted(),
+            )));
+        }
+    }
+    for g in group {
+        if let Some(kb) = g.keyboard.as_ref().filter(|k| k.inline) {
+            body.extend(keyboard_block(
+                kb,
+                inner,
+                button_focus(app, g.chat_id, g.id, true),
+                false,
+            ));
+        }
+        let views = (g.meta.channel_post && g.meta.views > 0)
+            .then(|| format!("👁 {}", app.count(i64::from(g.meta.views))));
+        if !g.reactions.is_empty() || views.is_some() {
+            let mut text = model::reactions_text(&g.reactions, &app.custom_emoji);
+            if let Some(v) = views {
+                if !text.is_empty() {
+                    text.push_str("  ");
+                }
+                text.push_str(&v);
+            }
+            body.push(Line::from(Span::styled(
+                format::truncate(&text, inner),
+                theme::reactions(),
+            )));
+        }
     }
     for g in group {
         match &g.state {
@@ -566,6 +1038,9 @@ fn group_block(
                     .attachments
                     .iter()
                     .any(|a| app.media.file(&a.file).uploading);
+                if ticks && !up {
+                    continue;
+                }
                 let text = if up {
                     "uploading... (Enter → c to cancel)"
                 } else {
@@ -582,58 +1057,134 @@ fn group_block(
             ))),
         }
     }
-    if !show_header
-        && edited
-        && let Some(last) = body.last_mut()
-    {
-        last.spans.push(Span::styled(" (edited)", theme::muted()));
-    }
-    let offset = lines.len() + usize::from(selected);
-    for p in &mut images {
-        p.line += offset;
-        if selected {
-            p.col += 2;
-        }
-    }
-    if selected {
-        lines.extend(card(body, width, (!show_header).then_some(time.as_str())));
-    } else {
-        lines.extend(body);
-    }
-    Rendered { lines, images }
 }
 
-fn card(body: Vec<Line<'static>>, width: usize, bottom_time: Option<&str>) -> Vec<Line<'static>> {
-    let style = theme::selection_border();
-    let inner = width.saturating_sub(2);
-    let mut out = vec![Line::from(Span::styled(
-        format!("╭{}╮", "─".repeat(inner)),
-        style,
-    ))];
-    for line in body {
-        let used: usize = line.spans.iter().map(|s| s.content.width()).sum();
-        let pad = width.saturating_sub(4).saturating_sub(used);
-        let mut spans = vec![Span::styled("│ ", style)];
-        spans.extend(line.spans);
-        spans.push(Span::raw(" ".repeat(pad)));
-        spans.push(Span::styled(" │", style));
-        out.push(Line::from(spans));
+fn button_focus(app: &App, chat_id: i64, msg_id: i64, inline: bool) -> Option<usize> {
+    match &app.popup {
+        Some(Popup::Buttons(b))
+            if b.chat_id == chat_id && b.msg_id == msg_id && b.keyboard.inline == inline =>
+        {
+            Some(b.sel)
+        }
+        _ => None,
     }
-    match bottom_time.filter(|t| inner > t.width() + 3) {
-        Some(t) => out.push(Line::from(vec![
-            Span::styled(format!("╰{}", "─".repeat(inner - t.width() - 3)), style),
-            Span::styled(format!(" {t} "), theme::muted()),
-            Span::styled("─╯", style),
-        ])),
-        None => out.push(Line::from(Span::styled(
-            format!("╰{}╯", "─".repeat(inner)),
-            style,
-        ))),
+}
+
+pub(crate) fn keyboard_block(
+    kb: &crate::bots::Keyboard,
+    width: usize,
+    focus: Option<usize>,
+    keys: bool,
+) -> Vec<Line<'static>> {
+    let th = theme::get();
+    let mark = th.glyphs.url_button.clone();
+    let key = |i: usize| {
+        if keys {
+            crate::bots::button_key(i).map_or_else(String::new, |k| format!("{k} "))
+        } else {
+            String::new()
+        }
+    };
+    let rows = crate::bots::keyboard_layout(kb, width, |i, b| {
+        key(i).width() + crate::bots::button_label(b, &mark).width()
+    });
+    let b = theme::border_set();
+    let mut out = Vec::with_capacity(rows.len() * 3);
+    for row in rows {
+        let mut top: Vec<Span<'static>> = Vec::new();
+        let mut mid: Vec<Span<'static>> = Vec::new();
+        let mut bottom: Vec<Span<'static>> = Vec::new();
+        let mut col = 0;
+        for cell in row {
+            let Some(button) = kb.button(cell.index) else {
+                continue;
+            };
+            if cell.x > col {
+                let gap = " ".repeat(cell.x - col);
+                top.push(Span::raw(gap.clone()));
+                mid.push(Span::raw(gap.clone()));
+                bottom.push(Span::raw(gap));
+            }
+            let focused = focus == Some(cell.index);
+            let (edge, text, hint) = if focused {
+                let s = theme::button_selected();
+                (s, s, s)
+            } else {
+                (
+                    theme::button_border(),
+                    theme::button_text(),
+                    theme::hint_key(),
+                )
+            };
+            let inner = cell.width.saturating_sub(2);
+            let room = if inner >= 4 { inner - 2 } else { inner };
+            let k = format::truncate(&key(cell.index), room);
+            let label = format::truncate(
+                &crate::bots::button_label(button, &mark),
+                room.saturating_sub(k.width()),
+            );
+            let pad = inner.saturating_sub(k.width() + label.width());
+            top.push(Span::styled(
+                format!(
+                    "{}{}{}",
+                    b.top_left,
+                    b.horizontal_top.repeat(inner),
+                    b.top_right
+                ),
+                edge,
+            ));
+            mid.push(Span::styled(b.vertical_left.to_owned(), edge));
+            mid.push(Span::styled(" ".repeat(pad / 2), text));
+            if !k.is_empty() {
+                mid.push(Span::styled(k, hint));
+            }
+            mid.push(Span::styled(label, text));
+            mid.push(Span::styled(" ".repeat(pad - pad / 2), text));
+            mid.push(Span::styled(b.vertical_right.to_owned(), edge));
+            bottom.push(Span::styled(
+                format!(
+                    "{}{}{}",
+                    b.bottom_left,
+                    b.horizontal_bottom.repeat(inner),
+                    b.bottom_right
+                ),
+                edge,
+            ));
+            col = cell.x + cell.width;
+        }
+        out.push(Line::from(top));
+        out.push(Line::from(mid));
+        out.push(Line::from(bottom));
     }
     out
 }
 
+fn select_row(line: Line<'static>, width: usize) -> Line<'static> {
+    let mut spans = line.spans;
+    if let Some(first) = spans.first_mut()
+        && first.content.starts_with(' ')
+    {
+        *first = Span::styled(first.content[1..].to_owned(), first.style);
+    }
+    spans.insert(
+        0,
+        Span::styled(
+            format::truncate(&theme::get().glyphs.selection_bar, 1),
+            theme::selection_bar(),
+        ),
+    );
+    let tint = theme::selection_bg();
+    let mut line = with_bg(Line::from(spans), tint);
+    let used = spans_width(&line.spans);
+    if used < width {
+        line.spans
+            .push(Span::styled(" ".repeat(width - used), bg_style(tint)));
+    }
+    line
+}
+
 const MAX_ATTACHMENT_LINES: usize = 5;
+const MAX_REPLY_KEYBOARD_LINES: usize = 9;
 
 fn attachment_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     let c = &app.composer;
@@ -664,7 +1215,8 @@ fn attachment_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             a.send_kind().label().to_owned()
         };
         let label = format!(
-            "📎 {} · {} · {kind}",
+            "{} {} · {} · {kind}",
+            theme::get().glyphs.attachment,
             a.name,
             format::file_size(a.size as i64)
         );
@@ -680,9 +1232,32 @@ fn attachment_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     }
     if c.pasting {
         out.push(Line::from(Span::styled(
-            "📋 reading clipboard...",
+            format!("{} reading clipboard...", theme::get().glyphs.clipboard),
             theme::muted(),
         )));
+    }
+    if let Some((id, kb)) = app.reply_keyboard() {
+        let rows = keyboard_block(
+            kb,
+            width,
+            app.open_chat
+                .and_then(|chat| button_focus(app, chat, id, false)),
+            false,
+        );
+        let shown = rows.len().min(MAX_REPLY_KEYBOARD_LINES);
+        let hidden = (rows.len() - shown) / 3;
+        let mut label = format!("{} C-k", theme::get().glyphs.keyboard);
+        if !kb.placeholder.is_empty() {
+            label = format!("{label} · {}", kb.placeholder);
+        }
+        if hidden > 0 {
+            label = format!("{label} · +{hidden}");
+        }
+        out.push(Line::from(Span::styled(
+            format::truncate(&label, width),
+            theme::muted(),
+        )));
+        out.extend(rows.into_iter().take(shown));
     }
     out
 }
@@ -694,22 +1269,19 @@ fn composer_height(app: &App, width: usize) -> u16 {
     if app.recording.is_some() {
         return 3;
     }
-    let lines = app
-        .composer
-        .input
-        .visual_lines(width.saturating_sub(2))
-        .len()
-        .max(1);
-    let extra = attachment_lines(app, width).len();
+    let text_w = width.saturating_sub(2 + 2 * composer_pad() as usize);
+    let lines = app.composer.input.visual_lines(text_w).len().max(1);
+    let extra = attachment_lines(app, text_w).len();
     (lines.min(8) + 2 + extra) as u16
 }
 
 fn draw_messages(frame: &mut Frame, area: Rect, app: &mut App) {
     let focused = app.focus == Pane::Messages;
-    let title = app
-        .open_chat
-        .and_then(|id| app.chats.get(&id))
-        .map_or_else(|| "Messages".to_owned(), |c| c.title.clone());
+    let title = app.view_title();
+    let title = match app.open_chat.and_then(|id| app.chat_subtitle(id)) {
+        Some(sub) => format!("{title} · {sub}"),
+        None => title,
+    };
     let block = pane_block(
         format!(
             " {} ",
@@ -726,13 +1298,720 @@ fn draw_messages(frame: &mut Frame, area: Rect, app: &mut App) {
     draw_message_list(frame, list, app);
     if ch > 0 {
         draw_composer(frame, composer, app);
+        draw_command_suggestions(frame, list, app);
     }
+}
+
+fn draw_command_suggestions(frame: &mut Frame, area: Rect, app: &App) {
+    let list = app.command_suggestions();
+    if list.is_empty() || area.height < 3 {
+        return;
+    }
+    let rows = list.len().min(8).min(area.height as usize - 2);
+    let sel = app.cmd_sel.min(list.len() - 1);
+    let start = list_window(sel, list.len(), rows);
+    let width = area.width.min(64);
+    let inner_w = width.saturating_sub(2) as usize;
+    let lines: Vec<Line<'static>> = list
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(rows)
+        .map(|(i, c)| {
+            row_line(
+                vec![
+                    Span::styled(format!("/{} ", c.name), theme::active_field()),
+                    Span::styled(c.description.clone(), theme::muted()),
+                ],
+                i == sel,
+                true,
+                inner_w,
+            )
+        })
+        .collect();
+    let height = rows as u16 + 2;
+    let rect = Rect {
+        x: area.x,
+        y: area.y + area.height - height,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, rect);
+    let block = theme::popup_block()
+        .title(Span::styled(" Commands ", theme::popup_title()))
+        .title_bottom(Span::styled(" Tab complete · ↑↓ select ", theme::muted()));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+const RUN_GAP_SECS: i64 = 600;
+const MAX_CACHED_BLOCKS: usize = 4096;
+
+#[derive(Default)]
+pub struct LayoutCache {
+    map: HashMap<(i64, i64, bool), (u64, Rendered)>,
+}
+
+impl LayoutCache {
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Ctx {
+    width: usize,
+    layout: MessageLayout,
+    theme: u64,
+    now: i64,
+    today: i64,
+    lang: format::Lang,
+    sel: Option<(usize, usize)>,
+}
+
+fn bg_style(bg: Option<Color>) -> Style {
+    Style {
+        bg,
+        ..Style::default()
+    }
+}
+
+fn same_run(a: &Msg, b: &Msg) -> bool {
+    a.sender == b.sender
+        && a.outgoing == b.outgoing
+        && format::same_day(a.date, b.date)
+        && (b.date - a.date).abs() <= RUN_GAP_SECS
+}
+
+pub(crate) fn initials(name: &str) -> String {
+    let letters: String = name
+        .split_whitespace()
+        .filter_map(|w| w.chars().find(|c| c.is_alphanumeric()))
+        .take(2)
+        .flat_map(char::to_uppercase)
+        .collect();
+    if letters.is_empty() {
+        "?".to_owned()
+    } else {
+        letters
+    }
+}
+
+fn origin_name(app: &App, origin: &model::Origin) -> String {
+    match origin {
+        model::Origin::Sender(s) => app.sender_name(*s),
+        model::Origin::Name(n) => n.clone(),
+    }
+}
+
+fn reply_parts(app: &App, m: &Msg) -> Option<(Option<Sender>, String, String)> {
+    let reply_id = m.reply_to?;
+    Some(
+        match app.histories.get(&m.chat_id).and_then(|h| h.get(reply_id)) {
+            Some(r) => {
+                let text = if r.body.text.is_empty() {
+                    r.media.clone().unwrap_or_default()
+                } else {
+                    format::one_line(&r.body.text)
+                };
+                (Some(r.sender), app.sender_name(r.sender), text)
+            }
+            None => (None, String::new(), String::new()),
+        },
+    )
+}
+
+fn fingerprint(
+    app: &App,
+    msgs: &[Msg],
+    range: std::ops::Range<usize>,
+    ctx: Ctx,
+    selected: bool,
+) -> u64 {
+    let mut h = DefaultHasher::new();
+    (
+        ctx.width, ctx.layout, ctx.theme, ctx.today, ctx.lang, selected,
+    )
+        .hash(&mut h);
+    app.media.font().hash(&mut h);
+    msgs[range.clone()].hash(&mut h);
+    if ctx.layout == MessageLayout::Cards {
+        let run = layouts::card_run(msgs, &range);
+        msgs[run.clone()].hash(&mut h);
+        for m in &msgs[run] {
+            app.sender_name(m.sender).hash(&mut h);
+        }
+    }
+    let edge = |m: Option<&Msg>| m.map(|m| (m.sender, m.date, m.outgoing));
+    edge(range.start.checked_sub(1).map(|j| &msgs[j])).hash(&mut h);
+    edge(msgs.get(range.end)).hash(&mut h);
+    ctx.sel
+        .map(|(s, e)| (s == range.end, e == range.start))
+        .hash(&mut h);
+    let chat = msgs
+        .get(range.start)
+        .and_then(|m| app.chats.get(&m.chat_id));
+    chat.map(|c| (c.kind.clone(), c.last_read_outbox))
+        .hash(&mut h);
+    app.playing.as_ref().map(|p| p.target).hash(&mut h);
+    for m in &msgs[range] {
+        app.sender_name(m.sender).hash(&mut h);
+        reply_parts(app, m).hash(&mut h);
+        m.forward.as_ref().map(|o| origin_name(app, o)).hash(&mut h);
+        for a in &m.attachments {
+            app.media.file(&a.file).hash(&mut h);
+            app.media.file_error(a.file.id).hash(&mut h);
+        }
+        button_focus(app, m.chat_id, m.id, true).hash(&mut h);
+        for r in m.reactions.iter().filter(|r| r.custom != 0) {
+            app.custom_emoji.get(&r.custom).hash(&mut h);
+        }
+    }
+    h.finish()
+}
+
+pub const DELETED_MARK: &str = "🗑 deleted";
+pub const BLOCKED_PLACEHOLDER: &str = "⊘ message from a blocked user · Enter to show";
+
+fn utf16_len(s: &str) -> usize {
+    s.encode_utf16().count()
+}
+
+pub fn mark_deleted(m: &mut Msg) {
+    let prefix = format!("{DELETED_MARK} · ");
+    let shift = utf16_len(&prefix);
+    if m.body.text.is_empty() {
+        let label = m.media.take().unwrap_or_default();
+        m.media = Some(if label.is_empty() {
+            DELETED_MARK.to_owned()
+        } else {
+            format!("{prefix}{label}")
+        });
+        return;
+    }
+    let len = utf16_len(&m.body.text);
+    for e in &mut m.body.entities {
+        e.offset += shift;
+    }
+    m.body.entities.push(model::Entity {
+        offset: shift,
+        length: len,
+        kind: model::EntityKind::Strike,
+    });
+    m.body.text = format!("{prefix}{}", m.body.text);
+}
+
+pub fn hide_blocked(m: &mut Msg) {
+    m.body = model::RichText::plain(BLOCKED_PLACEHOLDER);
+    m.media = None;
+    m.attachments.clear();
+    m.reactions.clear();
+    m.keyboard = None;
+    m.forward = None;
+    m.reply_to = None;
+}
+
+pub fn display_msgs<'a>(app: &App, msgs: &'a [Msg]) -> std::borrow::Cow<'a, [Msg]> {
+    let touched = |m: &Msg| m.deleted || app.hidden_blocked(m);
+    if !msgs.iter().any(touched) {
+        return std::borrow::Cow::Borrowed(msgs);
+    }
+    let mut out = msgs.to_vec();
+    for m in &mut out {
+        if app.hidden_blocked(m) {
+            hide_blocked(m);
+        } else if m.deleted {
+            mark_deleted(m);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+fn cached_block(
+    app: &App,
+    cache: &mut LayoutCache,
+    msgs: &[Msg],
+    range: std::ops::Range<usize>,
+    ctx: Ctx,
+    selected: bool,
+) -> Rendered {
+    let first = &msgs[range.start];
+    let key = (first.chat_id, first.id, selected);
+    let print = fingerprint(app, msgs, range.clone(), ctx, selected);
+    if let Some((p, r)) = cache.map.get(&key)
+        && *p == print
+    {
+        return r.clone();
+    }
+    let r = match ctx.layout {
+        MessageLayout::Classic => group_block(app, msgs, range, ctx, selected),
+        MessageLayout::Bubbles => bubble_block(app, msgs, range, ctx, selected),
+        MessageLayout::Cards => layouts::cards_block(app, msgs, range, ctx, selected),
+        MessageLayout::Compact => layouts::compact_block(app, msgs, range, ctx, selected),
+        MessageLayout::Minimal => layouts::minimal_block(app, msgs, range, ctx, selected),
+        MessageLayout::Split => layouts::split_block(app, msgs, range, ctx, selected),
+    };
+    if cache.map.len() >= MAX_CACHED_BLOCKS {
+        cache.map.clear();
+    }
+    cache.map.insert(key, (print, r.clone()));
+    r
+}
+
+fn with_bg(mut line: Line<'static>, bg: Option<Color>) -> Line<'static> {
+    for span in &mut line.spans {
+        if span.style.bg.is_none() {
+            span.style.bg = bg;
+        }
+    }
+    line
+}
+
+fn bubble_footer(
+    app: &App,
+    last: &Msg,
+    edited: bool,
+    pinned: bool,
+    lang: format::Lang,
+) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    if pinned {
+        spans.push(pin_span());
+        spans.push(Span::raw(" "));
+    }
+    if edited {
+        spans.push(edited_span(lang));
+        spans.push(Span::raw(" "));
+    }
+    spans.push(Span::styled(format::time_label(last.date), theme::time()));
+    if let Some(tick) = tick_span(app, last) {
+        spans.push(Span::raw(" "));
+        spans.push(tick);
+    }
+    spans
+}
+
+fn spans_width(spans: &[Span]) -> usize {
+    spans.iter().map(|s| s.content.width()).sum()
+}
+
+fn bubble_block(
+    app: &App,
+    msgs: &[Msg],
+    range: std::ops::Range<usize>,
+    ctx: Ctx,
+    selected: bool,
+) -> Rendered {
+    let width = ctx.width;
+    let m = &msgs[range.start];
+    let group = &msgs[range.clone()];
+    let last = &msgs[range.end - 1];
+    let prev = range.start.checked_sub(1).map(|j| &msgs[j]);
+    let next = msgs.get(range.end);
+    let new_day = prev.is_none_or(|p| !format::same_day(p.date, m.date));
+    let first_of_run = new_day || prev.is_none_or(|p| !same_run(p, m));
+    let last_of_run = next.is_none_or(|n| !same_run(last, n));
+    let group_chat = app
+        .chats
+        .get(&m.chat_id)
+        .is_some_and(|c| matches!(c.kind, ChatKind::Group | ChatKind::Supergroup));
+    let outgoing = m.outgoing;
+    let th = theme::get();
+    let show_names = group_chat && !outgoing;
+    let with_avatar = show_names && th.layout.avatars;
+    let avatar_rows = th.layout.bubble_avatar_rows as usize;
+    let avatar_cols = avatar_rows * 2;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    if new_day {
+        if prev.is_some() {
+            lines.push(Line::default());
+        }
+        let sep = day_separator(ctx, m.date);
+        if !sep.is_empty() {
+            lines.extend(sep);
+            lines.push(Line::default());
+        }
+    } else if first_of_run {
+        lines.push(Line::default());
+    }
+    let gutter = if with_avatar { avatar_cols + 1 } else { 1 };
+    let room = width.saturating_sub(gutter + 1).max(4);
+    let outer_max = (width * th.layout.bubble_max_width as usize / 100)
+        .max(18)
+        .min(room);
+    let inner_max = outer_max.saturating_sub(2).max(2);
+    let mut body: Vec<Line<'static>> = Vec::new();
+    if show_names && first_of_run {
+        body.push(Line::from(Span::styled(
+            format::truncate(&app.sender_name(m.sender), inner_max),
+            author_style(app, m.sender),
+        )));
+    }
+    if let Some(origin) = &m.forward {
+        body.push(Line::from(Span::styled(
+            format::truncate(&forward_text(app, origin, ctx.lang), inner_max),
+            theme::forwarded(),
+        )));
+    }
+    if let Some((sender, name, text)) = reply_parts(app, m) {
+        let bar_style = theme::reply_bar(sender.map(sender_id));
+        let bar = Span::styled(th.glyphs.bubble_reply_bar.clone(), bar_style);
+        let bar_w = bar.content.width();
+        let name = if name.is_empty() {
+            match ctx.lang {
+                format::Lang::Ru => "ответ".to_owned(),
+                format::Lang::En => "reply".to_owned(),
+            }
+        } else {
+            name
+        };
+        body.push(Line::from(vec![
+            bar.clone(),
+            Span::styled(
+                format::truncate(&name, inner_max.saturating_sub(bar_w)),
+                theme::strong().patch(bar_style),
+            ),
+        ]));
+        if !text.is_empty() {
+            body.push(Line::from(vec![
+                bar,
+                Span::styled(
+                    format::truncate(&text, inner_max.saturating_sub(bar_w)),
+                    theme::reply_text(),
+                ),
+            ]));
+        }
+    }
+    let mut images = Vec::new();
+    let before = body.len();
+    group_content(
+        app,
+        msgs,
+        range.clone(),
+        inner_max,
+        true,
+        &mut body,
+        &mut images,
+    );
+    let media_end = images
+        .iter()
+        .map(|p| p.line + p.rows as usize)
+        .max()
+        .unwrap_or(0);
+    let last_is_text = body.len() > before.max(media_end);
+    let edited = group.iter().any(|g| g.edited);
+    let pinned = group.iter().any(|g| g.pinned);
+    let footer = bubble_footer(app, last, edited, pinned, ctx.lang);
+    let footer_w = spans_width(&footer);
+    let image_w = images
+        .iter()
+        .map(|p| (p.col + p.cols) as usize)
+        .max()
+        .unwrap_or(0);
+    let content_w = body
+        .iter()
+        .map(|l| spans_width(&l.spans))
+        .max()
+        .unwrap_or(0)
+        .max(image_w);
+    let fits_last = last_is_text
+        && body
+            .last()
+            .is_some_and(|l| spans_width(&l.spans) + 1 + footer_w <= inner_max);
+    let inner_w = if fits_last {
+        content_w.max(body.last().map_or(0, |l| spans_width(&l.spans)) + 1 + footer_w)
+    } else {
+        content_w.max(footer_w)
+    }
+    .min(inner_max);
+    if fits_last {
+        if let Some(l) = body.last_mut() {
+            let pad = inner_w.saturating_sub(spans_width(&l.spans) + footer_w);
+            l.spans.push(Span::raw(" ".repeat(pad)));
+            l.spans.extend(footer);
+        }
+    } else {
+        let mut spans = vec![Span::raw(" ".repeat(inner_w.saturating_sub(footer_w)))];
+        spans.extend(footer);
+        body.push(Line::from(spans));
+    }
+    let bg = theme::bubble_bg(outgoing, selected);
+    let outer_w = inner_w + 2;
+    let x = if outgoing {
+        width.saturating_sub(outer_w + 1)
+    } else {
+        gutter
+    };
+    let show_avatar = with_avatar && last_of_run;
+    let lift = if show_avatar {
+        avatar_rows.saturating_sub(body.len())
+    } else {
+        0
+    };
+    lines.extend(std::iter::repeat_n(Line::default(), lift));
+    let top = lines.len();
+    let edge = |left: bool| {
+        let g = if left {
+            &th.glyphs.selected_left
+        } else {
+            &th.glyphs.selected_right
+        };
+        if selected {
+            Span::styled(
+                format::truncate(g, 1),
+                theme::bubble_edge().patch(bg_style(bg)),
+            )
+        } else {
+            Span::styled(" ", bg_style(bg))
+        }
+    };
+    for l in body {
+        let used = spans_width(&l.spans);
+        let mut spans = vec![Span::raw(" ".repeat(x)), edge(true)];
+        let content = if used > inner_w {
+            Line::from(Span::raw(format::truncate(
+                &l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>(),
+                inner_w,
+            )))
+        } else {
+            l
+        };
+        let used = spans_width(&content.spans);
+        spans.extend(with_bg(content, bg).spans);
+        spans.push(Span::styled(
+            " ".repeat(inner_w.saturating_sub(used)),
+            bg_style(bg),
+        ));
+        spans.push(edge(false));
+        lines.push(Line::from(spans));
+    }
+    for p in &mut images {
+        p.line += top;
+        p.col += (x + 1) as u16;
+    }
+    if show_avatar {
+        let first_row = lines.len() - avatar_rows;
+        let label = initials(&app.sender_name(m.sender));
+        let cols = avatar_cols;
+        for (i, line) in lines[first_row..].iter_mut().enumerate() {
+            let text = if i == 0 {
+                let pad = cols.saturating_sub(label.width());
+                format!(
+                    "{}{label}{}",
+                    " ".repeat(pad / 2),
+                    " ".repeat(pad - pad / 2)
+                )
+            } else {
+                " ".repeat(cols)
+            };
+            let cell = Span::styled(text, theme::avatar(sender_id(m.sender)));
+            match line.spans.first_mut() {
+                Some(first) if first.content.width() >= cols => {
+                    let rest = first.content.width() - cols;
+                    *first = Span::raw(" ".repeat(rest));
+                    line.spans.insert(0, cell);
+                }
+                _ => line.spans.insert(0, cell),
+            }
+        }
+        images.push(Place {
+            line: first_row,
+            col: 0,
+            cols: avatar_cols as u16,
+            rows: avatar_rows as u16,
+            pic: Pic::Avatar(m.sender),
+        });
+    }
+    Rendered { lines, images }
+}
+
+fn avatar_cells(t: ImageTarget) -> impl Iterator<Item = (u16, u16, u16, u16)> {
+    (0..t.rows).flat_map(move |cy| {
+        (0..t.cols).filter_map(move |cx| {
+            let y = t.y + cy as isize;
+            let x = t.x + cx;
+            (y >= 0 && y < t.area.height as isize && x < t.area.width)
+                .then(|| (cx, cy, t.area.x + x, t.area.y + y as u16))
+        })
+    })
+}
+
+fn mask_halfblock_cell(
+    cell: &mut ratatui::buffer::Cell,
+    upper_in: bool,
+    lower_in: bool,
+    behind: Color,
+) {
+    let (fg, bg) = (cell.fg, cell.bg);
+    let (upper, lower) = match cell.symbol() {
+        "▀" => (fg, bg),
+        "▄" => (bg, fg),
+        _ => (bg, bg),
+    };
+    let (symbol, fg, bg) = match (upper_in, lower_in) {
+        (true, true) => return,
+        (false, false) => (" ", behind, behind),
+        (true, false) => ("▀", upper, behind),
+        (false, true) => ("▄", lower, behind),
+    };
+    cell.set_symbol(symbol);
+    cell.set_fg(fg);
+    cell.set_bg(bg);
+}
+
+fn draw_avatar(
+    frame: &mut Frame,
+    t: ImageTarget,
+    media: &mut Media,
+    photo: &model::FileRef,
+    overlay: bool,
+    behind: Option<Color>,
+) {
+    let f = media.file(photo);
+    let Some(input) = media::input_for(&f, Decode::Raster) else {
+        media.want_download(f.id, 1);
+        return;
+    };
+    let shape = theme::get().layout.avatar_shape;
+    let key = Key {
+        src: Src::File(f.id),
+        cols: t.cols,
+        rows: t.rows,
+        shape: Some(shape),
+        animate: false,
+    };
+    let font = media.font();
+    let Look::Ready(frames) = media.look(key, input, overlay) else {
+        return;
+    };
+    let Some(proto) = frames.at(Duration::ZERO) else {
+        return;
+    };
+    let behind = theme::cell_bg(behind);
+    let buf = frame.buffer_mut();
+    for (_, _, x, y) in avatar_cells(t) {
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            cell.reset();
+            cell.set_bg(behind);
+        }
+    }
+    render_proto(frame, t, proto);
+    if !matches!(proto, SlicedProtocol::Halfblocks(_)) {
+        return;
+    }
+    let (fw, fh) = (f32::from(font.0.max(1)), f32::from(font.1.max(1)));
+    let (w, h) = (f32::from(t.cols) * fw, f32::from(t.rows) * fh);
+    let buf = frame.buffer_mut();
+    for (cx, cy, x, y) in avatar_cells(t) {
+        let px = (f32::from(cx) + 0.5) * fw;
+        let top = f32::from(cy) * fh;
+        let upper = media::inside_shape(shape, w, h, px, top + fh * 0.25);
+        let lower = media::inside_shape(shape, w, h, px, top + fh * 0.75);
+        if let Some(cell) = buf.cell_mut((x, y)) {
+            mask_halfblock_cell(cell, upper, lower, behind);
+        }
+    }
+}
+
+fn draw_profile_avatar(frame: &mut Frame, area: Rect, app: &mut App) {
+    let Some(Popup::Profile(p)) = &app.popup else {
+        return;
+    };
+    if p.data.is_none() || p.error.is_some() || p.scroll > 0 {
+        return;
+    }
+    let Some(photo) = app.profile_photo(p.target) else {
+        return;
+    };
+    let rect = crate::popups::profile_rect(area);
+    let inner = Rect {
+        x: rect.x + 1,
+        y: rect.y + 1,
+        width: rect.width.saturating_sub(2),
+        height: rect.height.saturating_sub(2),
+    };
+    let (cols, rows) = crate::popups::PROFILE_AVATAR;
+    if inner.width <= cols + 1 || inner.height < rows {
+        return;
+    }
+    let t = ImageTarget {
+        area: inner,
+        x: 1,
+        y: 0,
+        cols,
+        rows,
+    };
+    draw_avatar(
+        frame,
+        t,
+        &mut app.media,
+        &photo,
+        false,
+        theme::popup_surface().bg,
+    );
+}
+
+fn pinned_bar(app: &App, chat_id: i64, width: usize) -> Option<Line<'static>> {
+    let m = app.pinned_msg.get(&chat_id)?;
+    let label = match app.lang {
+        format::Lang::Ru => "Закреплённое",
+        format::Lang::En => "Pinned",
+    };
+    let key = app
+        .keymap
+        .label_for(crate::keymap::Action::JumpToPinned)
+        .map(|k| format!("  {k}"))
+        .unwrap_or_default();
+    let head = format!("{} {label}: ", theme::get().glyphs.pinned);
+    let room = width.saturating_sub(head.width() + key.width() + 1);
+    Some(Line::from(vec![
+        Span::styled(head, theme::pinned_bar()),
+        Span::raw(format::truncate(&model::preview(m), room)),
+        Span::styled(key, theme::muted()),
+    ]))
+}
+
+pub fn lines_from(app: &mut App, chat_id: i64, from: usize) -> usize {
+    let mut cache = std::mem::take(&mut app.layout_cache);
+    let total = match app.histories.get(&chat_id) {
+        Some(h) if from < h.len() => {
+            let shown = display_msgs(app, h.msgs());
+            let msgs: &[Msg] = &shown;
+            let groups = model::groups(msgs);
+            let now = chrono::Local::now();
+            let ctx = Ctx {
+                width: app.msg_view_width.max(1),
+                layout: app.message_layout(),
+                theme: app.theme_key(),
+                now: now.timestamp(),
+                today: i64::from(chrono::Datelike::num_days_from_ce(&now.date_naive())),
+                lang: app.lang,
+                sel: None,
+            };
+            let first = model::group_of(&groups, from);
+            (first..groups.len())
+                .map(|g| {
+                    cached_block(app, &mut cache, msgs, groups[g].clone(), ctx, false)
+                        .lines
+                        .len()
+                })
+                .sum()
+        }
+        _ => 0,
+    };
+    app.layout_cache = cache;
+    total
 }
 
 fn draw_message_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let Some(chat_id) = app.open_chat else {
         let hint = Line::from(vec![
-            Span::styled(" Select a chat and press ", theme::muted()),
+            Span::styled("  Select a chat and press ", theme::muted()),
             Span::styled("Enter", theme::strong()),
             Span::styled(", or ", theme::muted()),
             Span::styled(
@@ -746,122 +2025,172 @@ fn draw_message_list(frame: &mut Frame, area: Rect, app: &mut App) {
         frame.render_widget(Paragraph::new(hint), area);
         return;
     };
+    let mut area = area;
+    if let Some(bar) = pinned_bar(app, chat_id, area.width as usize).filter(|_| area.height > 3) {
+        let [top, rest] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
+        frame.render_widget(Paragraph::new(bar), top);
+        area = rest;
+        app.msg_view_height = area.height as usize;
+    }
+    let full = area;
+    if theme::get().layout.scrollbar && area.width > 2 {
+        area.width -= 1;
+    }
     let height = area.height as usize;
     let width = area.width as usize;
+    app.msg_view_width = width;
     if height == 0 || width == 0 {
         return;
     }
     let Some(h) = app.histories.get(&chat_id) else {
         return;
     };
-    let msgs = h.msgs();
     if h.is_empty() {
         let text = if h.loading_older {
-            " Loading..."
+            "  Loading..."
         } else {
-            " No messages yet"
+            "  No messages yet"
         };
         frame.render_widget(Paragraph::new(Span::styled(text, theme::muted())), area);
         return;
     }
+    let mut cache = std::mem::take(&mut app.layout_cache);
+    let Some(h) = app.histories.get(&chat_id) else {
+        return;
+    };
+    let shown_msgs = display_msgs(app, h.msgs());
+    let msgs: &[Msg] = &shown_msgs;
     let reached_start = h.reached_start;
     let loading = h.loading_older;
+    let indicator = h.older_indicator(std::time::Instant::now());
+    if loading && !indicator && !reached_start {
+        app.animating = true;
+    }
     let groups = model::groups(msgs);
-    let block = |app: &App, g: usize, sel: Option<usize>| {
-        group_block(app, msgs, groups[g].clone(), width, sel == Some(g))
+    let now = chrono::Local::now();
+    let sel_group = app
+        .msg_sel
+        .map(|s| model::group_of(&groups, s.min(msgs.len() - 1)));
+    let ctx = Ctx {
+        width,
+        layout: app.message_layout(),
+        theme: app.theme_key(),
+        now: now.timestamp(),
+        today: i64::from(chrono::Datelike::num_days_from_ce(&now.date_naive())),
+        lang: app.lang,
+        sel: sel_group.map(|g| (groups[g].start, groups[g].end)),
+    };
+    let mut block = |app: &App, g: usize, sel: Option<usize>| {
+        cached_block(
+            app,
+            &mut cache,
+            msgs,
+            groups[g].clone(),
+            ctx,
+            sel == Some(g),
+        )
+    };
+    let absolute = |p: Place, g: usize| match p.pic {
+        Pic::Att { rel, att } => Place {
+            pic: Pic::Att {
+                rel: groups[g].start + rel,
+                att,
+            },
+            ..p
+        },
+        Pic::Avatar(_) => p,
     };
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut placed: Vec<(usize, Place)> = Vec::new();
-    let mut first_line = 0usize;
+    let mut starts: Vec<(usize, usize)> = Vec::new();
     let mut want_older = false;
-    match app.msg_sel {
-        None => {
-            let mut blocks: Vec<Rendered> = Vec::new();
-            let mut total = 0;
-            let mut g = groups.len();
-            while g > 0 && total < height + app.bottom_offset {
-                g -= 1;
-                let b = block(app, g, None);
-                total += b.lines.len();
-                blocks.push(b);
-            }
-            if total < height + app.bottom_offset && !reached_start {
-                want_older = true;
-            }
-            let mut all: Vec<Line<'static>> = Vec::with_capacity(total);
-            for b in blocks.into_iter().rev() {
-                let base = all.len();
-                placed.extend(b.images.into_iter().map(|p| (base + p.line, p)));
-                all.extend(b.lines);
-            }
-            let max_offset = all.len().saturating_sub(height);
-            app.bottom_offset = app.bottom_offset.min(max_offset);
-            let end = all.len() - app.bottom_offset;
-            let start = end.saturating_sub(height);
-            first_line = start;
-            all.truncate(end);
-            lines.extend(all.drain(start..));
-        }
-        Some(sel) => {
-            let gsel = model::group_of(&groups, sel.min(msgs.len() - 1));
-            let heights = |from: usize, to: usize, app: &App| -> usize {
-                (from..=to)
-                    .map(|g| block(app, g, Some(gsel)).lines.len())
-                    .sum()
-            };
-            let mut top = model::group_of(&groups, app.msg_top).min(gsel);
-            while top < gsel && heights(top, gsel, app) > height {
-                top += 1;
-            }
-            let mut below = 0;
-            let mut j = top;
-            while j < groups.len() && below <= height {
-                below += block(app, j, Some(gsel)).lines.len();
-                j += 1;
-            }
-            while top > 0 && below < height {
-                let add = block(app, top - 1, Some(gsel)).lines.len();
-                if below + add > height {
-                    break;
-                }
-                below += add;
-                top -= 1;
-            }
-            if top == 0 && !reached_start {
-                want_older = true;
-            }
-            let mut g = top;
-            while g < groups.len() && lines.len() < height {
-                let b = block(app, g, Some(gsel));
-                let base = lines.len();
-                placed.extend(b.images.into_iter().map(|p| (base + p.line, p)));
-                lines.extend(b.lines);
-                g += 1;
-            }
-            lines.truncate(height);
-            app.msg_top = groups[top].start;
-        }
+    let mut blocks: Vec<(usize, Rendered)> = Vec::new();
+    let mut total = 0;
+    let mut g = groups.len();
+    while g > 0 && (sel_group.is_some_and(|s| g > s) || total < height + app.bottom_offset) {
+        g -= 1;
+        let b = block(app, g, sel_group);
+        total += b.lines.len();
+        blocks.push((g, b));
     }
-    if loading && !reached_start && lines.len() >= height {
+    let unknown: Vec<i64> = blocks
+        .iter()
+        .flat_map(|(g, _)| &msgs[groups[*g].clone()])
+        .flat_map(|m| &m.reactions)
+        .map(|r| r.custom)
+        .filter(|id| *id != 0 && !app.custom_emoji.contains_key(id))
+        .collect();
+    app.want_emoji.extend(unknown);
+    let mut all: Vec<Line<'static>> = Vec::with_capacity(total);
+    let mut sel_span = None;
+    for (g, b) in blocks.into_iter().rev() {
+        let base = all.len();
+        starts.push((base, g));
+        placed.extend(
+            b.images
+                .into_iter()
+                .map(|p| (base + p.line, absolute(p, g))),
+        );
+        if sel_group == Some(g) {
+            sel_span = Some((base, base + b.lines.len()));
+        }
+        all.extend(b.lines);
+    }
+    let max_offset = all.len().saturating_sub(height);
+    let mut end = all.len() - app.bottom_offset.min(max_offset);
+    if let Some((s0, s1)) = sel_span {
+        if s1 > end {
+            end = s1;
+        }
+        if s0 + height < end {
+            end = s0 + height;
+        }
+        end = end.clamp(height.min(all.len()), all.len());
+    }
+    app.bottom_offset = all.len() - end;
+    let at_bottom = app.bottom_offset == 0;
+    let start = end.saturating_sub(height);
+    if start == 0 && !reached_start {
+        want_older = true;
+    }
+    let first_line = start;
+    if let Some(&(_, g)) = starts.iter().rev().find(|(line, _)| *line <= start) {
+        app.msg_top = groups[g].start;
+    }
+    all.truncate(end);
+    lines.extend(all.drain(start..));
+    app.layout_cache = cache;
+    if indicator && lines.len() >= height {
         lines[0] = Line::from(Span::styled(
             format::separator(" loading older ", width),
-            theme::muted(),
+            theme::date_separator(),
         ));
     }
     let pad = height.saturating_sub(lines.len());
     let mut shown: Vec<Line<'static>> = vec![Line::from(""); pad];
     shown.extend(lines);
     frame.render_widget(Paragraph::new(shown), area);
+    if full.width > area.width {
+        let view_end = first_line + height;
+        let top_group = starts
+            .iter()
+            .rev()
+            .find(|(line, _)| *line <= first_line)
+            .or(starts.first())
+            .map_or(0, |(_, g)| *g);
+        let visible = starts
+            .iter()
+            .filter(|(line, _)| *line >= first_line && *line < view_end)
+            .count()
+            .max(1);
+        draw_scrollbar(frame, full, groups.len(), top_group, visible);
+    }
     let overlay = app.popup.is_some() || !app.pending.is_empty();
     for (abs, p) in placed {
         let y = pad as isize + abs as isize - first_line as isize;
         if y + p.rows as isize <= 0 || y >= height as isize {
             continue;
         }
-        let m = &msgs[p.msg];
-        let Some(att) = m.attachments.get(p.att) else {
-            continue;
-        };
         let target = ImageTarget {
             area,
             x: p.col,
@@ -869,20 +2198,123 @@ fn draw_message_list(frame: &mut Frame, area: Rect, app: &mut App) {
             cols: p.cols,
             rows: p.rows,
         };
-        draw_attachment(
-            frame,
-            target,
-            &mut app.media,
-            att,
-            (chat_id, m.id, p.att),
-            overlay,
-            false,
-            Duration::ZERO,
-        );
+        match p.pic {
+            Pic::Att { rel, att } => {
+                let m = &msgs[rel];
+                let Some(a) = m.attachments.get(att) else {
+                    continue;
+                };
+                draw_attachment(
+                    frame,
+                    target,
+                    &mut app.media,
+                    a,
+                    (chat_id, m.id, att),
+                    overlay,
+                    false,
+                    Duration::ZERO,
+                );
+            }
+            Pic::Avatar(sender) => {
+                if y < 0
+                    || y + p.rows as isize > height as isize
+                    || p.rows < MIN_AVATAR_ROWS
+                    || p.cols < 2 * MIN_AVATAR_ROWS
+                {
+                    continue;
+                }
+                if let Some(photo) = app.sender_photo(sender) {
+                    draw_avatar(
+                        frame,
+                        target,
+                        &mut app.media,
+                        &photo,
+                        overlay,
+                        theme::surface().bg,
+                    );
+                }
+            }
+        }
+    }
+    if !at_bottom || app.window_detached() {
+        draw_jump_indicator(frame, area, app, chat_id);
     }
     if want_older {
         app.want_older = true;
     }
+}
+
+fn draw_scrollbar(frame: &mut Frame, area: Rect, total: usize, top: usize, visible: usize) {
+    let total = total.max(1);
+    let mut state = ScrollbarState::new(total.saturating_sub(visible).max(1))
+        .position(top.min(total))
+        .viewport_content_length(visible);
+    let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_style(theme::scrollbar())
+        .thumb_style(theme::scrollbar_thumb());
+    frame.render_stateful_widget(bar, area, &mut state);
+}
+
+fn jump_label(app: &App, chat_id: i64) -> String {
+    let unread = app.chats.get(&chat_id).map_or(0, |c| c.unread);
+    let key = app
+        .keymap
+        .label_for(crate::keymap::Action::JumpBottom)
+        .unwrap_or_default();
+    let arrow = theme::get().glyphs.jump.clone();
+    match (unread, app.lang) {
+        (0, _) => format!(" {arrow} {key} "),
+        (n, format::Lang::Ru) => format!(" {arrow} {n} новых · {key} "),
+        (n, format::Lang::En) => format!(" {arrow} {n} new · {key} "),
+    }
+}
+
+fn unread_badges(app: &App, chat_id: i64) -> Vec<String> {
+    let topic = app.open_topic.filter(|_| app.is_forum(chat_id));
+    let (mentions, reactions) = app.unread_counts(chat_id, topic);
+    let glyphs = &theme::get().glyphs;
+    let heart = format::emoji_cell(&glyphs.reaction_badge)
+        .unwrap_or_else(|| format::sanitize(&glyphs.reaction_badge));
+    let at = format::sanitize(&glyphs.mention_dot);
+    let key = |a| app.keymap.label_for(a).unwrap_or_default();
+    let mut out = Vec::new();
+    for (n, glyph, action) in [
+        (reactions, heart, crate::keymap::Action::JumpToNextReaction),
+        (mentions, at, crate::keymap::Action::JumpToNextMention),
+    ] {
+        if n <= 0 {
+            continue;
+        }
+        let parts = [glyph, app.count(i64::from(n)), key(action)];
+        let text: Vec<&str> = parts
+            .iter()
+            .map(String::as_str)
+            .filter(|p| !p.is_empty())
+            .collect();
+        out.push(format!(" {} ", text.join(" ")));
+    }
+    out
+}
+
+fn draw_jump_indicator(frame: &mut Frame, area: Rect, app: &App, chat_id: i64) {
+    let label = jump_label(app, chat_id);
+    let w = (label.width() as u16).min(area.width);
+    if area.height == 0 || w == 0 {
+        return;
+    }
+    let rect = Rect {
+        x: area.x + area.width - w,
+        y: area.y + area.height - 1,
+        width: w,
+        height: 1,
+    };
+    frame.render_widget(Clear, rect);
+    frame.render_widget(
+        Paragraph::new(Span::styled(label, theme::jump_badge())),
+        rect,
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -932,7 +2364,7 @@ fn draw_attachment(
     full: bool,
     elapsed: Duration,
 ) -> bool {
-    let round = att.kind == MediaKind::VideoNote;
+    let shape = (att.kind == MediaKind::VideoNote).then_some(theme::AvatarShape::Circle);
     let mut note: Option<String> = None;
     let mut animated = false;
     let sources: Vec<&Visual> = if full {
@@ -946,12 +2378,13 @@ fn draw_attachment(
         let Some(input) = media::input_for(&f, v.decode) else {
             if n == 0 {
                 match media.file_error(v.file.id) {
-                    Some(e) => note = Some(format!("⚠ {e}")),
+                    Some(e) => note = Some(format!("{} {e}", theme::get().glyphs.tick_failed)),
                     None => {
                         media.want_download(v.file.id, priority);
+                        let down = theme::get().glyphs.download.clone();
                         note = Some(match f.percent() {
-                            Some(p) => format!("⇣ {} {p}%", kind_label(att.kind)),
-                            None => format!("⇣ {}", kind_label(att.kind)),
+                            Some(p) => format!("{down} {} {p}%", kind_label(att.kind)),
+                            None => format!("{down} {}", kind_label(att.kind)),
                         });
                     }
                 }
@@ -962,7 +2395,7 @@ fn draw_attachment(
             src: Src::File(v.file.id),
             cols: t.cols,
             rows: t.rows,
-            round,
+            shape,
             animate: full && v.decode == Decode::Tgs,
         };
         match media.look(key, input, overlay) {
@@ -975,7 +2408,7 @@ fn draw_attachment(
             }
             Look::Failed(e) => {
                 if n == 0 {
-                    note = Some(format!("⚠ {e}"));
+                    note = Some(format!("{} {e}", theme::get().glyphs.tick_failed));
                 }
             }
             Look::Hidden => return false,
@@ -995,7 +2428,7 @@ fn draw_attachment(
             },
             cols: t.cols,
             rows: t.rows,
-            round,
+            shape,
             animate: false,
         };
         match media.look(key, Input::Bytes(bytes.clone()), overlay) {
@@ -1033,11 +2466,8 @@ fn draw_viewer(frame: &mut Frame, area: Rect, app: &mut App) {
         Some(a) => format!(" {} {}/{} ", kind_label(a.kind), pos + 1, len),
         None => format!(" attachment {}/{} ", pos + 1, len),
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_set(border::ROUNDED)
-        .border_style(theme::focus_border())
-        .title(Span::styled(title, theme::strong()))
+    let block = theme::popup_block()
+        .title(Span::styled(title, theme::popup_title()))
         .title_bottom(Span::styled(
             " j/k prev/next · x play/open · s save · o xdg-open · Esc close ",
             theme::muted(),
@@ -1109,7 +2539,7 @@ fn draw_viewer(frame: &mut Frame, area: Rect, app: &mut App) {
         .as_ref()
         .and_then(|v| app.media.file(&v.file).percent())
     {
-        meta.push(format!("⇣ {p}%"));
+        meta.push(format!("{} {p}%", theme::get().glyphs.download));
     }
     let line = Rect {
         y: inner.y + image_h,
@@ -1128,28 +2558,64 @@ fn draw_viewer(frame: &mut Frame, area: Rect, app: &mut App) {
 fn draw_recording(frame: &mut Frame, area: Rect, rec: &crate::app::Recording) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_set(border::ROUNDED)
-        .border_style(theme::error())
-        .title(Span::styled(" Voice message ", theme::error()));
+        .border_set(theme::border_set())
+        .border_style(theme::recording())
+        .padding(Padding::horizontal(composer_pad()))
+        .title(Span::styled(" Voice message ", theme::recording()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    let secs = rec.started.elapsed().as_secs() as i32;
     let line = if rec.stopping {
         Line::from(Span::styled("⧗ encoding...", theme::muted()))
     } else {
-        let dot = if secs % 2 == 0 { "●" } else { "○" };
-        Line::from(vec![
-            Span::styled(
-                format!("{dot} REC {} ", format::duration(secs)),
-                theme::error(),
-            ),
-            Span::styled(" Enter", theme::strong()),
-            Span::styled(" send · ", theme::muted()),
-            Span::styled("Esc", theme::strong()),
-            Span::styled(" cancel", theme::muted()),
-        ])
+        let secs = rec.started.elapsed().as_secs() as i32;
+        let levels = rec
+            .levels
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        recording_line(secs, &levels, inner.width as usize)
     };
     frame.render_widget(Paragraph::new(line), inner);
+}
+
+fn recording_line(secs: i32, levels: &[u16], width: usize) -> Line<'static> {
+    const MIN_BARS: usize = 8;
+    let th = theme::get();
+    let dot = if secs % 2 == 0 {
+        &th.glyphs.recording
+    } else {
+        &th.glyphs.recording_blink
+    };
+    let label = format!("{dot} REC {}", format::duration(secs));
+    let full = vec![
+        Span::styled("Enter", theme::strong()),
+        Span::styled(" send · ", theme::muted()),
+        Span::styled("Esc", theme::strong()),
+        Span::styled(" cancel", theme::muted()),
+    ];
+    let compact = vec![
+        Span::styled("Enter", theme::strong()),
+        Span::styled(" · ", theme::muted()),
+        Span::styled("Esc", theme::strong()),
+    ];
+    let room = |hints: &[Span]| {
+        let w: usize = hints.iter().map(|h| h.content.width()).sum();
+        width.saturating_sub(label.width() + w + 4)
+    };
+    let hints = if room(&full) >= MIN_BARS || room(&compact) < MIN_BARS {
+        full
+    } else {
+        compact
+    };
+    let bars_w = room(&hints);
+    let mut spans = vec![Span::styled(label, theme::recording()), Span::raw("  ")];
+    if bars_w >= MIN_BARS {
+        let bars = crate::voice::live_bars(levels, bars_w);
+        let fill = bars_w - bars.chars().count();
+        spans.push(Span::styled(bars, theme::waveform()));
+        spans.push(Span::raw(" ".repeat(fill + 2)));
+    }
+    spans.extend(hints);
+    Line::from(spans)
 }
 
 fn draw_composer(frame: &mut Frame, area: Rect, app: &App) {
@@ -1170,19 +2636,60 @@ fn draw_composer(frame: &mut Frame, area: Rect, app: &App) {
                     .and_then(|h| h.get(id))
             })
             .map_or_else(|| "message".to_owned(), |m| app.sender_name(m.sender));
-        Span::styled(format!(" Reply to {name} "), theme::strong())
+        match &c.quote {
+            Some((q, _)) => Span::styled(
+                format!(
+                    " Reply to {name}: “{}” ",
+                    format::truncate(&format::one_line(q), 32)
+                ),
+                theme::strong(),
+            ),
+            None => Span::styled(format!(" Reply to {name} "), theme::strong()),
+        }
     } else {
         Span::styled(" Message ", theme::strong())
     };
+    let mut room = (area.width as usize).saturating_sub(2 + format::cells(&title.content));
+    let mut marks: Vec<Span> = Vec::new();
+    for label in app
+        .open_chat
+        .map(|id| unread_badges(app, id))
+        .unwrap_or_default()
+        .into_iter()
+        .rev()
+    {
+        let need = format::cells(&label) + 1;
+        if need > room {
+            break;
+        }
+        room -= need;
+        if !marks.is_empty() {
+            marks.insert(0, Span::raw(" "));
+        }
+        marks.insert(0, Span::styled(label, theme::jump_badge()));
+    }
+    let typing = app
+        .open_chat
+        .and_then(|id| app.typing_line(id, app.open_topic))
+        .map(|t| format::truncate(&format!("· {t}"), room.saturating_sub(1)))
+        .filter(|t| t.chars().count() > 2)
+        .map(|t| Span::styled(format!("{t} "), theme::typing()));
+    let title = Line::from(std::iter::once(title).chain(typing).collect::<Vec<_>>());
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_set(border::ROUNDED)
+        .border_set(theme::border_set())
         .border_style(if c.active {
             theme::focus_border()
         } else {
             theme::border()
         })
+        .padding(Padding::horizontal(composer_pad()))
         .title(title);
+    let block = if marks.is_empty() {
+        block
+    } else {
+        block.title_top(Line::from(marks).right_aligned())
+    };
     let block = if c.att_sel.is_some() {
         block.title_bottom(Span::styled(
             " j/k select · J/K move · f as file · d remove · Tab text ",
@@ -1272,10 +2779,63 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &App) {
         Line::from(Span::styled(format!(" {}", chat.title), theme::strong())),
         Line::from(""),
         field("Type", kind.to_owned()),
-        field("Unread", chat.unread.to_string()),
-        field("Muted", if chat.muted { "yes" } else { "no" }.to_owned()),
-        field("ID", chat.id.to_string()),
     ];
+    if let ChatKind::Private(uid) | ChatKind::Secret(uid) = chat.kind
+        && let Some(status) = app.user_status(uid)
+    {
+        lines.push(field("Status", status));
+    }
+    if let Some(sc) = app.secret_chat(chat.id) {
+        lines.push(field("Secret", sc.state.label().to_owned()));
+        lines.push(field("Stored", "only on this device".to_owned()));
+    }
+    if chat.auto_delete > 0 {
+        let label = if matches!(chat.kind, ChatKind::Secret(_)) {
+            "Self-destruct"
+        } else {
+            "Auto-delete"
+        };
+        lines.push(field(label, format::ttl(chat.auto_delete)));
+    }
+    if chat.forum {
+        let n = app.topics.get(&chat.id).map_or(0, |l| l.topics().len());
+        lines.push(field("Topics", n.to_string()));
+    }
+    if let Some(t) = app.open_topic_info() {
+        let mut state = vec![format!("{} unread", app.count(i64::from(t.unread)))];
+        if t.closed {
+            state.push("closed".to_owned());
+        }
+        if app.topic_muted(chat.id, t.id) {
+            state.push("muted".to_owned());
+        }
+        lines.push(field("Topic", format!("{} · {}", t.name, state.join(", "))));
+    }
+    lines.extend([
+        field("Unread", app.count(i64::from(chat.unread))),
+        field(
+            "Muted",
+            if app.is_muted(chat.id) { "yes" } else { "no" }.to_owned(),
+        ),
+        field("ID", chat.id.to_string()),
+    ]);
+    if app.settings.appearance.show_ids {
+        if let ChatKind::Private(uid) | ChatKind::Secret(uid) = chat.kind {
+            lines.push(field("User ID", uid.to_string()));
+        }
+        if chat.group_id != 0 {
+            lines.push(field("Supergroup ID", chat.group_id.to_string()));
+        }
+        if chat.secret_id != 0 {
+            lines.push(field("Secret chat ID", chat.secret_id.to_string()));
+        }
+        if let Some(t) = app.open_topic {
+            lines.push(field("Topic ID", t.to_string()));
+        }
+        if let Some(m) = app.selected_message() {
+            lines.push(field("Message ID", m.id.to_string()));
+        }
+    }
     if let Some(h) = app.histories.get(&chat.id) {
         lines.push(field("Loaded", format!("{} messages", h.len())));
     }
@@ -1288,27 +2848,24 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &App) {
             format::file_size(bytes as i64)
         ),
     ));
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+        inner,
+    );
 }
 
-fn centered(area: Rect, width: u16, height: u16) -> Rect {
-    let width = width.min(area.width.saturating_sub(2)).max(1);
-    let height = height.min(area.height.saturating_sub(2)).max(1);
-    Rect {
-        x: area.x + area.width.saturating_sub(width) / 2,
-        y: area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    }
+pub(crate) fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let fit = |want: u16, avail: u16| want.clamp(1, avail.saturating_sub(2).max(1));
+    let (w, h) = (fit(width, area.width), fit(height, area.height));
+    let left = (area.width.max(w) - w) / 2;
+    let top = (area.height.max(h) - h) / 2;
+    Rect::new(area.x + left, area.y + top, w, h)
 }
 
-fn modal(frame: &mut Frame, rect: Rect, title: &str, lines: Vec<Line<'static>>) -> Rect {
+pub(crate) fn modal(frame: &mut Frame, rect: Rect, title: &str, lines: Vec<Line<'static>>) -> Rect {
     frame.render_widget(Clear, rect);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_set(border::ROUNDED)
-        .border_style(theme::focus_border())
-        .title(Span::styled(format!(" {title} "), theme::strong()));
+    let block =
+        theme::popup_block().title(Span::styled(format!(" {title} "), theme::popup_title()));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     frame.render_widget(Paragraph::new(lines), inner);
@@ -1341,6 +2898,21 @@ fn draw_popup(frame: &mut Frame, area: Rect, app: &App) {
             modal(frame, rect, title, lines);
         }
         Popup::Viewer { .. } | Popup::Stickers(_) => {}
+        Popup::Profile(_)
+        | Popup::Reactions(_)
+        | Popup::ReactionList { .. }
+        | Popup::Search(_)
+        | Popup::Buttons(_)
+        | Popup::ConfirmUrl(_)
+        | Popup::Options { .. }
+        | Popup::Details { .. }
+        | Popup::EditHistory { .. }
+        | Popup::ConfirmClearDeleted
+        | Popup::QuotePick { .. }
+        | Popup::Translate { .. }
+        | Popup::Members(_)
+        | Popup::EventLog(_)
+        | Popup::Inbox { .. } => draw_stage4_popup(frame, area, app, popup),
         Popup::FilePicker(fp) => draw_file_picker(frame, area, app, fp),
         Popup::ConfirmDelete { message_ids, .. } => {
             let question = if message_ids.len() > 1 {
@@ -1365,6 +2937,82 @@ fn draw_popup(frame: &mut Frame, area: Rect, app: &App) {
             let rect = centered(area, 40, 6);
             modal(frame, rect, "Delete", lines);
         }
+        Popup::NewTopic { input, .. } => {
+            let lines = vec![
+                Line::from(vec![
+                    Span::styled("> ", theme::active_field()),
+                    if input.is_empty() {
+                        Span::styled("topic name...", theme::muted())
+                    } else {
+                        Span::raw(input.text().to_owned())
+                    },
+                ]),
+                Line::from(Span::styled(" Enter create · Esc cancel", theme::muted())),
+            ];
+            let rect = centered(area, 44, 4);
+            let inner = modal(frame, rect, "New topic", lines);
+            let (_, col) = input.cursor_position(0);
+            frame.set_cursor_position(Position {
+                x: (inner.x + 2 + col as u16).min(inner.right().saturating_sub(1)),
+                y: inner.y,
+            });
+        }
+        Popup::Ttl {
+            chat_id,
+            choices,
+            sel,
+        } => {
+            let secret = app
+                .chats
+                .get(chat_id)
+                .is_some_and(|c| matches!(c.kind, ChatKind::Secret(_)));
+            let current = app.chats.get(chat_id).map_or(0, |c| c.auto_delete);
+            let mut lines: Vec<Line> = choices
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let mark = if *v == current { " ✓" } else { "" };
+                    row_line(
+                        vec![Span::raw(format!("{}{mark}", format::ttl(*v)))],
+                        i == *sel,
+                        true,
+                        32,
+                    )
+                })
+                .collect();
+            if secret {
+                lines.push(Line::from(Span::styled(
+                    " applies to new messages",
+                    theme::muted(),
+                )));
+            }
+            let title = if secret {
+                "Self-destruct timer"
+            } else {
+                "Auto-delete timer"
+            };
+            let rect = centered(area, 34, lines.len() as u16 + 2);
+            modal(frame, rect, title, lines);
+        }
+        Popup::ConfirmSecret { delete, .. } => {
+            let question = if *delete {
+                " Delete this secret chat and its messages?"
+            } else {
+                " Close this secret chat? It can't be reopened."
+            };
+            let lines = vec![
+                Line::from(question),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled(" y ", theme::active_field()),
+                    Span::raw(if *delete { "delete   " } else { "close   " }),
+                    Span::styled("n ", theme::active_field()),
+                    Span::raw("cancel"),
+                ]),
+            ];
+            let rect = centered(area, 50, 5);
+            modal(frame, rect, "Secret chat", lines);
+        }
         Popup::ConfirmLogout => {
             let lines = vec![
                 Line::from(" Log out of Telegram? y/N"),
@@ -1379,11 +3027,16 @@ fn draw_popup(frame: &mut Frame, area: Rect, app: &App) {
             let rect = centered(area, 40, 5);
             modal(frame, rect, "Log out", lines);
         }
-        Popup::Switcher { input, sel } => {
+        Popup::Switcher {
+            input,
+            sel,
+            forward,
+        } => {
             let results = app.switcher_results(input.text());
             let rect = centered(area, 60.min(area.width), 20.min(area.height));
             let inner_w = rect.width.saturating_sub(2) as usize;
             let rows = rect.height.saturating_sub(4) as usize;
+            app.popup_rows.set(rows);
             let sel = (*sel).min(results.len().saturating_sub(1));
             let start = list_window(sel, results.len(), rows);
             let mut lines = vec![
@@ -1395,7 +3048,10 @@ fn draw_popup(frame: &mut Frame, area: Rect, app: &App) {
                         Span::raw(input.text().to_owned())
                     },
                 ]),
-                Line::from(Span::styled("─".repeat(inner_w), theme::border())),
+                Line::from(Span::styled(
+                    theme::get().glyphs.separator.repeat(inner_w),
+                    theme::border(),
+                )),
             ];
             lines.extend(
                 results
@@ -1407,12 +3063,20 @@ fn draw_popup(frame: &mut Frame, area: Rect, app: &App) {
                         let c = app.chats.get(id)?;
                         let mut spans = vec![Span::raw(c.title.clone())];
                         if c.unread > 0 {
-                            spans.push(Span::styled(format!(" {}", c.unread), theme::muted()));
+                            spans.push(Span::styled(
+                                format!(" {}", app.count(i64::from(c.unread))),
+                                theme::muted(),
+                            ));
                         }
                         Some(row_line(spans, i == sel, true, inner_w))
                     }),
             );
-            let inner = modal(frame, rect, "Find chat", lines);
+            let title = if forward.is_some() {
+                "Forward to"
+            } else {
+                "Find chat"
+            };
+            let inner = modal(frame, rect, title, lines);
             let (_, col) = input.cursor_position(0);
             frame.set_cursor_position(Position {
                 x: (inner.x + 2 + col as u16).min(inner.right().saturating_sub(1)),
@@ -1428,6 +3092,7 @@ fn draw_file_picker(frame: &mut Frame, area: Rect, app: &App, fp: &crate::app::F
     let rect = centered(area, 72.min(area.width), 22.min(area.height));
     let inner_w = rect.width.saturating_sub(2) as usize;
     let rows = rect.height.saturating_sub(6) as usize;
+    app.popup_rows.set(rows);
     let sel = fp.sel.min(matches.len().saturating_sub(1));
     let mut lines = vec![
         Line::from(vec![
@@ -1442,11 +3107,14 @@ fn draw_file_picker(frame: &mut Frame, area: Rect, app: &App, fp: &crate::app::F
             format::truncate(&dir.display().to_string(), inner_w),
             theme::muted(),
         )),
-        Line::from(Span::styled("─".repeat(inner_w), theme::border())),
+        Line::from(Span::styled(
+            theme::get().glyphs.separator.repeat(inner_w),
+            theme::border(),
+        )),
     ];
     if let Some(e) = fp.error.as_ref().filter(|_| dir == fp.dir) {
         lines.push(Line::from(Span::styled(
-            format::truncate(&format!("⚠ {e}"), inner_w),
+            format::truncate(&format!("{} {e}", theme::get().glyphs.tick_failed), inner_w),
             theme::error(),
         )));
     } else if dir != fp.dir {
@@ -1503,11 +3171,8 @@ fn draw_stickers(frame: &mut Frame, area: Rect, app: &mut App) {
     } else {
         " Stickers "
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_set(border::ROUNDED)
-        .border_style(theme::focus_border())
-        .title(Span::styled(title, theme::strong()))
+    let block = theme::popup_block()
+        .title(Span::styled(title, theme::popup_title()))
         .title_bottom(Span::styled(
             " Tab/S-Tab section · arrows move · Enter send · type emoji to search · Esc close ",
             theme::muted(),
@@ -1623,7 +3288,7 @@ fn draw_stickers(frame: &mut Frame, area: Rect, app: &mut App) {
             frame.render_widget(
                 Block::default()
                     .borders(Borders::ALL)
-                    .border_set(border::ROUNDED)
+                    .border_set(theme::border_set())
                     .border_style(theme::selection_border()),
                 cell,
             );
@@ -1651,30 +3316,98 @@ fn draw_stickers(frame: &mut Frame, area: Rect, app: &mut App) {
     app.popup = Some(Popup::Stickers(sp));
 }
 
+const HINT_GAP: usize = 4;
+const HINT_MIN_WIDTH: u16 = 74;
+
+fn hint_column(group: crate::keymap::Group, hints: &[crate::keymap::Hint]) -> Vec<Line<'static>> {
+    let key_w = hints.iter().map(|h| h.key.width() + 2).max().unwrap_or(3);
+    let mut out = vec![Line::from(Span::styled(
+        group.title().to_owned(),
+        theme::hint_group(),
+    ))];
+    for h in hints {
+        let key = format!("[{}]", h.key);
+        let pad = key_w.saturating_sub(key.width());
+        let desc_style = if h.action.destructive() {
+            theme::error()
+        } else {
+            theme::normal()
+        };
+        out.push(Line::from(vec![
+            Span::styled(key, theme::hint_key()),
+            Span::raw(" ".repeat(pad + 2)),
+            Span::styled(h.desc.clone(), desc_style),
+        ]));
+    }
+    out
+}
+
+fn line_width(line: &Line) -> usize {
+    line.spans.iter().map(|s| s.content.width()).sum()
+}
+
+fn key_hint_lines(
+    groups: &[(crate::keymap::Group, Vec<crate::keymap::Hint>)],
+    max_w: usize,
+) -> Vec<Line<'static>> {
+    let cols: Vec<(Vec<Line<'static>>, usize)> = groups
+        .iter()
+        .map(|(g, h)| {
+            let lines = hint_column(*g, h);
+            let w = lines.iter().map(line_width).max().unwrap_or(0);
+            (lines, w)
+        })
+        .collect();
+    let mut rows: Vec<Vec<(Vec<Line<'static>>, usize)>> = Vec::new();
+    let mut used = 0;
+    for col in cols {
+        match rows.last_mut() {
+            Some(row) if used + HINT_GAP + col.1 <= max_w => {
+                used += HINT_GAP + col.1;
+                row.push(col);
+            }
+            _ => {
+                used = col.1;
+                rows.push(vec![col]);
+            }
+        }
+    }
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for (ri, row) in rows.into_iter().enumerate() {
+        if ri > 0 {
+            out.push(Line::default());
+        }
+        let height = row.iter().map(|(l, _)| l.len()).max().unwrap_or(0);
+        let last = row.len() - 1;
+        for r in 0..height {
+            let mut spans = Vec::new();
+            for (ci, (lines, w)) in row.iter().enumerate() {
+                let line = lines.get(r);
+                let lw = line.map_or(0, line_width);
+                if let Some(l) = line {
+                    spans.extend(l.spans.iter().cloned());
+                }
+                if ci < last {
+                    spans.push(Span::raw(" ".repeat(w - lw + HINT_GAP)));
+                }
+            }
+            out.push(Line::from(spans));
+        }
+    }
+    out
+}
+
 fn draw_key_hint(frame: &mut Frame, area: Rect, app: &App) {
     if app.pending.is_empty() {
         return;
     }
-    let items = app.keymap.continuations(&app.pending);
-    if items.is_empty() {
+    let groups = app.keymap.grouped_continuations(&app.pending);
+    if groups.is_empty() {
         return;
     }
-    let key_w = items.iter().map(|(k, _)| k.width()).max().unwrap_or(1);
-    let lines: Vec<Line> = items
-        .iter()
-        .map(|(k, d)| {
-            Line::from(vec![
-                Span::styled(format!(" {k:<key_w$} "), theme::active_field()),
-                Span::raw(format!("{d} ")),
-            ])
-        })
-        .collect();
-    let content_w = lines
-        .iter()
-        .map(|l| l.spans.iter().map(|s| s.content.width()).sum::<usize>())
-        .max()
-        .unwrap_or(10);
-    let width = (content_w as u16 + 2).max(28).min(area.width);
+    let lines = key_hint_lines(&groups, area.width.saturating_sub(4) as usize);
+    let content_w = lines.iter().map(line_width).max().unwrap_or(0) as u16;
+    let width = (content_w + 4).max(HINT_MIN_WIDTH).min(area.width);
     let height = (lines.len() as u16 + 2).min(area.height);
     let rect = Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
@@ -1687,7 +3420,13 @@ fn draw_key_hint(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         app.pending.iter().map(|c| c.label()).collect::<String>()
     };
-    modal(frame, rect, &title, lines);
+    frame.render_widget(Clear, rect);
+    let block = theme::popup_block()
+        .padding(Padding::horizontal(1))
+        .title(Span::styled(format!(" {title} "), theme::popup_title()));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_login(frame: &mut Frame, area: Rect, app: &App) {
@@ -1722,7 +3461,7 @@ fn draw_login(frame: &mut Frame, area: Rect, app: &App) {
                 let fits = qr.len() + 6 <= area.height as usize
                     && qr.first().map_or(0, |l| l.chars().count()) + 4 <= area.width as usize;
                 if fits {
-                    let qr_style = Style::default().fg(Color::White).bg(Color::Black);
+                    let qr_style = theme::qr();
                     let qr_w = qr.first().map_or(0, |l| l.chars().count());
                     let pad = " ".repeat(QR_CAPTION.width().saturating_sub(qr_w) / 2);
                     lines.extend(qr.into_iter().map(|l| {
@@ -1802,14 +3541,10 @@ fn draw_login(frame: &mut Frame, area: Rect, app: &App) {
     let width = (content_w as u16 + 4).max(50).min(area.width.max(1));
     let height = (lines.len() as u16 + 2).min(area.height.max(1));
     let rect = centered(area, width, height);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_set(border::ROUNDED)
-        .border_style(theme::focus_border())
-        .title(Span::styled(
-            format!(" {APP_NAME} login "),
-            theme::header_title(),
-        ));
+    let block = theme::popup_block().title(Span::styled(
+        format!(" {APP_NAME} login "),
+        theme::header_title(),
+    ));
     let inner = block.inner(rect);
     frame.render_widget(Clear, rect);
     frame.render_widget(block, rect);
@@ -1831,6 +3566,18 @@ fn draw_login(frame: &mut Frame, area: Rect, app: &App) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const MSG_GUTTER: usize = 2;
+    const AVATAR_COLS: u16 = 4;
+    const BUBBLE_PERCENT: usize = 68;
+
+    #[test]
+    fn test_constants_match_the_default_theme() {
+        let l = crate::theme::Theme::default().layout;
+        assert_eq!(l.message_gutter as usize, MSG_GUTTER);
+        assert_eq!(l.bubble_avatar_rows * 2, AVATAR_COLS);
+        assert_eq!(l.bubble_max_width as usize, BUBBLE_PERCENT);
+    }
     use crate::app::App;
     use crate::config::ApiCredentials;
     use crate::keymap::{Chord, Keymap};
@@ -1860,7 +3607,24 @@ mod tests {
                     kind: EntityKind::Bold,
                 }],
             },
+            pinned: false,
+            mention: false,
+            unread_reaction: false,
+            reactions: Vec::new(),
+            keyboard: None,
+            forward: None,
+            topic: None,
+            ttl: 0,
+            deleted: false,
+            meta: Default::default(),
         }
+    }
+
+    fn classic_rounded() -> theme::Theme {
+        let mut t = theme::Theme::default();
+        t.layout.message_layout = crate::config::MessageLayout::Classic;
+        t.layout.border_style = crate::config::BorderStyle::Rounded;
+        t
     }
 
     fn app() -> App {
@@ -1870,12 +3634,13 @@ mod tests {
             api_hash: "x".to_owned(),
         };
         let mut app = App::new(
-            crate::td::Td::new(tx),
+            crate::td::Td::recording(tx).0,
             creds,
             std::env::temp_dir(),
             Keymap::default(),
             ratatui_image::picker::Picker::halfblocks(),
         );
+        app.set_theme(classic_rounded());
         app.auth = Auth::Ready;
         app.users.insert(1, "Me".to_owned());
         app.users.insert(2, "Alice Longname".to_owned());
@@ -1887,14 +3652,24 @@ mod tests {
                 kind: ChatKind::Supergroup,
                 unread: 3,
                 mentions: 1,
+                reactions: 0,
                 last_read_inbox: 0,
+                last_read_outbox: 0,
+                photo: None,
                 muted: false,
+                use_default_mute: false,
                 positions: vec![Position {
                     list: ListId::Main,
                     order: 5,
                     pinned: true,
                 }],
                 last_message: None,
+                group_id: 0,
+                secret_id: 0,
+                forum: false,
+                auto_delete: 0,
+                perms: crate::model::Rights::default(),
+                protected: false,
             },
         );
         let mut h = History::default();
@@ -1913,6 +3688,7 @@ mod tests {
         app.histories.insert(10, h);
         app.open_chat = Some(10);
         app.show_info = true;
+        app.settings.appearance.layout = Some(crate::config::MessageLayout::Classic);
         app
     }
 
@@ -2096,14 +3872,16 @@ mod tests {
         app.recording = Some(crate::app::Recording {
             started: std::time::Instant::now() - std::time::Duration::from_secs(7),
             chat_id: 10,
+            topic: None,
             reply_to: None,
             stopping: false,
             stop: Some(tx),
+            levels: Default::default(),
         });
         let screen = render(&mut app, 120, 40);
         assert!(screen.contains("Voice message"));
         assert!(screen.contains("REC 0:07"));
-        assert!(screen.contains("Esc cancel"));
+        assert!(screen.contains("Enter · Esc"));
         app.recording.as_mut().unwrap().stopping = true;
         assert!(render(&mut app, 120, 40).contains("encoding"));
         app.recording = None;
@@ -2138,6 +3916,1110 @@ mod tests {
         term.draw(|f| draw(f, app)).unwrap();
         let buf = term.backend().buffer().clone();
         buf.content.iter().map(|c| c.symbol()).collect()
+    }
+
+    fn locate(app: &mut App, w: u16, h: u16, needle: &str) -> Option<(u16, u16)> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let chars: Vec<char> = needle.chars().collect();
+        (0..h).find_map(|y| {
+            (0..w).find_map(|x| {
+                let hit = chars.iter().enumerate().all(|(i, ch)| {
+                    let cx = x + i as u16;
+                    cx < w && buf[(cx, y)].symbol() == ch.to_string()
+                });
+                hit.then_some((x, y))
+            })
+        })
+    }
+
+    fn border_left_of(app: &mut App, w: u16, h: u16, needle: &str) -> (u16, u16) {
+        let (x, y) = locate(app, w, h, needle).unwrap_or_else(|| panic!("{needle} not found"));
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let border = (0..x)
+            .rev()
+            .find(|cx| buf[(*cx, y)].symbol() == "│")
+            .expect("pane border");
+        (x, border)
+    }
+
+    #[test]
+    fn messages_composer_and_recording_share_left_gutter() {
+        let mut app = app();
+        app.msg_sel = None;
+        let (body_x, pane) = border_left_of(&mut app, 120, 40, "hello there");
+        assert_eq!(body_x - pane - 1, MSG_GUTTER as u16);
+        let x = |app: &mut App, needle: &str| {
+            locate(app, 120, 40, needle)
+                .unwrap_or_else(|| panic!("{needle} not found"))
+                .0
+        };
+        assert_eq!(x(&mut app, "Alice Longname 0"), body_x);
+        assert_eq!(x(&mut app, "Me 0"), body_x);
+        app.msg_sel = Some(39);
+        assert_eq!(x(&mut app, "hello there"), body_x);
+        app.msg_sel = Some(3);
+        assert_eq!(x(&mut app, "│ Alice Longname: "), body_x);
+        app.msg_sel = Some(5);
+        assert_eq!(x(&mut app, "│ Alice Longname: "), body_x);
+        app.msg_sel = None;
+        app.composer.active = true;
+        app.composer.input = crate::input::TextInput::with_text("draftword");
+        let (draft_x, composer_border) = border_left_of(&mut app, 120, 40, "draftword");
+        assert_eq!(composer_border, pane + 1);
+        assert_eq!(draft_x, body_x);
+        let (tx, _rx) = tokio::sync::oneshot::channel();
+        app.recording = Some(crate::app::Recording {
+            started: std::time::Instant::now(),
+            chat_id: 10,
+            topic: None,
+            reply_to: None,
+            stopping: false,
+            stop: Some(tx),
+            levels: std::sync::Arc::new(std::sync::Mutex::new(vec![0, 300, 3000, 32_767])),
+        });
+        assert_eq!(x(&mut app, "REC 0:00") - 2, body_x);
+        let screen = render(&mut app, 120, 40);
+        assert!(screen.contains("REC 0:00  ▁▂▅█ "), "{screen}");
+        assert!(screen.contains("Enter · Esc"));
+        let screen = render(&mut app, 160, 40);
+        assert!(screen.contains("REC 0:00  ▁▂▅█ "), "{screen}");
+        assert!(screen.contains("Enter send · Esc cancel"));
+    }
+
+    #[test]
+    fn recording_line_scrolls_live_tail_and_keeps_hints_right() {
+        let flat = |l: &Line| -> String { l.spans.iter().map(|s| s.content.as_ref()).collect() };
+        let levels: Vec<u16> = (0..500)
+            .map(|i| if i == 499 { 32_767 } else { 0 })
+            .collect();
+        let line = recording_line(3, &levels, 60);
+        let text = flat(&line);
+        assert_eq!(text.width(), 60);
+        assert!(text.starts_with("○ REC 0:03  ▁"));
+        assert!(text.ends_with("█  Enter send · Esc cancel"), "{text}");
+        let short = flat(&recording_line(2, &[32_767, 32_767], 60));
+        assert_eq!(short.width(), 60);
+        assert!(short.starts_with("● REC 0:02  ██ "));
+        assert!(short.ends_with("Enter send · Esc cancel"));
+        let compact = flat(&recording_line(0, &levels, 36));
+        assert_eq!(compact.width(), 36);
+        assert!(compact.ends_with("█  Enter · Esc"), "{compact}");
+        let narrow = flat(&recording_line(0, &levels, 20));
+        assert!(!narrow.contains('▁'));
+        assert!(narrow.starts_with("● REC 0:00  Enter send"));
+    }
+
+    fn bubble_app() -> App {
+        let mut app = app();
+        app.settings.appearance.layout = Some(crate::config::MessageLayout::Bubbles);
+        app.show_info = false;
+        app.show_folders = false;
+        app.show_chats = false;
+        let now = chrono::Local::now().timestamp();
+        let mut h = History::default();
+        h.reached_start = true;
+        let plain = |id: i64, sender: i64, date: i64, text: &str| {
+            let mut m = msg(id, sender, date, text);
+            m.body = RichText::plain(text);
+            m.edited = false;
+            m.reply_to = None;
+            m.media = None;
+            m
+        };
+        let mut batch = vec![
+            plain(1, 2, now - 2 * 86_400, "old news"),
+            plain(2, 2, now - 600, "first from alice"),
+            plain(
+                3,
+                2,
+                now - 590,
+                "second from alice, which is long enough that it has to wrap inside the bubble at least once or twice",
+            ),
+            plain(4, 1, now - 500, "mine read"),
+            plain(5, 1, now - 400, "mine unread"),
+        ];
+        batch[2].edited = true;
+        h.merge_older(batch);
+        app.histories.insert(10, h);
+        app.chats.get_mut(&10).unwrap().last_read_outbox = 4;
+        app.chats.get_mut(&10).unwrap().unread = 0;
+        app
+    }
+
+    fn row_of(rows: &[String], needle: &str) -> usize {
+        rows.iter()
+            .position(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} not found in\n{}", rows.join("\n")))
+    }
+
+    fn col_of(row: &str, needle: &str) -> usize {
+        let at = row.find(needle).unwrap();
+        row[..at].chars().count()
+    }
+
+    #[test]
+    fn bubbles_align_wrap_group_and_tick() {
+        let mut app = bubble_app();
+        let (w, h) = (100u16, 40u16);
+        let rows = snapshot(&mut app, w, h);
+        let pane_right = rows[5].chars().count() - 1;
+        let mine = row_of(&rows, "mine unread");
+        let r = &rows[mine];
+        assert!(r.ends_with('│'), "{r}");
+        assert!(r.contains("✓") && !r.contains("✓✓"), "{r}");
+        let mine_end = r.trim_end_matches('│').trim_end().chars().count();
+        assert!(
+            pane_right - mine_end <= 2,
+            "own bubble is right aligned: {r}"
+        );
+        assert!(rows[row_of(&rows, "mine read")].contains("✓✓"));
+        let first = row_of(&rows, "first from alice");
+        let pane_left = 0;
+        let text_col = col_of(&rows[first], "first from alice");
+        assert_eq!(text_col - pane_left, 1 + AVATAR_COLS as usize + 1 + 1);
+        assert_eq!(
+            rows.iter().filter(|r| r.contains("Alice Longname")).count(),
+            2
+        );
+        assert_eq!(
+            row_of(&rows, "Alice Longname"),
+            row_of(&rows, "old news") - 1
+        );
+        assert!(
+            rows[first - 1].contains("Alice Longname"),
+            "{}",
+            rows.join("\n")
+        );
+        let second = row_of(&rows, "second from alice");
+        assert!(second > first && second - first <= 2, "tightly stacked");
+        let wrapped: Vec<&String> = rows[second..]
+            .iter()
+            .take_while(|r| !r.contains("mine read"))
+            .filter(|r| r.trim_matches(|c| c == '│' || c == ' ').len() > 2)
+            .collect();
+        assert!(wrapped.len() >= 2, "long text wraps");
+        let max_w = (w as usize - 2) * BUBBLE_PERCENT / 100;
+        for r in &rows[second..second + wrapped.len()] {
+            let inner: String = r.chars().skip(1).collect();
+            let used = inner
+                .trim()
+                .trim_end_matches('│')
+                .trim_end()
+                .chars()
+                .count();
+            assert!(used <= max_w + AVATAR_COLS as usize + 2, "{r}");
+        }
+        let edited_row = rows[second..]
+            .iter()
+            .position(|r| r.contains("edited"))
+            .unwrap()
+            + second;
+        assert!(edited_row < row_of(&rows, "mine read"));
+        let avatar_rows: Vec<usize> = rows
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| r.starts_with("│ AL ") || r.starts_with("│ AL"))
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            avatar_rows.len(),
+            2,
+            "one avatar per run:\n{}",
+            rows.join("\n")
+        );
+        assert_eq!(
+            avatar_rows[1],
+            edited_row - 1,
+            "avatar sits at the bottom of the run"
+        );
+        if std::env::var_os("GRAMTTY_SHOW").is_some() {
+            println!("{}", rows.join("\n"));
+        }
+        assert!(row_of(&rows, "Today") < first);
+        assert!(row_of(&rows, "Today") > row_of(&rows, "old news"));
+        let old_label = format::day_label(
+            format::Lang::En,
+            chrono::Local::now().timestamp() - 2 * 86_400,
+            chrono::Local::now().timestamp(),
+        );
+        assert!(row_of(&rows, &old_label) < row_of(&rows, "old news"));
+        let today = &rows[row_of(&rows, "Today")];
+        let c = col_of(today, "Today");
+        assert!(
+            (c as isize - (w as isize / 2)).abs() <= 6,
+            "date centered: {today}"
+        );
+    }
+
+    #[test]
+    fn bubble_selection_and_private_chat_without_avatars() {
+        let mut app = bubble_app();
+        app.chats.get_mut(&10).unwrap().kind = ChatKind::Private(2);
+        let rows = snapshot(&mut app, 90, 30);
+        assert!(!rows.iter().any(|r| r.contains("Alice Longname")));
+        assert!(!rows.iter().any(|r| r.contains(" AL ")));
+        let first = row_of(&rows, "first from alice");
+        assert_eq!(col_of(&rows[first], "first from alice"), 3);
+        let before = rows.clone();
+        app.msg_sel = Some(1);
+        let rows = snapshot(&mut app, 90, 30);
+        let sel = row_of(&rows, "first from alice");
+        assert!(
+            rows[sel].contains('▌') && rows[sel].contains('▐'),
+            "{}",
+            rows[sel]
+        );
+        assert_eq!(rows.len(), before.len());
+        assert_eq!(rows.iter().filter(|r| r.contains('▌')).count(), 1);
+    }
+
+    #[test]
+    fn layout_option_switches_to_classic_and_cache_follows_edits() {
+        let mut app = bubble_app();
+        let bubbles = snapshot(&mut app, 100, 30);
+        assert!(app.layout_cache.len() > 0);
+        assert_eq!(snapshot(&mut app, 100, 30), bubbles);
+        app.histories.get_mut(&10).unwrap().get_mut(5).unwrap().body =
+            RichText::plain("mine changed");
+        let edited = snapshot(&mut app, 100, 30);
+        assert!(edited.iter().any(|r| r.contains("mine changed")));
+        app.chats.get_mut(&10).unwrap().last_read_outbox = 5;
+        let read = snapshot(&mut app, 100, 30);
+        assert!(read[row_of(&read, "mine changed")].contains("✓✓"));
+        app.settings.appearance.layout = Some(crate::config::MessageLayout::Classic);
+        let classic = snapshot(&mut app, 100, 30);
+        let mine = &classic[row_of(&classic, "mine changed")];
+        assert_eq!(col_of(mine, "mine changed"), 1 + MSG_GUTTER);
+        assert!(
+            mine.trim_end_matches('│').trim_end().ends_with("✓✓"),
+            "tick right-aligned: {mine}"
+        );
+        let header = &classic[row_of(&classic, "mine read") - 1];
+        assert!(header.contains("Me ") && header.contains("✓✓"), "{header}");
+    }
+
+    #[test]
+    fn replies_forwards_pinned_bar_and_jump_indicator() {
+        let mut app = bubble_app();
+        let h = app.histories.get_mut(&10).unwrap();
+        h.get_mut(5).unwrap().reply_to = Some(2);
+        h.get_mut(4).unwrap().forward = Some(crate::model::Origin::Name("Bob Hidden".to_owned()));
+        let pinned = h.get(2).unwrap().clone();
+        app.pinned_msg.insert(10, pinned);
+        let rows = snapshot(&mut app, 100, 30);
+        let bar = &rows[row_of(&rows, "Pinned:")];
+        assert_eq!(row_of(&rows, "Pinned:"), 2);
+        assert!(
+            bar.contains("Pinned: first from alice") && bar.contains("gp"),
+            "{bar}"
+        );
+        let fwd = row_of(&rows, "Forwarded from Bob Hidden");
+        assert_eq!(fwd + 1, row_of(&rows, "mine read"));
+        let quote = row_of(&rows, "▎Alice Longname");
+        assert_eq!(quote + 1, row_of(&rows, "▎first from alice"));
+        assert_eq!(quote + 2, row_of(&rows, "mine unread"));
+        assert!(!rows.iter().any(|r| r.contains("↓")));
+        app.chats.get_mut(&10).unwrap().unread = 3;
+        app.msg_sel = Some(0);
+        let rows = snapshot(&mut app, 100, 12);
+        assert!(
+            rows.iter().any(|r| r.contains("↓ 3 new · G")),
+            "{}",
+            rows.join("\n")
+        );
+    }
+
+    fn visible(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                let mut row = String::new();
+                let mut x = 0;
+                while x < w {
+                    let sym = buf[(x, y)].symbol();
+                    row.push_str(sym);
+                    x += (sym.width() as u16).max(1);
+                }
+                row
+            })
+            .collect()
+    }
+
+    #[test]
+    fn unread_badges_live_in_the_composer_border_and_never_move_content() {
+        let mut app = bubble_app();
+        app.chats.get_mut(&10).unwrap().mentions = 0;
+        let (w, h) = (100u16, 12u16);
+        let base = visible(&mut app, w, h);
+        assert!(!base.iter().any(|r| r.contains("]r") || r.contains("]m")));
+        let border = row_of(&base, " Message ");
+        let corner: String = base[border]
+            .chars()
+            .rev()
+            .take(2)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+
+        app.chats.get_mut(&10).unwrap().reactions = 2;
+        app.chats.get_mut(&10).unwrap().mentions = 1;
+        let rows = visible(&mut app, w, h);
+        for (y, (a, b)) in base.iter().zip(&rows).enumerate() {
+            if y != border {
+                assert_eq!(a, b, "row {y} must not change");
+            }
+        }
+        let row = &rows[border];
+        assert_eq!(row.width(), w as usize, "{row}");
+        assert!(
+            row.ends_with(&format!(" ❤️ 2 ]r   @ 1 ]m {corner}")),
+            "{row}"
+        );
+        assert!(row.contains("╭ Message ─"), "{row}");
+        let at = col_of(row, "@ 1 ]m");
+        let heart = col_of(row, "❤️");
+
+        app.msg_sel = Some(0);
+        app.chats.get_mut(&10).unwrap().unread = 3;
+        for _ in 0..3 {
+            let again = visible(&mut app, w, h);
+            assert!(again.iter().any(|r| r.contains("↓ 3 new · G")));
+            assert_eq!(row_of(&again, "]m"), border);
+            assert_eq!(col_of(&again[border], "@ 1 ]m"), at);
+            assert_eq!(col_of(&again[border], "❤️"), heart);
+        }
+        app.msg_sel = None;
+        app.bottom_offset = 0;
+        app.chats.get_mut(&10).unwrap().unread = 0;
+
+        app.chats.get_mut(&10).unwrap().reactions = 0;
+        let rows = visible(&mut app, w, h);
+        assert!(!rows[border].contains("]r"));
+        assert_eq!(col_of(&rows[border], "@ 1 ]m"), at);
+        app.chats.get_mut(&10).unwrap().mentions = 0;
+        assert_eq!(visible(&mut app, w, h), base, "hidden when zero");
+    }
+
+    #[test]
+    fn unread_badges_drop_rather_than_overlap_on_narrow_composers() {
+        let mut app = bubble_app();
+        app.chats.get_mut(&10).unwrap().reactions = 12;
+        app.chats.get_mut(&10).unwrap().mentions = 3;
+        let mut seen = (false, false);
+        for w in [14u16, 18, 22, 26, 30, 34] {
+            let rows = visible(&mut app, w, 20);
+            let border = row_of(&rows, " Message ");
+            let row = &rows[border];
+            assert_eq!(row.width(), w as usize, "{row}");
+            assert!(row.ends_with("╮│"), "corner kept: {row}");
+            if row.contains("]r") {
+                assert!(row.contains("]m"), "mentions are kept first: {row}");
+                seen.1 = true;
+            } else if row.contains("]m") {
+                seen.0 = true;
+            }
+        }
+        assert_eq!(
+            seen,
+            (true, true),
+            "both the partial and the full set appear"
+        );
+    }
+
+    fn classic_app() -> App {
+        let mut app = bubble_app();
+        app.settings.appearance.layout = Some(crate::config::MessageLayout::Classic);
+        app.lang = format::Lang::Ru;
+        let h = app.histories.get_mut(&10).unwrap();
+        h.get_mut(5).unwrap().reply_to = Some(2);
+        h.get_mut(4).unwrap().forward = Some(crate::model::Origin::Name("Bob Hidden".to_owned()));
+        app
+    }
+
+    fn cell_at(app: &mut App, w: u16, h: u16, x: u16, y: u16) -> ratatui::buffer::Cell {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        term.backend().buffer()[(x, y)].clone()
+    }
+
+    #[test]
+    fn defaults_are_bubbles_plain_square_and_classic_shows_dates_headers_ticks_and_grouping() {
+        assert_eq!(crate::config::Settings::default().appearance.layout, None);
+        let d = crate::theme::Theme::default().layout;
+        assert_eq!(d.message_layout, crate::config::MessageLayout::Bubbles);
+        assert_eq!(d.border_style, crate::config::BorderStyle::Plain);
+        assert_eq!(d.avatar_shape, theme::AvatarShape::Square);
+        let mut app = classic_app();
+        let rows = snapshot(&mut app, 100, 30);
+        let today = &rows[row_of(&rows, " Сегодня ")];
+        let at = col_of(today, " Сегодня ");
+        assert!(today[..today.find(" Сегодня ").unwrap()].ends_with('─'));
+        assert!(today.contains(" Сегодня ─"));
+        let right = today.chars().count() - at - " Сегодня ".chars().count();
+        assert!(at.abs_diff(right) <= 2, "{today}");
+        assert!(
+            rows.iter().any(|r| r.contains("─ Вчера ─")
+                || r.contains(" ноября ")
+                || r.contains(" октября "))
+        );
+        let alice: Vec<&String> = rows
+            .iter()
+            .filter(|r| r.contains("Alice Longname "))
+            .collect();
+        assert_eq!(alice.len(), 2, "{}", rows.join("\n"));
+        let first = row_of(&rows, "first from alice");
+        let header = &rows[first - 1];
+        let first_msg = app.histories[&10].get(2).unwrap().date;
+        assert!(header.contains(&format!("Alice Longname {}", format::time_label(first_msg))));
+        assert!(!rows[first + 1].contains("Alice Longname"));
+        let edited_row = row_of(&rows, "изм.");
+        assert!(edited_row > first && edited_row < row_of(&rows, "mine read"));
+        assert!(!rows[edited_row].contains("Alice"));
+        let me = row_of(&rows, "Me ");
+        let mine_date = app.histories[&10].get(4).unwrap().date;
+        assert!(
+            rows[me].contains(&format!("Me {} ✓✓", format::time_label(mine_date))),
+            "{}",
+            rows[me]
+        );
+        assert_eq!(row_of(&rows, "↪ Переслано от Bob Hidden"), me + 1);
+        assert_eq!(me + 2, row_of(&rows, "mine read"));
+        let strip = row_of(&rows, "│ Alice Longname: first from alice");
+        assert_eq!(strip + 1, row_of(&rows, "mine unread"));
+        let unread = rows[strip + 1].trim_end_matches('│').trim_end();
+        assert!(unread.ends_with('✓') && !unread.contains("✓✓"), "{unread}");
+        assert!(
+            !unread.contains("mine unread ✓"),
+            "tick is not glued: {unread}"
+        );
+        assert_eq!(rows.iter().filter(|r| r.contains("Me ")).count(), 1);
+        let x = |row: &str, needle: &str| col_of(row, needle);
+        assert_eq!(
+            x(&rows[row_of(&rows, "mine read")], "mine read"),
+            1 + MSG_GUTTER
+        );
+        assert_eq!(x(&rows[first], "first from alice"), 1 + MSG_GUTTER);
+        assert_eq!(x(header, "Alice Longname"), 1 + MSG_GUTTER);
+    }
+
+    #[test]
+    fn classic_has_no_background_blocks_and_avatar_only_in_groups() {
+        let mut app = classic_app();
+        let rows = snapshot(&mut app, 100, 30);
+        let first = row_of(&rows, "first from alice") as u16;
+        let col = (1 + MSG_GUTTER) as u16;
+        for dx in 0..20 {
+            let c = cell_at(&mut app, 100, 30, col + dx, first);
+            assert_eq!(c.bg, Color::Reset, "body cell {dx} has a background");
+        }
+        let header = first - 1;
+        let avatar = cell_at(&mut app, 100, 30, 1, header);
+        assert_eq!(avatar.symbol(), "A");
+        assert_eq!(Some(avatar.bg), theme::get().name_color(2));
+        let me = row_of(&rows, "Me ") as u16;
+        assert_eq!(cell_at(&mut app, 100, 30, 1, me).symbol(), "M");
+        app.chats.get_mut(&10).unwrap().kind = ChatKind::Private(2);
+        let rows = snapshot(&mut app, 100, 30);
+        let header = row_of(&rows, "Alice Longname ") as u16;
+        let c = cell_at(&mut app, 100, 30, 1, header);
+        assert_eq!(c.symbol(), " ");
+        assert_eq!(c.bg, Color::Reset);
+    }
+
+    #[test]
+    fn classic_pinned_bar_jump_indicator_and_selection() {
+        let mut app = classic_app();
+        let pinned = app.histories[&10].get(2).unwrap().clone();
+        app.pinned_msg.insert(10, pinned);
+        let rows = snapshot(&mut app, 100, 30);
+        assert_eq!(row_of(&rows, "Закреплённое: first from alice"), 2);
+        assert!(!rows.iter().any(|r| r.contains("↓")));
+        app.chats.get_mut(&10).unwrap().unread = 3;
+        app.msg_sel = Some(0);
+        let rows = snapshot(&mut app, 100, 12);
+        assert!(
+            rows.iter().any(|r| r.contains("↓ 3 новых · G")),
+            "{}",
+            rows.join("\n")
+        );
+        app.msg_sel = Some(2);
+        let rows = snapshot(&mut app, 100, 30);
+        let sel = row_of(&rows, "second from alice");
+        assert_eq!(rows[sel].chars().nth(1), Some('▎'), "{}", rows.join("\n"));
+        assert!(!rows.iter().any(|r| r.contains("╭─")), "no selection box");
+        for (w, h) in [(30u16, 8u16), (50, 12), (80, 24), (200, 60)] {
+            for sel in [None, Some(0), Some(3), Some(4)] {
+                app.msg_sel = sel;
+                snapshot(&mut app, w, h);
+            }
+        }
+    }
+
+    #[test]
+    fn border_style_option_reaches_every_bordered_widget() {
+        use crate::config::BorderStyle;
+        let mut app = classic_app();
+        app.show_folders = true;
+        app.show_chats = true;
+        for (style, tl, br) in [
+            (BorderStyle::Rounded, '╭', '╯'),
+            (BorderStyle::Plain, '┌', '┘'),
+            (BorderStyle::Thick, '┏', '┛'),
+            (BorderStyle::Double, '╔', '╝'),
+        ] {
+            app.settings.appearance.border_style = Some(style);
+            app.msg_sel = None;
+            app.popup = None;
+            let rows = snapshot(&mut app, 120, 30);
+            assert!(
+                rows[1].starts_with(&format!("{tl} Folders")),
+                "{style:?}: {}",
+                rows[1]
+            );
+            assert!(rows[1].contains(&format!("{tl} All chats")));
+            assert!(rows[1].contains(&format!("{tl} Rust чат")));
+            assert!(rows.iter().any(|r| r.contains(&format!("{tl} Message"))));
+            assert!(rows.last().unwrap().ends_with(br));
+            app.msg_sel = Some(2);
+            let screen = render(&mut app, 120, 30);
+            assert_eq!(screen.matches(tl).count(), 4, "{style:?} no selection box");
+            assert!(screen.contains('▎'), "{style:?} selection bar");
+            app.msg_sel = None;
+            app.popup = Some(Popup::Options { sel: 5 });
+            let rows = snapshot(&mut app, 120, 30);
+            let opt = &rows[row_of(&rows, " Options ")];
+            assert!(opt.contains(&format!("{tl} Options")), "{opt}");
+            assert!(
+                rows.iter()
+                    .any(|r| r.contains(&format!("6 Border style: {}", style.name())))
+            );
+            app.popup = None;
+            app.pending = vec![app.keymap.leader];
+            let rows = snapshot(&mut app, 120, 30);
+            assert!(
+                rows.iter().any(|r| r.contains(&format!("{tl} Leader"))),
+                "{style:?} leader"
+            );
+            app.pending.clear();
+        }
+    }
+
+    #[test]
+    fn options_popup_shows_groups_hotkeys_and_full_description() {
+        let mut app = bubble_app();
+        app.popup = Some(Popup::Options {
+            sel: crate::app::OPEN_FOCUS_OPTION,
+        });
+        let rows = snapshot(&mut app, 70, 44);
+        let text = rows.join("\n");
+        for head in [
+            "Notifications",
+            "Privacy",
+            "Appearance",
+            "Chats",
+            "Behaviour",
+        ] {
+            assert!(text.contains(head), "{head}\n{text}");
+        }
+        for (i, (label, _)) in crate::app::OPTIONS.iter().enumerate() {
+            let line = format!("{} ", crate::app::option_key(i));
+            assert!(
+                rows.iter()
+                    .any(|r| r.contains(&line) && r.contains(label.split(':').next().unwrap())),
+                "{label}\n{text}"
+            );
+        }
+        let flat: String = rows
+            .iter()
+            .map(|r| r.trim_matches(|c: char| c == '│' || c == ' '))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            flat.contains(
+                "smart: composer if unread fit on screen, else first unread; composer; messages"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains('…'), "{text}");
+        let rows = snapshot(&mut app, 70, 18);
+        assert!(rows.iter().any(|r| r.contains("Options")));
+    }
+
+    #[test]
+    fn options_popup_keeps_its_rect_for_every_entry() {
+        let mut app = bubble_app();
+        for (w, h) in [(100u16, 40u16), (70, 30), (60, 24)] {
+            let mut first = None;
+            for sel in 0..crate::app::OPTIONS.len() {
+                app.popup = Some(Popup::Options { sel });
+                let rows = snapshot(&mut app, w, h);
+                let top = row_of(&rows, " Options ");
+                let bottom = row_of(&rows, "j/k move");
+                let left = col_of(&rows[top], "╭ Options");
+                let right = rows[top].chars().count() - 1;
+                let label = crate::app::OPTIONS[0].0.split(':').next().unwrap();
+                let entry = (h >= 40).then(|| row_of(&rows, label));
+                let (label, _) = crate::app::OPTIONS[sel];
+                assert!(
+                    rows[top..bottom].iter().any(|r| r.contains(label)),
+                    "{w}x{h} sel {sel} not visible\n{}",
+                    rows.join("\n")
+                );
+                let rect = (top, bottom, left, right, entry);
+                match first {
+                    None => first = Some(rect),
+                    Some(f) => assert_eq!(rect, f, "{w}x{h} sel {sel}\n{}", rows.join("\n")),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn bubbles_render_at_many_sizes() {
+        let mut app = bubble_app();
+        app.show_info = true;
+        app.show_chats = true;
+        for (w, h) in [(30u16, 8u16), (50, 12), (80, 24), (200, 60), (36, 40)] {
+            for sel in [None, Some(0), Some(4)] {
+                app.msg_sel = sel;
+                snapshot(&mut app, w, h);
+            }
+        }
+    }
+
+    fn snapshot(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| {
+                (0..w)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn leader_popup_groups_columns_and_wraps() {
+        let mut app = app();
+        app.pending = vec![app.keymap.leader];
+        let wide = snapshot(&mut app, 160, 40);
+        let inner = |rows: &[String]| -> Vec<String> {
+            let top = rows.iter().position(|l| l.contains("╭ Leader")).unwrap();
+            rows[top..]
+                .iter()
+                .take_while(|l| !l.is_empty())
+                .map(|l| {
+                    let start = l.find("╭ Leader").or_else(|| l.find('│')).unwrap_or(0);
+                    l[start..].to_owned()
+                })
+                .collect()
+        };
+        let w = inner(&wide);
+        assert!(
+            w[1].contains("Navigate")
+                && w[1].contains("Compose")
+                && w[1].contains("Panes")
+                && w[1].contains("Account"),
+            "{w:#?}"
+        );
+        let gap = |line: &str, a: &str, b: &str| {
+            let (i, j) = (line.find(a).unwrap(), line.find(b).unwrap());
+            i < j && line[i + a.len()..j].trim().is_empty()
+        };
+        assert!(
+            gap(&w[2], "[Space]  find chat", "[u]  attach file"),
+            "{w:#?}"
+        );
+        assert!(
+            gap(&w[3], "[a]      actions", "[v]  record voice message"),
+            "{w:#?}"
+        );
+        assert!(w[4].contains("[p]      profile"), "{w:#?}");
+        assert!(
+            w[2].trim_end_matches(['│', ' ', '╯', '╮'])
+                .ends_with("[o]  options"),
+            "{w:#?}"
+        );
+        assert!(
+            w[3].trim_end_matches(['│', ' ', '╯', '╮'])
+                .ends_with("[L]  log out"),
+            "{w:#?}"
+        );
+        assert_eq!(wide.last().map(|l| l.contains('╰')), Some(true));
+        let narrow = snapshot(&mut app, 70, 40);
+        let n = inner(&narrow);
+        assert!(
+            n[1].contains("Navigate") && n[1].contains("Compose") && !n[1].contains("Panes"),
+            "{n:#?}"
+        );
+        let panes = n.iter().position(|l| l.contains("Panes")).unwrap();
+        assert!(n[panes - 1].trim_matches(['│', ' ']).is_empty());
+        assert!(n[panes].contains("Account"));
+        assert!(n[panes + 4].contains("[r]  redraw"), "{n:#?}");
+        let buf_row = |app: &mut App| {
+            let mut term = Terminal::new(TestBackend::new(160, 40)).unwrap();
+            term.draw(|f| draw(f, app)).unwrap();
+            let buf = term.backend().buffer().clone();
+            let (x, y) = (0..40u16)
+                .flat_map(|y| (0..160u16).map(move |x| (x, y)))
+                .find(|(x, y)| {
+                    buf[(*x, *y)].symbol() == "l"
+                        && buf[(*x + 1, *y)].symbol() == "o"
+                        && buf[(*x + 4, *y)].symbol() == "o"
+                        && buf[(*x + 5, *y)].symbol() == "u"
+                })
+                .unwrap();
+            buf[(x, y)].fg
+        };
+        assert_eq!(buf_row(&mut app), Color::Red);
+    }
+
+    #[test]
+    fn info_pane_wraps_long_values_instead_of_clipping() {
+        let mut app = app();
+        let rows = snapshot(&mut app, 140, 16);
+        let at = rows
+            .iter()
+            .position(|l| l.contains("Images: halfblocks"))
+            .unwrap();
+        assert!(rows[at + 1].contains("cached"), "{rows:#?}");
+    }
+
+    #[test]
+    fn stage4_message_decorations_and_header_render() {
+        use crate::bots::{Button, ButtonAction, Command, Keyboard};
+        let mut app = app();
+        app.settings.privacy.ghost_mode = true;
+        app.unread_counts.insert(ListId::Main, 42);
+        app.chats.insert(
+            20,
+            ChatInfo {
+                id: 20,
+                title: "Alice DM".to_owned(),
+                kind: ChatKind::Private(2),
+                unread: 0,
+                mentions: 0,
+                reactions: 0,
+                last_read_inbox: 0,
+                last_read_outbox: 0,
+                photo: None,
+                muted: false,
+                use_default_mute: false,
+                positions: vec![Position {
+                    list: ListId::Main,
+                    order: 9,
+                    pinned: false,
+                }],
+                last_message: None,
+                group_id: 0,
+                secret_id: 0,
+                forum: false,
+                auto_delete: 0,
+                perms: crate::model::Rights::default(),
+                protected: false,
+            },
+        );
+        app.user_meta.insert(
+            2,
+            crate::model::UserMeta {
+                status: crate::presence::Status::Online {
+                    expires: crate::app::unix_now() + 100,
+                },
+                ..Default::default()
+            },
+        );
+        app.typing.insert(
+            10,
+            vec![crate::presence::Typing::new(
+                Sender::User(2),
+                crate::presence::Activity::Typing,
+                None,
+            )],
+        );
+        let h = app.histories.get_mut(&10).unwrap();
+        let m = h.get_mut(40).unwrap();
+        m.pinned = true;
+        m.reactions = vec![crate::model::Reaction {
+            label: "❤".to_owned(),
+            emoji: Some("❤".to_owned()),
+            custom: 0,
+            count: 3,
+            chosen: true,
+        }];
+        m.keyboard = Some(Keyboard {
+            inline: true,
+            rows: vec![vec![
+                Button {
+                    text: "Approve".to_owned(),
+                    action: ButtonAction::Callback("YQ==".to_owned()),
+                },
+                Button {
+                    text: "Docs".to_owned(),
+                    action: ButtonAction::Url("https://example.org".to_owned()),
+                },
+            ]],
+            placeholder: String::new(),
+        });
+        let screen = render(&mut app, 140, 40);
+        assert!(
+            screen.contains("👻") && screen.contains(" ghost "),
+            "{screen}"
+        );
+        assert!(!screen.contains("Rust чат · Alice"), "{screen}");
+        assert!(screen.contains(" Message · Alice is typing… "), "{screen}");
+        assert!(screen.contains("Approve"));
+        assert!(screen.contains("Docs ↗"));
+        assert!(screen.contains("❤\u{FE0F}  3•"));
+        assert!(screen.contains("📌"));
+        assert!(screen.contains("All chats"));
+        assert!(screen.contains("42"));
+        assert!(screen.contains("● Alice DM"));
+        app.settings.privacy.ghost_mode = false;
+        app.settings.privacy.dont_mark_read = true;
+        assert!(render(&mut app, 140, 40).contains("◌ no-read"));
+        app.open_chat = Some(20);
+        app.histories.insert(20, History::default());
+        app.typing.clear();
+        let screen = render(&mut app, 140, 40);
+        assert!(screen.contains("Alice DM · online"), "{screen}");
+        assert!(screen.contains("Status: online"));
+        app.bot_commands.insert(
+            20,
+            vec![Command {
+                name: "start".to_owned(),
+                description: "Start the bot".to_owned(),
+                bot: "abot".to_owned(),
+            }],
+        );
+        app.composer.active = true;
+        app.composer.input = crate::input::TextInput::with_text("/st");
+        let screen = render(&mut app, 140, 40);
+        assert!(screen.contains("Commands"));
+        assert!(screen.contains("/start Start the bot"));
+    }
+
+    #[test]
+    fn avatars_load_photos_in_bubbles_and_profile() {
+        let fixture =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".work/fixtures/photo.jpg");
+        let mut app = bubble_app();
+        snapshot(&mut app, 100, 30);
+        assert!(!app.media.has_work());
+        app.user_meta.entry(2).or_default().photo = Some(crate::model::FileRef {
+            id: 501,
+            ..crate::model::FileRef::default()
+        });
+        snapshot(&mut app, 100, 30);
+        assert!(
+            app.media.has_work(),
+            "missing avatar is requested for download"
+        );
+        let mut app = bubble_app();
+        app.user_meta.entry(2).or_default().photo = Some(crate::model::FileRef {
+            id: 502,
+            path: fixture.to_string_lossy().into_owned(),
+            done: true,
+            ..crate::model::FileRef::default()
+        });
+        let rows = snapshot(&mut app, 100, 30);
+        assert!(app.media.has_work(), "downloaded avatar is decoded");
+        assert!(
+            rows.iter().any(|r| r.contains(" AL ")),
+            "initials stay as fallback"
+        );
+        let mut app = super::tests::app();
+        app.popup = Some(Popup::Profile(crate::app::ProfileView {
+            target: crate::model::ProfileTarget::User(2),
+            data: Some(crate::model::Profile {
+                title: "Alice Longname".to_owned(),
+                id: 2,
+                user_id: Some(2),
+                ..Default::default()
+            }),
+            error: None,
+            scroll: 0,
+        }));
+        let rows = snapshot(&mut app, 120, 40);
+        let title = row_of(&rows, "Alice Longname");
+        assert!(col_of(&rows[title], "Alice Longname") > col_of(&rows[title], "│") + 10);
+        assert!(
+            rows.iter().any(|r| r.contains("    AL    ")),
+            "{}",
+            rows.join("\n")
+        );
+        assert!(!app.media.has_work());
+        app.user_meta.entry(2).or_default().photo = Some(crate::model::FileRef {
+            id: 503,
+            path: fixture.to_string_lossy().into_owned(),
+            done: true,
+            ..crate::model::FileRef::default()
+        });
+        snapshot(&mut app, 120, 40);
+        assert!(app.media.has_work(), "profile avatar is decoded");
+    }
+
+    #[test]
+    fn stage4_popups_render() {
+        use crate::app::{ButtonsView, ProfileView, ReactionPicker, SearchView};
+        use crate::bots::{Button, ButtonAction, Keyboard};
+        let mut app = app();
+        app.popup = Some(Popup::Profile(ProfileView {
+            target: crate::model::ProfileTarget::User(2),
+            data: None,
+            error: None,
+            scroll: 0,
+        }));
+        assert!(render(&mut app, 120, 40).contains("Loading profile"));
+        app.user_meta.insert(
+            2,
+            crate::model::UserMeta {
+                status: crate::presence::Status::Recently,
+                ..Default::default()
+            },
+        );
+        app.popup = Some(Popup::Profile(ProfileView {
+            target: crate::model::ProfileTarget::User(2),
+            data: Some(crate::model::Profile {
+                title: "Alice Longname".to_owned(),
+                kind: "user".to_owned(),
+                id: 2,
+                user_id: Some(2),
+                usernames: vec!["alice".to_owned(), "al".to_owned()],
+                phone: "+79990000000".to_owned(),
+                bio: "Rustacean and tea lover".to_owned(),
+                common_chats: Some(3),
+                members: None,
+                links: vec!["https://t.me/alice".to_owned()],
+                commands: Vec::new(),
+            }),
+            error: None,
+            scroll: 0,
+        }));
+        let screen = render(&mut app, 120, 40);
+        for want in [
+            "Profile",
+            "@alice · @al",
+            "last seen recently · user",
+            "Rustacean and tea lover",
+            "+79990000000",
+            "Common chats 3",
+            "https://t.me/alice",
+        ] {
+            assert!(screen.contains(want), "{want}: {screen}");
+        }
+        app.popup = Some(Popup::Options { sel: 2 });
+        app.settings.privacy.ghost_mode = true;
+        let screen = render(&mut app, 120, 40);
+        assert!(screen.contains("[x] Desktop notifications"));
+        assert!(screen.contains("[ ] Don't mark as read"));
+        assert!(screen.contains("[x] Ghost mode"));
+        assert!(screen.contains("never online, no typing status"));
+        let found = |id: i64| {
+            let mut m = msg(id, 2, 1_700_000_000, "needle here");
+            m.chat_id = 10;
+            m
+        };
+        app.popup = Some(Popup::Search(SearchView {
+            chat_id: None,
+            pinned: false,
+            sender: None,
+            input: crate::input::TextInput::with_text("needle"),
+            searched_for: Some("needle".to_owned()),
+            results: vec![found(1), found(2)],
+            sel: 1,
+            token: 1,
+            loading: false,
+            error: None,
+        }));
+        let screen = render(&mut app, 120, 40);
+        assert!(screen.contains("Search all chats"));
+        assert!(screen.contains("Rust чат · Alice Longname: needle here"));
+        app.inbox.push_front(crate::model::InboxItem {
+            chat_id: 10,
+            msg_id: 1,
+            sender: Sender::User(2),
+            preview: "ping".to_owned(),
+            date: 1_700_000_000,
+            mention: true,
+            topic: None,
+        });
+        app.popup = Some(Popup::Inbox { sel: 0 });
+        let screen = render(&mut app, 120, 40);
+        assert!(screen.contains("Notifications"));
+        assert!(screen.contains("@ Rust чат · Alice Longname: ping"));
+        app.popup = Some(Popup::Reactions(ReactionPicker {
+            chat_id: 10,
+            msg_id: 40,
+            emojis: vec!["👍".to_owned(), "🔥".to_owned()],
+            sel: 1,
+            loading: false,
+            note: None,
+        }));
+        let screen = render(&mut app, 120, 40);
+        assert!(screen.contains("React"));
+        assert!(screen.contains("🔥"));
+        app.popup = Some(Popup::Buttons(ButtonsView {
+            chat_id: 10,
+            msg_id: 40,
+            keyboard: Keyboard {
+                inline: false,
+                rows: vec![vec![
+                    Button {
+                        text: "Yes".to_owned(),
+                        action: ButtonAction::Text,
+                    },
+                    Button {
+                        text: "Phone".to_owned(),
+                        action: ButtonAction::Unsupported("sharing your phone number"),
+                    },
+                ]],
+                placeholder: "Choose".to_owned(),
+            },
+            sel: 0,
+        }));
+        let screen = render(&mut app, 120, 40);
+        assert!(screen.contains("Keyboard"));
+        assert!(screen.contains("1 Yes"), "{screen}");
+        assert!(screen.contains("│ 2 Phone ✕ │"), "{screen}");
+        assert!(screen.contains("Choose"));
+        app.popup = Some(Popup::ConfirmUrl("https://example.org/x".to_owned()));
+        let screen = render(&mut app, 120, 40);
+        assert!(screen.contains("Open this link"));
+        assert!(screen.contains("https://example.org/x"));
+        app.popup = Some(Popup::ReactionList {
+            chat_id: 10,
+            msg_id: 40,
+            items: Some(vec![(Sender::User(2), "👍".to_owned())]),
+            sel: 0,
+        });
+        assert!(render(&mut app, 120, 40).contains("Alice Longname"));
+        app.popup = Some(Popup::Switcher {
+            input: crate::input::TextInput::default(),
+            sel: 0,
+            forward: Some((10, vec![40])),
+        });
+        assert!(render(&mut app, 120, 40).contains("Forward to"));
+        for (w, h) in [(40, 12), (80, 24), (200, 60)] {
+            for popup in [
+                Popup::Options { sel: 0 },
+                Popup::Inbox { sel: 0 },
+                Popup::ConfirmUrl("u".to_owned()),
+            ] {
+                app.popup = Some(popup);
+                render(&mut app, w, h);
+            }
+        }
     }
 
     #[test]
@@ -2179,6 +5061,7 @@ mod tests {
         app.popup = Some(Popup::Switcher {
             input: crate::input::TextInput::with_text("rust"),
             sel: 0,
+            forward: None,
         });
         let screen = render(&mut app, 120, 40);
         assert!(screen.contains("Find chat"));
@@ -2295,7 +5178,7 @@ mod tests {
                 src: Src::File(100 + i as i32),
                 cols: c.w,
                 rows: c.h,
-                round: false,
+                shape: None,
                 animate: false,
             };
             let frames = ready_frames(&app, c.w, c.h);
@@ -2381,7 +5264,7 @@ mod tests {
                 src: Src::File(100 + i as i32),
                 cols: c.w,
                 rows: c.h,
-                round: false,
+                shape: None,
                 animate: false,
             };
             let frames = ready_frames(&app, c.w, c.h);
@@ -2426,7 +5309,7 @@ mod tests {
         let mut picker = ratatui_image::picker::Picker::halfblocks();
         picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
         let mut app = App::new(
-            crate::td::Td::new(tx),
+            crate::td::Td::recording(tx).0,
             ApiCredentials {
                 api_id: 1,
                 api_hash: "x".to_owned(),
@@ -2532,5 +5415,3029 @@ mod tests {
         }
         app.auth = Auth::Qr(Some("tg://login?token=abc".to_owned()));
         assert!(render(&mut app, 120, 50).contains("Link Desktop Device"));
+    }
+
+    const COLOUR_ONLY: [&str; 10] = [
+        "background",
+        "selection_bg",
+        "surface",
+        "avatar_text",
+        "popup_background",
+        "bubble_incoming",
+        "bubble_incoming_selected",
+        "bubble_outgoing",
+        "bubble_outgoing_selected",
+        "card_fill",
+    ];
+
+    fn distinctive_theme() -> theme::Theme {
+        use serde::Deserialize;
+        let toml::Value::Table(mut root) = toml::Value::try_from(classic_rounded()).unwrap() else {
+            panic!("theme is not a table");
+        };
+        let Some(toml::Value::Table(colors)) = root.get_mut("colors") else {
+            panic!("no colors");
+        };
+        let mut n = 0u32;
+        let mut next = || {
+            n += 1;
+            toml::Value::String(format!("#c8{:02x}{:02x}", n / 256, n % 256))
+        };
+        let keys: Vec<String> = colors.keys().cloned().collect();
+        for key in keys {
+            let old = colors[&key].clone();
+            let new = if COLOUR_ONLY.contains(&key.as_str()) {
+                next()
+            } else if key == "name_palette" {
+                toml::Value::Array(vec![next(), next(), next()])
+            } else {
+                let mut t = match old {
+                    toml::Value::Table(t) => t,
+                    _ => toml::Table::new(),
+                };
+                if key != "name" {
+                    t.insert("fg".to_owned(), next());
+                }
+                if t.contains_key("bg") {
+                    t.insert("bg".to_owned(), next());
+                }
+                toml::Value::Table(t)
+            };
+            colors.insert(key, new);
+        }
+        theme::Theme::deserialize(toml::Value::Table(root)).unwrap()
+    }
+
+    fn buffer(app: &mut App, w: u16, h: u16) -> Buffer {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        term.backend().buffer().clone()
+    }
+
+    fn themed(c: Color) -> bool {
+        matches!(c, Color::Rgb(200, _, _))
+    }
+
+    fn assert_all_themed(buf: &Buffer, what: &str) {
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                let c = &buf[(x, y)];
+                assert!(
+                    c.fg == Color::Reset || themed(c.fg),
+                    "{what}: cell ({x},{y}) {:?} has non-theme fg {:?}",
+                    c.symbol(),
+                    c.fg
+                );
+                assert!(
+                    themed(c.bg),
+                    "{what}: cell ({x},{y}) {:?} has non-theme bg {:?}",
+                    c.symbol(),
+                    c.bg
+                );
+            }
+        }
+    }
+
+    fn find(buf: &Buffer, needle: &str) -> (u16, u16) {
+        find_in(buf, needle, 0..buf.area.width)
+    }
+
+    fn find_in(buf: &Buffer, needle: &str, xs: std::ops::Range<u16>) -> (u16, u16) {
+        let chars: Vec<char> = needle.chars().collect();
+        for y in 1..buf.area.height {
+            for x in xs.clone() {
+                let hit = chars.iter().enumerate().all(|(i, ch)| {
+                    let xi = x as usize + i;
+                    xi < buf.area.width as usize && buf[(xi as u16, y)].symbol() == ch.to_string()
+                });
+                if hit {
+                    return (x, y);
+                }
+            }
+        }
+        panic!("{needle} not on screen");
+    }
+
+    fn themed_classic() -> (App, std::rc::Rc<theme::Theme>) {
+        let mut app = classic_app();
+        app.my_id = Some(1);
+        app.show_folders = true;
+        app.show_chats = true;
+        app.show_info = true;
+        app.open_chat = Some(10);
+        app.chats.get_mut(&10).unwrap().unread = 2;
+        let mut other = app.chats[&10].clone();
+        other.id = 11;
+        other.title = "Other".to_owned();
+        other.unread = 0;
+        other.positions[0].order = 9;
+        app.chats.insert(11, other);
+        app.chat_sel = 0;
+        app.settings.appearance.layout = None;
+        app.set_theme(distinctive_theme());
+        let th = app.frame_theme();
+        (app, th)
+    }
+
+    #[test]
+    fn every_widget_takes_its_colours_from_the_theme() {
+        let (mut app, th) = themed_classic();
+        let c = &th.colors;
+        app.focus = Pane::Messages;
+        let buf = buffer(&mut app, 160, 40);
+        assert_all_themed(&buf, "classic");
+        let (x, y) = find_in(&buf, "Rust чат", 0..48);
+        assert_eq!(buf[(x, y)].fg, c.open_chat.0.fg.unwrap());
+        assert_eq!(buf[(0, 1)].fg, c.border.0.fg.unwrap());
+        assert_eq!(buf[(48, 1)].symbol(), "╭");
+        assert_eq!(buf[(48, 1)].fg, c.border_focused.0.fg.unwrap());
+        assert_eq!(buf[(50, 1)].fg, c.title_focused.0.fg.unwrap());
+        assert_eq!(buf[(2, 1)].fg, c.title.0.fg.unwrap());
+        let (x, y) = find(&buf, "Сегодня");
+        assert_eq!(buf[(x - 2, y)].fg, c.date_separator.0.fg.unwrap());
+        let (x, y) = find_in(&buf, "Me ", 48..130);
+        assert_eq!(buf[(x, y)].fg, c.own_name.0.fg.unwrap());
+        let (x, y) = find(&buf, "Alice Longname ");
+        assert_eq!(Some(buf[(x, y)].fg), th.name_color(2));
+        assert_eq!(Some(buf[(x - 2, y)].bg), th.name_color(2));
+        assert_eq!(buf[(x - 2, y)].fg, c.avatar_text.0.unwrap());
+        let (x, y) = find(&buf, "✓✓");
+        assert_eq!(buf[(x, y)].fg, c.tick_read.0.fg.unwrap());
+        let (x, y) = find(&buf, "Bob Hidden");
+        assert_eq!(buf[(x, y)].fg, c.forwarded.0.fg.unwrap());
+        assert_eq!(buf[(1, 0)].fg, c.header.0.fg.unwrap());
+        assert_eq!(buf[(159, 39)].bg, c.background.0.unwrap());
+
+        app.msg_sel = Some(3);
+        let buf = buffer(&mut app, 160, 40);
+        assert_all_themed(&buf, "classic selected");
+        let (x, y) = find(&buf, "mine read");
+        assert_eq!(buf[(x, y)].bg, theme::fills().selection_bg.unwrap());
+        let bar = (0..x)
+            .rev()
+            .find(|&bx| buf[(bx, y)].symbol() == "▎")
+            .unwrap();
+        assert_eq!(buf[(bar, y)].fg, c.selection_bar.0.fg.unwrap());
+        assert_eq!(buf[(bar, y - 1)].symbol(), "▎");
+        assert_eq!(buf[(bar, y - 2)].symbol(), "▎");
+        assert_eq!(buf[(bar + 2, y - 2)].symbol(), "M");
+        assert_eq!(buf[(bar + 2, y - 2)].fg, c.accent.0.fg.unwrap());
+        assert_eq!(
+            buf[(x + 30, y)].bg,
+            theme::fills().selection_bg.unwrap(),
+            "tint spans the row"
+        );
+
+        app.msg_sel = None;
+        app.pending = vec![app.keymap.leader];
+        let buf = buffer(&mut app, 160, 40);
+        assert_all_themed(&buf, "leader window");
+        let (x, y) = find(&buf, " Leader ");
+        assert_eq!(buf[(x - 1, y)].fg, c.popup_border.0.fg.unwrap());
+        assert_eq!(buf[(x + 1, y)].fg, c.popup_title.0.fg.unwrap());
+        assert_eq!(buf[(x + 1, y + 1)].bg, theme::fills().popup.unwrap());
+        let (x, y) = find(&buf, "[Space]");
+        assert_eq!(buf[(x, y)].fg, c.hint_key.0.fg.unwrap());
+        app.pending.clear();
+
+        app.inbox.push_back(crate::model::InboxItem {
+            chat_id: 10,
+            msg_id: 1,
+            sender: Sender::User(2),
+            preview: "ping".to_owned(),
+            date: 1_700_000_000,
+            mention: true,
+            topic: None,
+        });
+        for popup in [
+            Popup::Options { sel: 6 },
+            Popup::Inbox { sel: 0 },
+            Popup::ConfirmLogout,
+            Popup::ConfirmDelete {
+                chat_id: 10,
+                message_ids: vec![1],
+            },
+            Popup::Switcher {
+                input: crate::input::TextInput::default(),
+                sel: 0,
+                forward: None,
+            },
+        ] {
+            let name = format!("{:?}", std::mem::discriminant(&popup));
+            app.popup = Some(popup);
+            let buf = buffer(&mut app, 160, 40);
+            assert_all_themed(&buf, &name);
+        }
+        app.popup = Some(Popup::Options { sel: 6 });
+        let buf = buffer(&mut app, 160, 40);
+        let (x, y) = find(&buf, "❯ 7");
+        assert_eq!(buf[(x, y)].fg, c.selection.0.fg.unwrap());
+        app.popup = None;
+
+        app.settings.appearance.layout = Some(crate::config::MessageLayout::Bubbles);
+        app.msg_sel = Some(2);
+        let buf = buffer(&mut app, 160, 40);
+        assert_all_themed(&buf, "bubbles");
+        let (x, y) = find(&buf, "old news");
+        assert_eq!(buf[(x, y)].bg, theme::fills().bubble_in.unwrap());
+        let (x, y) = find(&buf, "mine unread");
+        assert_eq!(buf[(x, y)].bg, theme::fills().bubble_out.unwrap());
+        let (x, y) = find(&buf, "second from alice");
+        assert_eq!(buf[(x, y)].bg, theme::fills().bubble_in_sel.unwrap());
+        assert_eq!(buf[(x - 1, y)].fg, c.bubble_edge.0.fg.unwrap());
+        let (x, y) = find(&buf, "Сегодня");
+        assert_eq!(buf[(x, y)].bg, c.date_badge.0.bg.unwrap());
+
+        app.auth = Auth::Qr(Some("tg://login?token=abc".to_owned()));
+        let buf = buffer(&mut app, 120, 50);
+        assert_all_themed(&buf, "login");
+        let (x, y) = find(&buf, "████");
+        assert_eq!(buf[(x, y)].fg, c.qr.0.fg.unwrap());
+        assert_eq!(buf[(x, y)].bg, c.qr.0.bg.unwrap());
+    }
+
+    #[test]
+    fn message_text_formatting_and_badges_use_the_theme() {
+        let (mut app, th) = themed_classic();
+        let c = &th.colors;
+        let h = app.histories.get_mut(&10).unwrap();
+        let m = h.get_mut(5).unwrap();
+        m.body = RichText {
+            text: "see link and code and @bob".to_owned(),
+            entities: vec![
+                Entity {
+                    offset: 4,
+                    length: 4,
+                    kind: EntityKind::Link(None),
+                },
+                Entity {
+                    offset: 13,
+                    length: 4,
+                    kind: EntityKind::Code,
+                },
+                Entity {
+                    offset: 22,
+                    length: 4,
+                    kind: EntityKind::Mention,
+                },
+            ],
+        };
+        app.chats.get_mut(&10).unwrap().mentions = 0;
+        app.open_chat = None;
+        let buf = buffer(&mut app, 160, 40);
+        let (ox, _) = find_in(&buf, "Other", 0..48);
+        let (x, y) = find_in(&buf, "Rust чат", 0..48);
+        assert_eq!(x, ox);
+        assert_eq!(buf[(x, y)].fg, c.unread_title.0.fg.unwrap());
+        let badge_x = (x..47)
+            .rev()
+            .find(|i| buf[(*i, y)].symbol() != " ")
+            .unwrap();
+        assert_eq!(buf[(badge_x, y)].symbol(), "2");
+        assert_eq!(buf[(badge_x, y)].fg, c.unread_badge.0.fg.unwrap());
+        app.open_chat = Some(10);
+        let buf = buffer(&mut app, 160, 40);
+        assert_all_themed(&buf, "formatted text");
+        let (x, y) = find(&buf, "see link");
+        assert_eq!(buf[(x + 4, y)].fg, c.link.0.fg.unwrap());
+        assert_eq!(buf[(x + 13, y)].fg, c.code.0.fg.unwrap());
+        assert_eq!(buf[(x + 22, y)].fg, c.mention.0.fg.unwrap());
+        assert_eq!(buf[(x + 9, y)].fg, c.text.0.fg.unwrap());
+    }
+
+    #[test]
+    fn layout_options_and_glyphs_change_the_screen() {
+        let mut app = classic_app();
+        app.my_id = Some(1);
+        let base = |f: &dyn Fn(&mut theme::Theme)| {
+            let mut t = classic_rounded();
+            f(&mut t);
+            t
+        };
+        let gutter_of = |app: &mut App| {
+            let rows = snapshot(app, 100, 30);
+            col_of(&rows[row_of(&rows, "first from alice")], "first from alice")
+        };
+        let normal = gutter_of(&mut app);
+        app.set_theme(base(&|t| t.layout.message_gutter = 5));
+        assert_eq!(gutter_of(&mut app), normal + 3);
+
+        app.set_theme(base(&|t| t.layout.avatars = false));
+        let rows = snapshot(&mut app, 100, 30);
+        let header = &rows[row_of(&rows, "Alice Longname ")];
+        assert!(header.starts_with("│  Alice"), "{header}");
+        app.set_theme(classic_rounded());
+        let rows = snapshot(&mut app, 100, 30);
+        assert!(rows[row_of(&rows, "Alice Longname ")].starts_with("│A"));
+
+        let first = app.histories[&10].get(2).unwrap().date;
+        app.set_theme(base(&|t| {
+            t.layout.clock = theme::Clock::H12;
+            t.layout.seconds = true;
+        }));
+        let rows = snapshot(&mut app, 100, 30);
+        let label = format::time_label(first);
+        assert!(label.ends_with("AM") || label.ends_with("PM"), "{label}");
+        assert_eq!(label.matches(':').count(), 2);
+        assert!(rows.iter().any(|r| r.contains(&label)));
+
+        app.set_theme(base(&|t| {
+            t.layout.date_separator = theme::DateSeparator::None
+        }));
+        assert!(
+            !snapshot(&mut app, 100, 30)
+                .iter()
+                .any(|r| r.contains("Сегодня"))
+        );
+        app.set_theme(base(&|t| {
+            t.layout.date_separator = theme::DateSeparator::Plain
+        }));
+        let rows = snapshot(&mut app, 100, 30);
+        let today = &rows[row_of(&rows, "Сегодня")];
+        assert!(!today.contains('─'), "{today}");
+
+        app.set_theme(base(&|t| {
+            t.glyphs.tick_read = "RR".to_owned();
+            t.glyphs.separator = "=".to_owned();
+            t.glyphs.edited = "(e)".to_owned();
+        }));
+        let rows = snapshot(&mut app, 100, 30);
+        assert!(rows[row_of(&rows, "Me ")].contains(" RR"));
+        assert!(rows[row_of(&rows, "Сегодня")].contains("= Сегодня ="));
+
+        app.show_folders = true;
+        app.show_chats = true;
+        app.set_theme(base(&|t| {
+            t.layout.folders_width = theme::PaneWidth::Cols(10);
+            t.layout.chats_width = theme::PaneWidth::Percent(50);
+            t.glyphs.selection_marker = "> ".to_owned();
+        }));
+        app.focus = Pane::Chats;
+        let rows = snapshot(&mut app, 100, 30);
+        let corners: Vec<usize> = rows[1]
+            .chars()
+            .enumerate()
+            .filter(|(_, c)| *c == '╭')
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(corners, vec![0, 10, 60], "{}", rows[1]);
+        assert!(
+            rows.iter().any(|r| r.contains("│> ")),
+            "{}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn scrollbar_and_bubble_options_render() {
+        let mut app = bubble_app();
+        let rows = snapshot(&mut app, 100, 30);
+        assert!(rows[row_of(&rows, "second from")].contains("enough"));
+        let edge: String = rows.iter().filter_map(|r| r.chars().nth(98)).collect();
+        assert!(!edge.contains('█') && !edge.contains('║'));
+        let mut t = theme::Theme::default();
+        t.layout.scrollbar = true;
+        t.layout.bubble_avatar_rows = 3;
+        t.layout.bubble_max_width = 40;
+        app.set_theme(t);
+        let buf = buffer(&mut app, 100, 30);
+        let thumb = theme::get().colors.scrollbar_thumb.0.fg.unwrap();
+        assert!(
+            (1..29).any(|y| buf[(98, y)].fg == thumb),
+            "no scrollbar thumb"
+        );
+        let rows = snapshot(&mut app, 100, 30);
+        let first = row_of(&rows, "first from alice");
+        assert_eq!(col_of(&rows[first], "first from alice"), 1 + 6 + 1 + 1);
+        let second = &rows[row_of(&rows, "second from")];
+        assert!(!second.contains("enough"), "{second}");
+    }
+    mod layout_variants {
+        use super::*;
+        use crate::config::MessageLayout;
+
+        pub(super) fn conversation(layout: MessageLayout) -> App {
+            let mut app = app();
+            app.settings.appearance.layout = Some(layout);
+            app.show_info = false;
+            app.show_folders = false;
+            app.show_chats = false;
+            app.users.insert(3, "Bob".to_owned());
+            let now = chrono::Local::now().timestamp();
+            let base = now - now.rem_euclid(86_400) + 12 * 3600 - 86_400;
+            let plain = |id: i64, sender: i64, date: i64, text: &str| {
+                let mut m = msg(id, sender, date, text);
+                m.body = RichText::plain(text);
+                m.edited = false;
+                m.reply_to = None;
+                m.media = None;
+                m
+            };
+            let mut batch = vec![
+                plain(1, 2, base, "hey, did you see the new release?"),
+                plain(
+                    2,
+                    2,
+                    base + 60,
+                    "the changelog is long enough to wrap around a couple of lines in a narrow pane",
+                ),
+                plain(3, 1, base + 180, "yes! upgrading tonight"),
+                plain(4, 1, base + 200, "screenshot"),
+                plain(5, 3, base + 3000, "Rust 1.99 released"),
+            ];
+            batch[1].edited = true;
+            batch[2].reply_to = Some(2);
+            batch[3].attachments = vec![photo(900)];
+            batch[4].forward = Some(crate::model::Origin::Name("Rust News".to_owned()));
+            batch[4].pinned = true;
+            let mut h = History::default();
+            h.reached_start = true;
+            h.merge_older(batch);
+            app.histories.insert(10, h);
+            let chat = app.chats.get_mut(&10).unwrap();
+            chat.last_read_outbox = 3;
+            chat.unread = 0;
+            app
+        }
+
+        fn tiny_cards() -> App {
+            let mut app = conversation(MessageLayout::Cards);
+            app.users.insert(7, "twink".to_owned());
+            let h = app.histories.get_mut(&10).unwrap();
+            let last = h.msgs().last().unwrap().clone();
+            let mut a = last.clone();
+            a.id = 50;
+            a.sender = Sender::User(7);
+            a.date = last.date + 4000;
+            a.body = RichText::plain("Ппп");
+            a.forward = None;
+            a.pinned = false;
+            a.outgoing = false;
+            let mut b = a.clone();
+            b.id = 51;
+            b.sender = Sender::User(1);
+            b.outgoing = true;
+            b.date += 600;
+            b.body = RichText::plain("Xd");
+            let mut c = b.clone();
+            c.id = 52;
+            c.body = RichText::plain("D");
+            for m in [a, b, c] {
+                h.upsert(m);
+            }
+            app
+        }
+
+        #[test]
+        fn deleted_marker_blocked_placeholder_and_details_render_in_every_layout() {
+            for layout in MessageLayout::ALL {
+                let mut app = conversation(layout);
+                app.settings.privacy.keep_deleted = true;
+                app.settings.privacy.hide_blocked = true;
+                app.blocked.insert(Sender::User(3));
+                app.histories
+                    .get_mut(&10)
+                    .unwrap()
+                    .get_mut(1)
+                    .unwrap()
+                    .deleted = true;
+                let text = snapshot(&mut app, 100, 70).join("\n");
+                assert!(text.contains("deleted"), "{layout:?}\n{text}");
+                assert!(text.contains("hey, did you see"), "{layout:?}\n{text}");
+                assert!(
+                    text.contains("message from a blocked user"),
+                    "{layout:?}\n{text}"
+                );
+                assert!(!text.contains("Rust 1.99 released"), "{layout:?}\n{text}");
+                app.revealed.insert((10, 5));
+                let text = snapshot(&mut app, 100, 70).join("\n");
+                assert!(text.contains("Rust 1.99 released"), "{layout:?}\n{text}");
+            }
+            let mut app = conversation(MessageLayout::Classic);
+            app.popup = Some(Popup::Details {
+                chat_id: 10,
+                msg_id: 2,
+                flags: None,
+                scroll: 0,
+            });
+            let text = snapshot(&mut app, 100, 40).join("\n");
+            assert!(text.contains("Message details"), "{text}");
+            assert!(text.contains("Message ID"), "{text}");
+            assert!(text.contains("Sender ID        2 (user)"), "{text}");
+            assert!(text.contains("checking..."), "{text}");
+        }
+
+        #[test]
+        fn stage5c_popups_and_quote_header_render() {
+            use crate::admin::{LogEntry, Member, MemberFilter, MemberPage};
+            use crate::app::{LogView, MembersView};
+            use crate::input::TextInput;
+            let mut app = conversation(MessageLayout::Classic);
+            app.popup = Some(Popup::QuotePick {
+                chat_id: 10,
+                msg_id: 2,
+                input: TextInput::with_text("a quoted fragment"),
+            });
+            let text = snapshot(&mut app, 100, 40).join("\n");
+            assert!(text.contains("Reply with quote"), "{text}");
+            assert!(text.contains("a quoted fragment"), "{text}");
+            app.popup = Some(Popup::Translate {
+                chat_id: 10,
+                msg_id: 2,
+                lang: "ru".to_owned(),
+                result: None,
+                scroll: 0,
+            });
+            let text = snapshot(&mut app, 100, 40).join("\n");
+            assert!(text.contains("translating to ru via Telegram"), "{text}");
+            app.popup = Some(Popup::Translate {
+                chat_id: 10,
+                msg_id: 2,
+                lang: "ru".to_owned(),
+                result: Some(Ok("привет из перевода".to_owned())),
+                scroll: 0,
+            });
+            let text = snapshot(&mut app, 100, 40).join("\n");
+            assert!(text.contains("Translation → ru"), "{text}");
+            assert!(!text.contains("LibreTranslate"), "{text}");
+            assert!(text.contains("привет из перевода"), "{text}");
+            assert!(text.contains("y copy"), "{text}");
+            app.popup = Some(Popup::Members(MembersView {
+                chat_id: 10,
+                supergroup_id: 77,
+                filter: MemberFilter::Admins,
+                input: TextInput::default(),
+                page: Some(Ok(MemberPage {
+                    total: 1500,
+                    members: vec![Member {
+                        sender: Sender::User(2),
+                        status: "admin · mod".to_owned(),
+                        joined: 1_700_000_000,
+                    }],
+                })),
+                sel: 0,
+                token: 1,
+            }));
+            let text = snapshot(&mut app, 100, 40).join("\n");
+            assert!(text.contains("Members of"), "{text}");
+            assert!(text.contains(" admins "), "{text}");
+            assert!(text.contains("admin · mod"), "{text}");
+            assert!(text.contains("1 shown of 1.5K"), "{text}");
+            app.popup = Some(Popup::EventLog(LogView {
+                chat_id: 10,
+                entries: vec![LogEntry {
+                    id: 1,
+                    date: 1_700_000_000,
+                    actor: Sender::User(2),
+                    action: "changed the title".to_owned(),
+                    target: None,
+                    detail: "\"Old\" → \"New\"".to_owned(),
+                }],
+                sel: 0,
+                loading: false,
+                done: true,
+                error: None,
+            }));
+            let text = snapshot(&mut app, 110, 40).join("\n");
+            assert!(text.contains("Recent actions in"), "{text}");
+            assert!(
+                text.contains("changed the title: \"Old\" → \"New\""),
+                "{text}"
+            );
+            app.popup = None;
+            app.open_chat = Some(10);
+            app.composer.active = true;
+            app.composer.reply_to = Some(2);
+            app.composer.quote = Some(("did you see".to_owned(), 5));
+            let text = snapshot(&mut app, 100, 40).join("\n");
+            assert!(text.contains("“did you see”"), "{text}");
+            let me = app.my_id.unwrap_or(1);
+            app.my_id = Some(me);
+            let profile = |id: i64| {
+                Popup::Profile(crate::app::ProfileView {
+                    target: crate::model::ProfileTarget::User(id),
+                    data: Some(crate::model::Profile {
+                        title: "Somebody".to_owned(),
+                        kind: "user".to_owned(),
+                        id,
+                        user_id: Some(id),
+                        phone: "+15550001".to_owned(),
+                        ..Default::default()
+                    }),
+                    error: None,
+                    scroll: 0,
+                })
+            };
+            app.settings.privacy.hide_phone = true;
+            app.popup = Some(profile(me));
+            let text = snapshot(&mut app, 120, 40).join("\n");
+            assert!(text.contains("hidden"), "{text}");
+            assert!(!text.contains("+15550001"), "{text}");
+            app.popup = Some(profile(me + 1000));
+            let text = snapshot(&mut app, 120, 40).join("\n");
+            assert!(text.contains("+15550001"), "{text}");
+            app.settings.privacy.hide_phone = false;
+            app.popup = Some(profile(me));
+            let text = snapshot(&mut app, 120, 40).join("\n");
+            assert!(text.contains("+15550001"), "{text}");
+        }
+
+        #[test]
+        fn partially_visible_top_message_stays_when_selecting() {
+            for layout in MessageLayout::ALL {
+                let mut app = conversation(layout);
+                let h = app.histories.get_mut(&10).unwrap();
+                let first = h.msgs()[0].id;
+                let m = h.get_mut(first).unwrap();
+                let text: Vec<String> = (1..=40)
+                    .map(|i| format!("строка {i}"))
+                    .chain(["Дата розыгрыша: завтра".to_owned()])
+                    .collect();
+                m.body = RichText::plain(text.join("\n"));
+                app.focus = Pane::Messages;
+                let n = app.histories[&10].msgs().len();
+                let before = pane(&snapshot(&mut app, 80, 40));
+                let tail = row_of(&before, "Дата розыгрыша");
+                let top_text = before
+                    .iter()
+                    .position(|r| r.contains("строка"))
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "{layout:?}: tall message clipped at top\n{}",
+                            before.join("\n")
+                        )
+                    });
+                assert!(top_text <= 3, "{layout:?}\n{}", before.join("\n"));
+                for sel in [n - 1, n - 2, 0] {
+                    app.msg_sel = Some(sel);
+                    let after = pane(&snapshot(&mut app, 80, 40));
+                    let screen = after.join("\n");
+                    if sel != 0 {
+                        assert_eq!(
+                            row_of(&after, "Дата розыгрыша"),
+                            tail,
+                            "{layout:?} sel {sel}\n{screen}"
+                        );
+                        assert!(
+                            after[..=3].iter().any(|r| r.contains("строка")),
+                            "{layout:?} sel {sel}: top kept\n{screen}"
+                        );
+                    } else {
+                        assert!(
+                            screen.contains("строка 1"),
+                            "{layout:?}: selected tall message shows its top\n{screen}"
+                        );
+                    }
+                }
+                app.msg_sel = None;
+                let back = pane(&snapshot(&mut app, 80, 40));
+                assert!(
+                    back.iter().any(|r| r.contains("строка 1")),
+                    "{layout:?}: viewport kept after Esc"
+                );
+            }
+        }
+
+        fn ansi(buf: &Buffer, rows: std::ops::Range<u16>) -> String {
+            use ratatui::style::Modifier;
+            let sgr = |c: Color, fg: bool| -> String {
+                let base = if fg { 30 } else { 40 };
+                match c {
+                    Color::Reset => format!("{}", base + 9),
+                    Color::Rgb(r, g, b) => format!("{};2;{r};{g};{b}", base + 8),
+                    Color::Indexed(n) => format!("{};5;{n}", base + 8),
+                    other => {
+                        let names = [
+                            Color::Black,
+                            Color::Red,
+                            Color::Green,
+                            Color::Yellow,
+                            Color::Blue,
+                            Color::Magenta,
+                            Color::Cyan,
+                            Color::Gray,
+                            Color::DarkGray,
+                            Color::LightRed,
+                            Color::LightGreen,
+                            Color::LightYellow,
+                            Color::LightBlue,
+                            Color::LightMagenta,
+                            Color::LightCyan,
+                            Color::White,
+                        ];
+                        let i = names.iter().position(|n| *n == other).unwrap_or(7);
+                        format!("{};5;{i}", base + 8)
+                    }
+                }
+            };
+            let mut out = String::new();
+            for y in rows {
+                let mut skip = 0;
+                for x in 0..buf.area.width {
+                    let c = &buf[(x, y)];
+                    if skip > 0 {
+                        skip -= 1;
+                        continue;
+                    }
+                    let mut codes = vec!["0".to_owned(), sgr(c.fg, true), sgr(c.bg, false)];
+                    if c.modifier.contains(Modifier::BOLD) {
+                        codes.push("1".to_owned());
+                    }
+                    if c.modifier.contains(Modifier::ITALIC) {
+                        codes.push("3".to_owned());
+                    }
+                    out.push_str(&format!("\x1b[{}m{}", codes.join(";"), c.symbol()));
+                    skip = c.symbol().width().saturating_sub(1);
+                }
+                out.push_str("\x1b[0m\n");
+            }
+            out
+        }
+
+        #[test]
+        #[ignore = "writes .work/palette-preview.ansi; run with --ignored"]
+        fn write_palette_preview() {
+            let mut pal = crate::termcolors::FALLBACK;
+            pal.bg = (19, 21, 12);
+            pal.fg = (227, 228, 211);
+            pal.ansi[2] = (184, 207, 132);
+            pal.ansi[4] = (190, 203, 152);
+            pal.ansi[6] = (160, 210, 180);
+            pal.ansi[8] = (90, 94, 74);
+            let mut out = String::new();
+            for (name, palette) in [
+                ("terminal preset, matugen-like olive palette", Some(pal)),
+                ("default preset (terminal did not answer)", None),
+            ] {
+                crate::termcolors::set(palette);
+                for (layout, sel) in [
+                    (MessageLayout::Classic, Some(3)),
+                    (MessageLayout::Split, Some(1)),
+                    (MessageLayout::Bubbles, Some(0)),
+                    (MessageLayout::Cards, Some(1)),
+                ] {
+                    let mut app = conversation(layout);
+                    let mut t = theme::Theme::preset(if palette.is_some() {
+                        crate::config::ThemeChoice::Terminal
+                    } else {
+                        crate::config::ThemeChoice::Default
+                    });
+                    t.layout.message_layout = layout;
+                    app.set_theme(t);
+                    app.focus = Pane::Messages;
+                    app.msg_sel = sel;
+                    let buf = buffer(&mut app, 90, 40);
+                    let rows = buf_rows(&buf);
+                    let top = row_of(&rows, "Rust чат") as u16;
+                    let start = rows
+                        .iter()
+                        .position(|r| r.contains("hey, did") || r.contains("Alice"))
+                        .unwrap_or(top as usize)
+                        .saturating_sub(2) as u16;
+                    out.push_str(&format!("\x1b[0m\n== {} · {name} ==\n", layout.name()));
+                    out.push_str(&ansi(&buf, top..start.max(top + 1).min(top + 1)));
+                    out.push_str(&ansi(&buf, start..buf.area.height));
+                }
+            }
+            crate::termcolors::set(None);
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".work");
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("palette-preview.ansi"), out).unwrap();
+        }
+
+        fn pane(rows: &[String]) -> Vec<String> {
+            rows.iter()
+                .map(|r| {
+                    let inner: String = r.chars().skip(1).collect();
+                    inner.trim_end_matches('│').trim_end().to_owned()
+                })
+                .collect()
+        }
+
+        fn visible_width(s: &str) -> usize {
+            s.width()
+        }
+
+        #[test]
+        fn cards_box_runs_align_sides_and_carry_time_in_border() {
+            let mut app = conversation(MessageLayout::Cards);
+            let rows = pane(&snapshot(&mut app, 80, 40));
+            let screen = rows.join("\n");
+            assert_eq!(screen.matches("Alice Longname").count(), 2, "{screen}");
+            let title = row_of(&rows, "╭─Alice Longname─");
+            assert!(rows[title].trim_end().ends_with('╮'), "{screen}");
+            let first = row_of(&rows, "hey, did you");
+            let second = row_of(&rows, "the changelog");
+            assert!(
+                second > first && !rows[second - 1].contains('╰'),
+                "one card per run\n{screen}"
+            );
+            let bottom = (second..rows.len())
+                .find(|&i| rows[i].contains('╰'))
+                .unwrap();
+            assert!(
+                rows[bottom].contains("изм. ") || rows[bottom].contains("edited "),
+                "{screen}"
+            );
+            let mine = row_of(&rows, "upgrading tonight");
+            assert!(rows[mine].ends_with('│'), "{screen}");
+            assert!(
+                visible_width(&rows[mine]) >= 76,
+                "own card is right aligned\n{screen}"
+            );
+            assert!(
+                rows[mine - 1].contains("│ Alice Longname: the changelog"),
+                "{screen}"
+            );
+            assert!(screen.contains("photo"), "{screen}");
+            let own_bottom = (mine..rows.len()).find(|&i| rows[i].contains('╰')).unwrap();
+            assert!(
+                rows[own_bottom].contains('✓') && !rows[own_bottom].contains("✓✓"),
+                "{screen}"
+            );
+            assert!(!rows[row_of(&rows, "upgrading")].contains('✓'), "{screen}");
+            assert!(
+                screen.contains("Forwarded from Rust News")
+                    || screen.contains("Переслано от Rust News")
+            );
+            assert!(screen.contains("📌"), "{screen}");
+            for t in (0..rows.len()).filter(|&i| rows[i].contains("╭─")) {
+                let b = (t..rows.len()).find(|&i| rows[i].contains('╰')).unwrap();
+                let left = col_of(&rows[t], "╭");
+                for r in &rows[t + 1..b] {
+                    assert_eq!(r.chars().nth(left), Some('│'), "{screen}");
+                    assert_eq!(r.width(), rows[t].width(), "sides align\n{screen}");
+                }
+            }
+        }
+
+        #[test]
+        fn cards_follow_the_border_style_and_selection() {
+            let mut app = conversation(MessageLayout::Cards);
+            app.settings.appearance.border_style = Some(crate::config::BorderStyle::Double);
+            app.msg_sel = Some(4);
+            app.focus = Pane::Messages;
+            let mut term = Terminal::new(TestBackend::new(80, 40)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let buf = term.backend().buffer().clone();
+            let rows: Vec<String> = (0..40)
+                .map(|y| (0..80).map(|x| buf[(x, y)].symbol()).collect::<String>())
+                .collect();
+            let screen = rows.join("\n");
+            assert!(screen.contains("╔═Bob═"), "{screen}");
+            let y = row_of(&rows, "╔═Bob");
+            let x = col_of(&rows[y], "╔");
+            let sel = crate::theme::selection_border();
+            assert_eq!(buf[(x as u16, y as u16)].fg, sel.fg.unwrap());
+            let y = row_of(&rows, "hey, did");
+            let x = col_of(&rows[y], "║ hey");
+            assert_ne!(buf[(x as u16, y as u16)].fg, sel.fg.unwrap());
+        }
+
+        #[test]
+        fn compact_aligns_columns_and_groups_names() {
+            let mut app = conversation(MessageLayout::Compact);
+            let rows = pane(&snapshot(&mut app, 80, 30));
+            let screen = rows.join("\n");
+            let first = row_of(&rows, "hey, did you");
+            let second = row_of(&rows, "the changelog");
+            assert_eq!(second, first + 1, "dense\n{screen}");
+            assert!(rows[first].contains("Alice Longn"), "{screen}");
+            assert!(!rows[second].contains("Alice"), "{screen}");
+            let col = col_of(&rows[first], "hey, did");
+            assert_eq!(col_of(&rows[second], "the changelog"), col, "{screen}");
+            assert_eq!(
+                col_of(&rows[second + 1], "lines"),
+                col,
+                "continuation aligned\n{screen}"
+            );
+            assert_eq!(col_of(&rows[first], "│ hey"), col - 2, "{screen}");
+            let mine = row_of(&rows, "upgrading tonight");
+            assert!(rows[mine].ends_with("✓✓"), "tick at line end\n{screen}");
+            assert!(
+                rows[mine - 1].contains("Me │ │ Alice Longname"),
+                "reply strip in text column\n{screen}"
+            );
+            let name_end = col_of(&rows[mine - 1], " │ │");
+            assert_eq!(name_end, col - 3, "{screen}");
+            assert!(
+                rows[second + 1].contains("изм.") || rows[second + 1].contains("edited"),
+                "{screen}"
+            );
+            assert!(screen.contains("photo"));
+        }
+
+        #[test]
+        fn minimal_names_once_per_run_and_time_on_the_right() {
+            let mut app = conversation(MessageLayout::Minimal);
+            let rows = pane(&snapshot(&mut app, 80, 34));
+            let screen = rows.join("\n");
+            assert_eq!(
+                screen.matches("Alice Longname").count(),
+                2,
+                "name + reply marker\n{screen}"
+            );
+            let name = row_of(&rows, "Alice Longname");
+            assert_eq!(row_of(&rows, "hey, did you"), name + 1, "{screen}");
+            let time = format::time_label(app.histories[&10].msgs()[0].date);
+            assert!(rows[name].ends_with(&time), "{screen}");
+            assert!(rows[name + 2].contains("the changelog"), "{screen}");
+            assert!(!rows[name + 2].contains("Alice"), "{screen}");
+            assert!(
+                rows[name + 2].contains(&format::time_label(app.histories[&10].msgs()[1].date))
+            );
+            let me = row_of(&rows, "Me");
+            assert!(rows[me - 1].is_empty(), "whitespace between runs\n{screen}");
+            assert!(
+                rows[me].ends_with('✓') || rows[me].trim_end().ends_with("✓✓"),
+                "{screen}"
+            );
+            assert!(
+                rows[me + 1].contains("│ Alice Longname: the changelog"),
+                "{screen}"
+            );
+            assert!(
+                !screen.contains('╭') || !screen[screen.find('╭').unwrap()..].contains("Alice")
+            );
+            assert!(screen.contains("↪ Rust News"), "{screen}");
+        }
+
+        #[test]
+        fn every_layout_fits_narrow_panes_and_keeps_features() {
+            for layout in MessageLayout::ALL {
+                let mut app = conversation(layout);
+                let rows = snapshot(&mut app, 40, 60);
+                let screen = rows.join("\n");
+                for needle in ["hey, did", "upgrading", "Rust 1.99", "screen"] {
+                    assert!(screen.contains(needle), "{layout:?} {needle}\n{screen}");
+                }
+                let read = if layout == MessageLayout::Cards {
+                    "✓"
+                } else {
+                    "✓✓"
+                };
+                assert!(
+                    screen.contains(read) && screen.contains("📌"),
+                    "{layout:?}\n{screen}"
+                );
+                assert!(screen.contains("pane"), "{layout:?} wraps\n{screen}");
+                for width in [40usize, 44, 52] {
+                    let ctx = Ctx {
+                        width,
+                        layout,
+                        theme: 0,
+                        now: 0,
+                        today: 0,
+                        lang: format::Lang::En,
+                        sel: None,
+                    };
+                    let msgs = app.histories[&10].msgs();
+                    for (g, range) in model::groups(msgs).into_iter().enumerate() {
+                        let mut cache = LayoutCache::default();
+                        let r = cached_block(&app, &mut cache, msgs, range, ctx, g == 2);
+                        for l in &r.lines {
+                            assert!(spans_width(&l.spans) <= width, "{layout:?} {width}: {l:?}");
+                        }
+                        for p in &r.images {
+                            assert!(
+                                (p.col + p.cols) as usize <= width,
+                                "{layout:?} {width}: {p:?}"
+                            );
+                        }
+                    }
+                }
+                let styled = |app: &mut App| {
+                    let mut term = Terminal::new(TestBackend::new(40, 60)).unwrap();
+                    term.draw(|f| draw(f, app)).unwrap();
+                    term.backend().buffer().clone()
+                };
+                let plain_buf = styled(&mut app);
+                app.msg_sel = Some(2);
+                app.focus = Pane::Messages;
+                let selected = snapshot(&mut app, 40, 60).join("\n");
+                assert!(selected.contains("upgrading"), "{layout:?}\n{selected}");
+                assert!(
+                    styled(&mut app) != plain_buf,
+                    "{layout:?} shows the selection"
+                );
+            }
+        }
+
+        #[test]
+        fn layouts_are_cached_per_message_and_width() {
+            let mut app = conversation(MessageLayout::Compact);
+            snapshot(&mut app, 80, 30);
+            let n = app.layout_cache.len();
+            assert!(n >= 5);
+            snapshot(&mut app, 80, 30);
+            assert_eq!(app.layout_cache.len(), n);
+            app.settings.appearance.layout = Some(MessageLayout::Cards);
+            let cards = snapshot(&mut app, 80, 30).join("\n");
+            assert!(cards.contains('╭'));
+        }
+
+        #[test]
+        fn avatar_corners_show_the_background_not_the_initials_colour() {
+            let green = Color::Rgb(0, 200, 0);
+            let mut png = Vec::new();
+            image::DynamicImage::ImageRgba8(image::RgbaImage::from_pixel(
+                64,
+                64,
+                image::Rgba([0, 200, 0, 255]),
+            ))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .unwrap();
+            for shape in [
+                crate::theme::AvatarShape::Circle,
+                crate::theme::AvatarShape::Rounded,
+                crate::theme::AvatarShape::Square,
+            ] {
+                let mut app = bubble_app();
+                let mut t = crate::theme::Theme::default();
+                t.layout.avatar_shape = shape;
+                app.set_theme(t);
+                app.user_meta.entry(2).or_default().photo = Some(crate::model::FileRef {
+                    id: 777,
+                    path: "/nonexistent/avatar.png".to_owned(),
+                    done: true,
+                    ..crate::model::FileRef::default()
+                });
+                let key = Key {
+                    src: Src::File(777),
+                    cols: AVATAR_COLS,
+                    rows: AVATAR_COLS / 2,
+                    shape: Some(shape),
+                    animate: false,
+                };
+                let frames = media::render(
+                    &ratatui_image::picker::Picker::halfblocks(),
+                    &Input::Bytes(png.clone().into()),
+                    key,
+                )
+                .unwrap();
+                app.media.insert_ready(key, frames, 0);
+                let mut term = Terminal::new(TestBackend::new(100, 30)).unwrap();
+                term.draw(|f| draw(f, &mut app)).unwrap();
+                let buf = term.backend().buffer().clone();
+                let greenish = |c: Color| matches!(c, Color::Rgb(r, g, _) if g > 60 && r < 40);
+                let mut hits: Vec<(u16, u16)> = (0..30)
+                    .flat_map(|y| (0..100).map(move |x| (x, y)))
+                    .filter(|&(x, y)| greenish(buf[(x, y)].fg) || greenish(buf[(x, y)].bg))
+                    .collect();
+                assert!(!hits.is_empty(), "{shape:?} avatar drawn");
+                let y0 = hits.iter().map(|h| h.1).min().unwrap();
+                hits.retain(|h| h.1 < y0 + AVATAR_COLS / 2);
+                let x0 = hits.iter().map(|h| h.0).min().unwrap();
+                let x1 = hits.iter().map(|h| h.0).max().unwrap();
+                let y1 = hits.iter().map(|h| h.1).max().unwrap();
+                assert_eq!(
+                    (x1 - x0 + 1, y1 - y0 + 1),
+                    (AVATAR_COLS, AVATAR_COLS / 2),
+                    "{shape:?}"
+                );
+                let initials = crate::theme::avatar(2).bg.unwrap();
+                for y in y0..=y1 {
+                    for x in x0..=x1 {
+                        assert_ne!(buf[(x, y)].bg, initials, "{shape:?} {x},{y}");
+                    }
+                }
+                let corner = &buf[(x0, y0)];
+                let centre = &buf[(x0 + 1, y0)];
+                match shape {
+                    crate::theme::AvatarShape::Square => {
+                        assert_eq!(corner.bg, green, "{shape:?}");
+                    }
+                    crate::theme::AvatarShape::Rounded => {
+                        assert!(greenish(corner.bg), "{shape:?}");
+                    }
+                    crate::theme::AvatarShape::Circle => {
+                        assert_eq!(corner.bg, Color::Reset, "{shape:?}");
+                        assert_eq!(corner.symbol(), "▄", "{shape:?}");
+                        assert!(greenish(corner.fg), "{shape:?}");
+                        assert!(greenish(centre.bg), "{shape:?}");
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn halfblock_cells_outside_the_mask_take_the_background() {
+            let behind = Color::Rgb(1, 2, 3);
+            let mut cell = ratatui::buffer::Cell::default();
+            cell.set_symbol("▀");
+            cell.set_fg(Color::Rgb(9, 9, 9));
+            cell.set_bg(Color::Rgb(7, 7, 7));
+            let mut c = cell.clone();
+            mask_halfblock_cell(&mut c, false, true, behind);
+            assert_eq!((c.symbol(), c.fg, c.bg), ("▄", Color::Rgb(7, 7, 7), behind));
+            let mut c = cell.clone();
+            mask_halfblock_cell(&mut c, true, false, behind);
+            assert_eq!((c.symbol(), c.fg, c.bg), ("▀", Color::Rgb(9, 9, 9), behind));
+            let mut c = cell.clone();
+            mask_halfblock_cell(&mut c, false, false, behind);
+            assert_eq!((c.symbol(), c.bg), (" ", behind));
+            let mut c = cell.clone();
+            mask_halfblock_cell(&mut c, true, true, behind);
+            assert_eq!(c, cell);
+        }
+
+        fn pane_end(rows: &[String]) -> usize {
+            let first = row_of(rows, "the changelog");
+            (first..rows.len())
+                .find(|&i| rows[i].contains("pane"))
+                .unwrap()
+        }
+
+        fn buf_rows(buf: &Buffer) -> Vec<String> {
+            (0..buf.area.height)
+                .map(|y| {
+                    (0..buf.area.width)
+                        .map(|x| buf[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect()
+        }
+
+        #[test]
+        fn cards_selection_recolours_without_moving_anything() {
+            let plain_rows = {
+                let mut app = conversation(MessageLayout::Cards);
+                app.focus = Pane::Messages;
+                app.msg_sel = Some(4);
+                buf_rows(&buffer(&mut app, 80, 40))
+            };
+            let shape = |rows: &[String]| -> Vec<String> {
+                rows.iter().map(|r| r.replace('▎', " ")).collect()
+            };
+            for sel in [0usize, 1] {
+                let mut app = conversation(MessageLayout::Cards);
+                app.focus = Pane::Messages;
+                app.msg_sel = Some(4);
+                let before = buf_rows(&buffer(&mut app, 80, 40));
+                assert_eq!(before, plain_rows);
+                app.msg_sel = Some(sel);
+                let buf = buffer(&mut app, 80, 40);
+                let rows = buf_rows(&buf);
+                let screen = rows.join("\n");
+                let needle = ["hey, did you", "the changelog"][sel];
+                let other = ["the changelog", "hey, did you"][sel];
+                let y = row_of(&rows, needle);
+                let oy = row_of(&rows, other);
+                let top = (0..y).rev().find(|&i| rows[i].contains('╭')).unwrap();
+                let bottom = (y..rows.len()).find(|&i| rows[i].contains('╰')).unwrap();
+                assert!(top < oy && oy < bottom, "one card per run\n{screen}");
+                let left = col_of(&rows[top], "╭");
+                let right = col_of(&rows[top], "╮");
+                let sel_fg = theme::selection_border().fg.unwrap();
+                let bar_x = left as u16 + 1;
+                assert_eq!(buf[(bar_x, y as u16)].symbol(), "▎", "{screen}");
+                assert_eq!(buf[(left as u16, y as u16)].fg, sel_fg, "{screen}");
+                assert_eq!(buf[(right as u16, y as u16)].fg, sel_fg, "{screen}");
+                assert_eq!(
+                    buf[(bar_x + 2, y as u16)].bg,
+                    theme::selection_bg().unwrap()
+                );
+                assert_ne!(buf[(bar_x, oy as u16)].symbol(), "▎", "{screen}");
+                assert_ne!(buf[(left as u16, oy as u16)].fg, sel_fg, "{screen}");
+                let boxes = |r: &[String]| -> Vec<(Option<usize>, Option<usize>)> {
+                    shape(r)
+                        .iter()
+                        .map(|l| (l.find('╭'), l.find('╰')))
+                        .collect()
+                };
+                assert_eq!(boxes(&rows), boxes(&plain_rows), "{screen}");
+            }
+        }
+
+        #[test]
+        fn cards_geometry_is_identical_with_and_without_selection() {
+            let mut app = tiny_cards();
+            app.focus = Pane::Messages;
+            let n = app.histories[&10].msgs().len();
+            let frame = |app: &mut App, sel: Option<usize>| {
+                app.msg_sel = sel;
+                let rows = buf_rows(&buffer(app, 80, 60));
+                let strip = |r: &String| r.replace('▎', " ");
+                let rows: Vec<String> = rows.iter().map(strip).collect();
+                let start = row_of(&rows, "Rust 1.99");
+                rows[start..].to_vec()
+            };
+            let base = frame(&mut app, Some(n - 1));
+            for sel in (n - 4)..n {
+                let rows = frame(&mut app, Some(sel));
+                let shape = |r: &[String]| -> Vec<String> {
+                    r.iter().map(|l| l.replace("↓ G", "   ")).collect()
+                };
+                let (a, b) = (shape(&base), shape(&rows));
+                let boxes = |r: &[String]| -> Vec<(usize, Option<usize>, Option<usize>)> {
+                    r.iter()
+                        .enumerate()
+                        .map(|(i, l)| (i, l.find('╭'), l.find('╰')))
+                        .collect()
+                };
+                assert_eq!(
+                    boxes(&a),
+                    boxes(&b),
+                    "sel {sel}\n{}\n---\n{}",
+                    a.join("\n"),
+                    b.join("\n")
+                );
+            }
+        }
+
+        fn cell_text(buf: &Buffer, y: u16, from: u16, to: u16) -> String {
+            let mut out = String::new();
+            let mut x = from;
+            while x < to {
+                let sym = buf[(x, y)].symbol();
+                out.push_str(sym);
+                x += sym.width().max(1) as u16;
+            }
+            out
+        }
+
+        fn has_clock(text: &str) -> bool {
+            let c: Vec<char> = text.chars().collect();
+            c.windows(5).any(|w| {
+                w[0].is_ascii_digit()
+                    && w[1].is_ascii_digit()
+                    && w[2] == ':'
+                    && w[3].is_ascii_digit()
+                    && w[4].is_ascii_digit()
+            })
+        }
+
+        fn edge_label(inner: &str, h: &str, top: bool) -> Option<String> {
+            let body = inner.trim_start_matches(h);
+            if body.is_empty() && !inner.is_empty() {
+                return Some(String::new());
+            }
+            let lead = (inner.len() - body.len()) / h.len();
+            let label = body.trim_end_matches(h);
+            let tail = (body.len() - label.len()) / h.len();
+            let ok = lead >= 1
+                && tail >= 1
+                && !label.starts_with(' ')
+                && !label.ends_with(' ')
+                && (label.is_empty() || if top { lead == 1 } else { tail == 1 });
+            ok.then(|| label.to_owned())
+        }
+
+        fn card_frames(
+            buf: &Buffer,
+            b: &ratatui::symbols::border::Set,
+        ) -> Vec<(u16, u16, u16, u16)> {
+            let screen = buf_rows(buf).join("\n");
+            let (w, h) = (buf.area.width, buf.area.height);
+            let mut out = Vec::new();
+            for y in 0..h {
+                for x in 0..w {
+                    if buf[(x, y)].symbol() != b.top_left || x <= 1 {
+                        continue;
+                    }
+                    let Some(x2) = (x + 1..w).find(|&c| buf[(c, y)].symbol() == b.top_right) else {
+                        panic!("card at {x},{y} has no top-right corner\n{screen}");
+                    };
+                    let top = cell_text(buf, y, x + 1, x2);
+                    let title = edge_label(&top, b.horizontal_top, true).unwrap_or_else(|| {
+                        panic!("broken top border {top:?} at {x},{y}\n{screen}")
+                    });
+                    let yb = (y + 1..h)
+                        .find(|&r| buf[(x, r)].symbol() != b.vertical_left)
+                        .unwrap_or_else(|| panic!("card at {x},{y} runs off\n{screen}"));
+                    assert_eq!(
+                        buf[(x, yb)].symbol(),
+                        b.bottom_left,
+                        "left side broken at {x},{yb}\n{screen}"
+                    );
+                    for r in y + 1..yb {
+                        assert_eq!(
+                            buf[(x2, r)].symbol(),
+                            b.vertical_right,
+                            "right side broken at {x2},{r}\n{screen}"
+                        );
+                        let body = cell_text(buf, r, x + 1, x2);
+                        assert!(!has_clock(&body), "time inside the card {body:?}\n{screen}");
+                    }
+                    assert_eq!(
+                        buf[(x2, yb)].symbol(),
+                        b.bottom_right,
+                        "bottom-right corner at {x2},{yb}\n{screen}"
+                    );
+                    let bottom = cell_text(buf, yb, x + 1, x2);
+                    let foot = edge_label(&bottom, b.horizontal_bottom, false)
+                        .unwrap_or_else(|| panic!("broken bottom border {bottom:?}\n{screen}"));
+                    assert!(
+                        has_clock(&foot),
+                        "time in the bottom border {bottom:?}\n{screen}"
+                    );
+                    assert_eq!(
+                        cell_text(buf, y, x, x2 + 1).width(),
+                        (x2 - x + 1) as usize,
+                        "{screen}"
+                    );
+                    assert_eq!(
+                        cell_text(buf, yb, x, x2 + 1).width(),
+                        (x2 - x + 1) as usize,
+                        "{screen}"
+                    );
+                    let _ = title;
+                    out.push((x, y, x2, yb));
+                }
+            }
+            out
+        }
+
+        #[test]
+        fn every_card_has_a_closed_frame_and_one_time_in_its_bottom_border() {
+            use crate::config::BorderStyle;
+            for style in [
+                BorderStyle::Rounded,
+                BorderStyle::Plain,
+                BorderStyle::Thick,
+                BorderStyle::Double,
+            ] {
+                for tiny in [true, false] {
+                    let base = if tiny {
+                        tiny_cards()
+                    } else {
+                        conversation(MessageLayout::Cards)
+                    };
+                    let n = base.histories[&10].msgs().len();
+                    let sels = std::iter::once(None).chain((0..n).map(Some));
+                    for sel in sels {
+                        let mut app = if tiny {
+                            tiny_cards()
+                        } else {
+                            conversation(MessageLayout::Cards)
+                        };
+                        app.settings.appearance.border_style = Some(style);
+                        app.focus = Pane::Messages;
+                        app.msg_sel = sel;
+                        let buf = buffer(&mut app, 80, 70);
+                        let screen = buf_rows(&buf).join("\n");
+                        let set = theme::border_set();
+                        let frames = card_frames(&buf, &set);
+                        let expect = if tiny { 5 } else { 3 };
+                        assert_eq!(frames.len(), expect, "{style:?} sel {sel:?}\n{screen}");
+                        let right = frames.iter().filter(|f| f.2 >= 70).count();
+                        assert!(
+                            right >= 1 && right < frames.len(),
+                            "own cards right, incoming left\n{screen}"
+                        );
+                    }
+                }
+            }
+        }
+
+        #[test]
+        fn small_cards_shrink_wrap_with_time_in_the_border() {
+            for sel in [None, Some(5), Some(6), Some(7)] {
+                let mut app = tiny_cards();
+                app.focus = Pane::Messages;
+                app.msg_sel = sel;
+                let rows = pane(&snapshot(&mut app, 80, 60));
+                let screen = rows.join("\n");
+                let t = row_of(&rows, "╭─twink─╮");
+                assert!(
+                    rows[t + 1].contains("│ Ппп   │") || rows[t + 1].contains("│▎Ппп   │"),
+                    "{screen}"
+                );
+                let msgs = app.histories[&10].msgs();
+                let a = format::time_label(msgs[5].date);
+                assert!(rows[t + 2].trim().starts_with("╰─"), "{screen}");
+                assert!(
+                    rows[t + 2].trim_end().ends_with(&format!("{a}─╯")),
+                    "{screen}"
+                );
+                let xd = row_of(&rows, "Xd");
+                let top = rows[xd - 1].trim();
+                assert!(top.starts_with('╭') && top.ends_with('╮'), "{screen}");
+                assert!(
+                    !has_clock(&rows[xd]) && !has_clock(&rows[xd + 1]),
+                    "{screen}"
+                );
+                let bottom = rows[xd + 2].trim();
+                let b = format::time_label(msgs[7].date);
+                assert!(
+                    bottom.starts_with("╰─") && bottom.contains(&b) && bottom.ends_with("─╯"),
+                    "{screen}"
+                );
+                assert_eq!(rows[xd].width(), rows[xd + 1].width(), "{screen}");
+                assert_eq!(rows[xd - 1].width(), rows[xd + 2].width(), "{screen}");
+            }
+            let mut app = tiny_cards();
+            app.settings.appearance.border_style = Some(crate::config::BorderStyle::Plain);
+            let rows = pane(&snapshot(&mut app, 80, 60));
+            assert!(
+                rows.iter().any(|r| r.contains("┌─twink─┐")),
+                "{}",
+                rows.join("\n")
+            );
+            assert!(!rows.iter().any(|r| r.contains('╭')), "{}", rows.join("\n"));
+        }
+
+        #[test]
+        fn cards_show_each_time_once() {
+            let mut app = conversation(MessageLayout::Cards);
+            let rows = pane(&snapshot(&mut app, 80, 40));
+            let screen = rows.join("\n");
+            let msgs = app.histories[&10].msgs();
+            let own = format::time_label(msgs[2].date);
+            assert_eq!(
+                format::time_label(msgs[3].date),
+                own,
+                "fixture: same minute"
+            );
+            assert_eq!(screen.matches(&own).count(), 1, "{screen}");
+            let own_bottom = (row_of(&rows, "screenshot")..rows.len())
+                .find(|&i| rows[i].contains('╰'))
+                .unwrap();
+            assert!(rows[own_bottom].contains(&format!("{own} ✓─")), "{screen}");
+            let first = format::time_label(msgs[0].date);
+            let last = format::time_label(msgs[1].date);
+            assert_ne!(first, last, "fixture: different minutes");
+            assert_eq!(
+                screen.matches(&first).count(),
+                0,
+                "one time per card\n{screen}"
+            );
+            assert_eq!(screen.matches(&last).count(), 1, "{screen}");
+        }
+
+        #[test]
+        fn classic_edited_marker_is_dim_and_not_glued() {
+            let mut app = conversation(MessageLayout::Classic);
+            app.lang = format::Lang::from_locale(Some("ru_RU.UTF-8"));
+            let buf = buffer(&mut app, 80, 50);
+            let rows = buf_rows(&buf);
+            let y = pane_end(&rows);
+            assert!(!rows[y].contains("pane изм."), "{}", rows[y]);
+            let (x, my) = find(&buf, "изм.");
+            assert_eq!(my as usize, y);
+            assert!(x as usize > col_of(&rows[y], "pane") + 15, "{}", rows[y]);
+            assert_eq!(
+                buf[(x, my)].style().add_modifier,
+                theme::edited().add_modifier
+            );
+            app.histories
+                .get_mut(&10)
+                .unwrap()
+                .get_mut(1)
+                .unwrap()
+                .edited = true;
+            let rows = snapshot(&mut app, 80, 50);
+            let header = &rows[row_of(&rows, "Alice Longname ")];
+            assert!(header.contains("· изм."), "edited header message: {header}");
+        }
+
+        #[test]
+        fn text_layouts_mark_every_row_of_the_selected_message() {
+            for layout in [
+                MessageLayout::Classic,
+                MessageLayout::Compact,
+                MessageLayout::Minimal,
+                MessageLayout::Split,
+            ] {
+                let mut app = conversation(layout);
+                app.msg_sel = Some(1);
+                app.focus = Pane::Messages;
+                let buf = buffer(&mut app, 80, 50);
+                let rows = buf_rows(&buf);
+                let screen = rows.join("\n");
+                let first = row_of(&rows, "the changelog");
+                let last = pane_end(&rows);
+                assert!(last > first, "{layout:?} wraps\n{screen}");
+                let bar = theme::get().glyphs.selection_bar.clone();
+                for y in first..=last {
+                    let cell = &buf[(1, y as u16)];
+                    assert_eq!(cell.symbol(), bar, "{layout:?} row {y}\n{screen}");
+                    assert_eq!(cell.fg, theme::selection_bar().fg.unwrap(), "{layout:?}");
+                    for x in [2u16, 40, 77] {
+                        assert_eq!(
+                            Some(buf[(x, y as u16)].bg),
+                            theme::selection_bg(),
+                            "{layout:?} tint at ({x},{y})\n{screen}"
+                        );
+                    }
+                }
+                let hey = row_of(&rows, "hey, did you");
+                assert_ne!(buf[(1, hey as u16)].symbol(), bar, "{layout:?}\n{screen}");
+                assert!(!screen.contains("╭─"), "{layout:?} draws no box\n{screen}");
+                app.msg_sel = Some(0);
+                let buf = buffer(&mut app, 80, 50);
+                let rows = buf_rows(&buf);
+                let name = (0..rows.len())
+                    .find(|&y| rows[y].contains("Alice Longn") && !rows[y].contains("│ Alice"))
+                    .unwrap();
+                let (nx, _) = find_in(&buf, "Alice Longn", 0..80);
+                assert_eq!(
+                    buf[(nx, name as u16)].fg,
+                    theme::active_field().fg.unwrap(),
+                    "{layout:?} name in accent"
+                );
+            }
+        }
+
+        #[test]
+        fn split_puts_own_messages_right_and_others_left() {
+            let mut app = conversation(MessageLayout::Split);
+            let rows = pane(&snapshot(&mut app, 80, 50));
+            let screen = rows.join("\n");
+            assert!(!screen.contains('▄'), "{screen}");
+            let gutter = MSG_GUTTER;
+            let hey = row_of(&rows, "hey, did you");
+            assert_eq!(col_of(&rows[hey], "hey"), gutter, "{screen}");
+            let alice = row_of(&rows, "Alice Longname ");
+            assert_eq!(col_of(&rows[alice], "Alice"), gutter, "{screen}");
+            let mine = row_of(&rows, "upgrading tonight");
+            assert_eq!(rows[mine].width(), 78 - gutter, "{screen}");
+            let me = row_of(&rows, "Me ");
+            assert!(rows[me].ends_with("✓✓"), "{screen}");
+            assert_eq!(
+                rows[me].width(),
+                78 - gutter,
+                "header on its side\n{screen}"
+            );
+            let strip = row_of(&rows, "│ Alice Longname: ");
+            assert_eq!(rows[strip].width(), 78 - gutter, "{screen}");
+            assert!(col_of(&rows[strip], "│ Alice") >= 78 - 78 * 70 / 100 - gutter);
+            let wrap = row_of(&rows, "the changelog");
+            assert!(rows[wrap].width() <= gutter + 78 * 70 / 100, "{screen}");
+            let bob = row_of(&rows, "Bob ");
+            assert_eq!(col_of(&rows[bob], "Bob"), gutter);
+        }
+
+        fn keyboard_msg(app: &mut App) {
+            use crate::bots::{Button, ButtonAction, Keyboard};
+            let h = app.histories.get_mut(&10).unwrap();
+            let m = h.get_mut(5).unwrap();
+            m.keyboard = Some(Keyboard {
+                inline: true,
+                rows: vec![
+                    vec![Button {
+                        text: "Участвовать".to_owned(),
+                        action: ButtonAction::Url("https://example.org".to_owned()),
+                    }],
+                    vec![
+                        Button {
+                            text: "Да".to_owned(),
+                            action: ButtonAction::Callback("eQ==".to_owned()),
+                        },
+                        Button {
+                            text: "Нет".to_owned(),
+                            action: ButtonAction::Callback("bg==".to_owned()),
+                        },
+                    ],
+                ],
+                placeholder: String::new(),
+            });
+        }
+
+        #[test]
+        fn inline_keyboards_render_as_separate_rounded_buttons() {
+            for layout in MessageLayout::ALL {
+                let mut app = conversation(layout);
+                keyboard_msg(&mut app);
+                let buf = buffer(&mut app, 90, 40);
+                let rows = buf_rows(&buf);
+                let screen = rows.join("\n");
+                let y = row_of(&rows, "│ Участвовать ↗ │");
+                assert!(
+                    rows[y - 1].contains("╭───────────────╮"),
+                    "{layout:?}\n{screen}"
+                );
+                assert!(
+                    rows[y + 1].contains("╰───────────────╯"),
+                    "{layout:?}\n{screen}"
+                );
+                let yes = row_of(&rows, "Да");
+                assert_eq!(yes, y + 3, "{layout:?}\n{screen}");
+                assert_eq!(
+                    rows[yes].matches('│').count() - rows[y].matches('│').count(),
+                    2
+                );
+                let x0 = col_of(&rows[y], "│ Участвовать");
+                let row_end = x0 + "│ Участвовать ↗ │".width();
+                let da_end = col_of(&rows[yes], "│ Нет") + "│ Нет  │".width();
+                assert_eq!(da_end, row_end, "{layout:?} rows share a width\n{screen}");
+                assert!(!screen.contains("[ "), "{layout:?}\n{screen}");
+                let (bx, by) = find(&buf, "Участвовать");
+                assert_eq!(buf[(bx, by)].fg, theme::button_text().fg.unwrap());
+                assert_eq!(buf[(bx - 2, by)].fg, theme::button_border().fg.unwrap());
+                let id = app.histories[&10].get(5).unwrap().id;
+                let kb = app.histories[&10].get(5).unwrap().keyboard.clone().unwrap();
+                app.popup = Some(Popup::Buttons(crate::app::ButtonsView {
+                    chat_id: 10,
+                    msg_id: id,
+                    keyboard: kb,
+                    sel: 2,
+                }));
+                let buf = buffer(&mut app, 90, 40);
+                let focused = theme::button_selected();
+                let hits: Vec<(u16, u16)> = (0..40u16)
+                    .flat_map(|y| (0..90u16).map(move |x| (x, y)))
+                    .filter(|&(x, y)| {
+                        buf[(x, y)].symbol() == "Н" && buf[(x, y)].bg == focused.bg.unwrap()
+                    })
+                    .collect();
+                assert!(hits.len() >= 2, "{layout:?}: focused in message and popup");
+                let (dx, dy) = find(&buf, "Да");
+                assert_ne!(buf[(dx, dy)].bg, focused.bg.unwrap(), "{layout:?}");
+            }
+        }
+
+        #[test]
+        fn reply_keyboard_sits_above_the_composer_as_buttons() {
+            use crate::bots::{Button, ButtonAction, Keyboard};
+            let mut app = conversation(MessageLayout::Classic);
+            let h = app.histories.get_mut(&10).unwrap();
+            let m = h.get_mut(5).unwrap();
+            m.keyboard = Some(Keyboard {
+                inline: false,
+                rows: vec![vec![
+                    Button {
+                        text: "Меню".to_owned(),
+                        action: ButtonAction::Text,
+                    },
+                    Button {
+                        text: "Помощь".to_owned(),
+                        action: ButtonAction::Text,
+                    },
+                ]],
+                placeholder: "Выберите".to_owned(),
+            });
+            app.set_reply_keyboard_id(10, 5);
+            let rows = snapshot(&mut app, 80, 30);
+            let screen = rows.join("\n");
+            let composer = row_of(&rows, "╭ Message");
+            let mid = row_of(&rows, "Помощь");
+            assert!(mid > composer, "{screen}");
+            assert!(
+                rows[mid].contains("│  Меню  │") || rows[mid].contains("│ Меню"),
+                "{screen}"
+            );
+            assert!(
+                rows[mid - 1].contains('╭') && rows[mid + 1].contains('╰'),
+                "{screen}"
+            );
+            assert!(rows[mid - 2].contains("C-k") && rows[mid - 2].contains("Выберите"));
+            app.popup = Some(Popup::Buttons(crate::app::ButtonsView {
+                chat_id: 10,
+                msg_id: 5,
+                keyboard: app.reply_keyboard().unwrap().1.clone(),
+                sel: 1,
+            }));
+            let buf = buffer(&mut app, 80, 30);
+            let focused = theme::button_selected().bg.unwrap();
+            let lit = (0..30u16)
+                .flat_map(|y| (0..80u16).map(move |x| (x, y)))
+                .filter(|&(x, y)| buf[(x, y)].symbol() == "П" && buf[(x, y)].bg == focused)
+                .count();
+            assert_eq!(lit, 2, "composer row and popup show the focus");
+        }
+
+        #[test]
+        fn date_separators_follow_the_russian_locale() {
+            use chrono::TimeZone;
+            let at = |d: u32, h: u32| {
+                chrono::Local
+                    .with_ymd_and_hms(2026, 11, d, h, 0, 0)
+                    .single()
+                    .unwrap()
+                    .timestamp()
+            };
+            let lang = format::Lang::from_locale(Some("ru_RU.UTF-8"));
+            assert_eq!(lang, format::Lang::Ru);
+            for layout in MessageLayout::ALL {
+                let mut app = conversation(layout);
+                let h = app.histories.get_mut(&10).unwrap();
+                h.get_mut(1).unwrap().date = at(7, 12);
+                h.get_mut(2).unwrap().date = at(7, 12) + 60;
+                for id in 3..=5 {
+                    h.get_mut(id).unwrap().date = at(9, 10) + id * 60;
+                }
+                let ctx = Ctx {
+                    width: 70,
+                    layout,
+                    theme: 0,
+                    now: at(9, 15),
+                    today: 0,
+                    lang,
+                    sel: None,
+                };
+                let msgs = app.histories[&10].msgs();
+                let mut text = String::new();
+                for range in model::groups(msgs) {
+                    let mut cache = LayoutCache::default();
+                    let r = cached_block(&app, &mut cache, msgs, range, ctx, false);
+                    for l in r.lines {
+                        text.extend(l.spans.iter().map(|s| s.content.to_string()));
+                        text.push('\n');
+                    }
+                }
+                assert!(text.contains(" 7 ноября "), "{layout:?}\n{text}");
+                assert!(text.contains(" Сегодня "), "{layout:?}\n{text}");
+                assert!(!text.contains("November") && !text.contains("Today"));
+            }
+        }
+
+        #[test]
+        #[ignore = "writes .work/layouts-preview.txt"]
+        fn write_layouts_preview() {
+            use crate::bots::{Button, ButtonAction, Keyboard};
+            let mut out = String::new();
+            for layout in MessageLayout::ALL {
+                for (label, sel) in [("", None), (" · selected", Some(1usize))] {
+                    let mut app = conversation(layout);
+                    app.lang = format::Lang::from_locale(Some("ru_RU.UTF-8"));
+                    let h = app.histories.get_mut(&10).unwrap();
+                    let mut shot = h.msgs()[3].clone();
+                    let mut doc = Attachment::new(MediaKind::Document, file(901, false));
+                    doc.name = "release-notes.pdf".to_owned();
+                    shot.attachments = vec![doc];
+                    h.upsert(shot);
+                    let mut bob = h.msgs()[4].clone();
+                    bob.keyboard = Some(Keyboard {
+                        inline: true,
+                        rows: vec![
+                            vec![Button {
+                                text: "Участвовать".to_owned(),
+                                action: ButtonAction::Url("https://example.org".to_owned()),
+                            }],
+                            vec![
+                                Button {
+                                    text: "Да".to_owned(),
+                                    action: ButtonAction::Callback("eQ==".to_owned()),
+                                },
+                                Button {
+                                    text: "Нет".to_owned(),
+                                    action: ButtonAction::Callback("bg==".to_owned()),
+                                },
+                            ],
+                        ],
+                        placeholder: String::new(),
+                    });
+                    h.upsert(bob);
+                    app.msg_sel = sel;
+                    if sel.is_some() {
+                        app.focus = Pane::Messages;
+                    }
+                    let (w, rows) = (70u16, 40u16);
+                    let mut term = Terminal::new(TestBackend::new(w, rows)).unwrap();
+                    term.draw(|f| draw(f, &mut app)).unwrap();
+                    let buf = term.backend().buffer().clone();
+                    out.push_str(&format!("=== {}{label} ===\n", layout.name()));
+                    for y in 0..rows {
+                        let mut row = String::new();
+                        let mut x = 0;
+                        while x < w {
+                            let sym = buf[(x, y)].symbol();
+                            row.push_str(sym);
+                            x += sym.width().max(1) as u16;
+                        }
+                        out.push_str(row.trim_end());
+                        out.push('\n');
+                    }
+                    out.push('\n');
+                }
+            }
+            let path =
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".work/layouts-preview.txt");
+            std::fs::write(path, out).unwrap();
+        }
+    }
+
+    mod stray_cells {
+        use super::*;
+        use crate::config::MessageLayout;
+        use crate::model::Reaction;
+
+        const ALL: [MessageLayout; 6] = [
+            MessageLayout::Classic,
+            MessageLayout::Bubbles,
+            MessageLayout::Cards,
+            MessageLayout::Compact,
+            MessageLayout::Minimal,
+            MessageLayout::Split,
+        ];
+        const AVATAR_RED: Color = Color::Rgb(200, 30, 30);
+        const PARTY: i64 = 5_368_324_170_671_202_286;
+
+        fn react(label: &str, custom: i64, count: i32, chosen: bool) -> Reaction {
+            Reaction {
+                label: label.to_owned(),
+                emoji: (custom == 0).then(|| label.to_owned()),
+                custom,
+                count,
+                chosen,
+            }
+        }
+
+        fn chat_scene(layout: MessageLayout) -> App {
+            let mut app = app();
+            app.settings.appearance.layout = Some(layout);
+            app.settings.appearance.seconds = Some(true);
+            app.show_info = false;
+            app.show_folders = false;
+            app.show_chats = false;
+            app.my_id = Some(1);
+            app.users.insert(1, "mihail".to_owned());
+            app.users.insert(2, "рустем".to_owned());
+            let now = chrono::Local::now().timestamp();
+            let base = now - now.rem_euclid(86_400) + 12 * 3600 - 86_400;
+            let plain = |id: i64, sender: i64, date: i64, text: &str| {
+                let mut m = msg(id, sender, date, text);
+                m.body = RichText::plain(text);
+                m.edited = false;
+                m.reply_to = None;
+                m.media = None;
+                m
+            };
+            let mut batch = vec![
+                plain(1, 2, base, "не впускай"),
+                plain(2, 1, base + 10, "будет фотки"),
+                plain(3, 1, base + 12, "ещё"),
+                plain(4, 2, base + 20, "ДААДАДАДДА"),
+                plain(5, 2, base + 22, "ага"),
+                plain(6, 1, base + 30, "выкладывать"),
+                plain(7, 1, base + 31, ""),
+                plain(8, 2, base + 40, "ок"),
+            ];
+            batch[0].reactions = vec![react("👍", 0, 1, false)];
+            batch[1].reactions = vec![react("❤", 0, 1, false)];
+            batch[2].reactions = vec![react("•", PARTY, 2, true)];
+            batch[3].reactions = vec![react("🔥", 0, 1, false), react("•", PARTY, 1, false)];
+            batch[5].reactions = vec![react("😁", 0, 3, false)];
+            batch[6].attachments = vec![photo(900)];
+            let mut h = History::default();
+            h.reached_start = true;
+            h.merge_older(batch);
+            app.histories.insert(10, h);
+            let chat = app.chats.get_mut(&10).unwrap();
+            chat.last_read_outbox = 10;
+            chat.unread = 0;
+            for (uid, fid) in [(1i64, 701), (2, 702)] {
+                app.user_meta.entry(uid).or_default().photo = Some(crate::model::FileRef {
+                    id: fid,
+                    path: format!("/nonexistent/avatar{fid}.png"),
+                    done: true,
+                    ..crate::model::FileRef::default()
+                });
+            }
+            for (cols, rows) in [(2, 1), (4, 2)] {
+                for fid in [701, 702] {
+                    for shape in [
+                        crate::theme::AvatarShape::Circle,
+                        crate::theme::AvatarShape::Rounded,
+                        crate::theme::AvatarShape::Square,
+                    ] {
+                        let key = Key {
+                            src: Src::File(fid),
+                            cols,
+                            rows,
+                            shape: Some(shape),
+                            animate: false,
+                        };
+                        let frames = ready_frames(&app, cols, rows);
+                        app.media.insert_ready(key, frames, 0);
+                    }
+                }
+            }
+            app
+        }
+
+        fn pane_rows(app: &mut App) -> Vec<String> {
+            let buf = buffer(app, 140, 60);
+            (0..60u16)
+                .map(|y| {
+                    let mut row = String::new();
+                    let mut x = 0u16;
+                    while x < 140 {
+                        let sym = buf[(x, y)].symbol();
+                        row.push_str(sym);
+                        x += (sym.width() as u16).max(1);
+                    }
+                    row
+                })
+                .skip(2)
+                .take_while(|r| !r.contains("╭ Message"))
+                .map(|r| r.trim_matches(|c: char| c == '│' || c == ' ').to_owned())
+                .collect()
+        }
+
+        fn avatar_cells(app: &mut App) -> usize {
+            let buf = buffer(app, 140, 60);
+            buf.content
+                .iter()
+                .filter(|c| c.fg == AVATAR_RED || c.bg == AVATAR_RED)
+                .count()
+        }
+
+        #[test]
+        fn reactions_render_as_emoji_count_chips_in_every_layout() {
+            for layout in ALL {
+                let mut app = chat_scene(layout);
+                app.custom_emoji.insert(PARTY, "🎉".to_owned());
+                let rows = pane_rows(&mut app);
+                let screen = rows.join("\n");
+                for chip in ["👍 1", "❤\u{FE0F} 1", "🎉 2•", "😁 3"] {
+                    assert!(screen.contains(chip), "{layout:?} {chip}\n{screen}");
+                }
+                assert!(
+                    rows.iter()
+                        .any(|r| r.contains("🔥 1") && r.contains("🎉 1")),
+                    "{layout:?}\n{screen}"
+                );
+                assert!(
+                    !screen.split_whitespace().any(|w| w == "•"),
+                    "{layout:?}\n{screen}"
+                );
+                for r in &rows {
+                    let lone = r
+                        .split(|c: char| c == '│' || c.is_whitespace())
+                        .filter(|w| !w.is_empty())
+                        .any(|w| ["👍", "❤\u{FE0F}", "🔥", "😁", "🎉"].contains(&w))
+                        && !r.chars().any(|c| c.is_ascii_digit());
+                    assert!(!lone, "{layout:?} bare reaction glyph: [{r}]\n{screen}");
+                }
+            }
+        }
+
+        #[test]
+        fn reaction_chips_have_terminal_widths_and_repaint_cleanly_while_selecting() {
+            let qualified = [
+                "❤\u{FE0F}",
+                "👍🏽",
+                "👨\u{200D}👩\u{200D}👧",
+                "1\u{FE0F}\u{20E3}",
+                "❤\u{FE0F}\u{200D}🔥",
+                "🤷\u{200D}♂\u{FE0F}",
+                "🎉",
+            ];
+            let raw = ["❤\u{200D}🔥", "🤷\u{200D}♂", "1\u{20E3}"];
+            for layout in ALL {
+                let mut app = chat_scene(layout);
+                {
+                    let h = app.histories.get_mut(&10).unwrap();
+                    h.get_mut(1).unwrap().reactions =
+                        vec![react("❤", 0, 1, false), react("👍🏽", 0, 2, false)];
+                    h.get_mut(4).unwrap().reactions = vec![
+                        react("👨\u{200D}👩\u{200D}👧", 0, 1, false),
+                        react("1\u{20E3}", 0, 1, false),
+                    ];
+                    h.get_mut(5).unwrap().reactions = vec![
+                        react("❤\u{200D}🔥", 0, 4, true),
+                        react("🤷\u{200D}♂", 0, 1, false),
+                        react("•", PARTY, 1, false),
+                    ];
+                }
+                let mut term = Terminal::new(TestBackend::new(140, 60)).unwrap();
+                for step in 0..12 {
+                    if step == 6 {
+                        app.custom_emoji.insert(PARTY, "🎉".to_owned());
+                    }
+                    app.msg_sel = match step % 6 {
+                        0 => None,
+                        n => Some(8 - n),
+                    };
+                    term.draw(|f| draw(f, &mut app)).unwrap();
+                    let incremental = term.backend().buffer().clone();
+                    let fresh = buffer(&mut app, 140, 60);
+                    let syms = |b: &Buffer| -> Vec<String> {
+                        b.content.iter().map(|c| c.symbol().to_owned()).collect()
+                    };
+                    let (a, b) = (syms(&incremental), syms(&fresh));
+                    let diff: Vec<(usize, usize, &String, &String)> = a
+                        .iter()
+                        .zip(&b)
+                        .enumerate()
+                        .filter(|(i, (x, y))| {
+                            let hidden =
+                                i % 140 > 0 && crate::format::grapheme_cells(&b[i - 1]) == 2;
+                            x != y && !hidden
+                        })
+                        .map(|(i, (x, y))| (i % 140, i / 140, x, y))
+                        .collect();
+                    assert!(diff.is_empty(), "{layout:?} step {step}: {diff:?}");
+                    let on_screen: Vec<&str> = fresh.content.iter().map(|c| c.symbol()).collect();
+                    for q in qualified.iter().take(6) {
+                        assert!(
+                            on_screen.contains(q),
+                            "{layout:?} step {step}: {q:?} missing"
+                        );
+                        assert_eq!(crate::format::grapheme_cells(q), 2);
+                    }
+                    assert_eq!(
+                        on_screen.contains(&"🎉"),
+                        step >= 6,
+                        "{layout:?} step {step}"
+                    );
+                    for r in raw.iter().chain(["❤", "◆", "\u{25A1}"].iter()) {
+                        assert!(!on_screen.contains(r), "{layout:?} step {step}: raw {r:?}");
+                    }
+                    for (i, c) in fresh.content.iter().enumerate() {
+                        let sym = c.symbol();
+                        if crate::format::grapheme_cells(sym) == 2 && sym.chars().count() > 1 {
+                            assert!(
+                                qualified.contains(&sym) || sym.chars().all(|ch| ch.len_utf8() < 4),
+                                "{layout:?} step {step}: unexpected wide cluster {sym:?} at {i}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        #[tokio::test]
+        async fn custom_emoji_reactions_are_resolved_once_and_redrawn() {
+            let mut app = chat_scene(MessageLayout::Split);
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let (td, log) = crate::td::Td::recording(tx);
+            app.td = td;
+            let asked = |log: &crate::td::RequestLog| {
+                log.lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|w| w.as_str() == "custom emoji")
+                    .count()
+            };
+            let rows = pane_rows(&mut app);
+            assert!(rows.iter().any(|r| r.contains("• 2•")), "{rows:#?}");
+            app.after_draw();
+            pane_rows(&mut app);
+            app.after_draw();
+            assert_eq!(asked(&log), 1);
+            app.handle(Event::CustomEmoji(Ok(std::collections::HashMap::from([(
+                PARTY,
+                "🎉".to_owned(),
+            )]))));
+            let screen = pane_rows(&mut app).join("\n");
+            assert!(
+                screen.contains("🎉 2•") && !screen.split_whitespace().any(|w| w == "•"),
+                "{screen}"
+            );
+            app.after_draw();
+            assert_eq!(asked(&log), 1);
+            app.handle(Event::CustomEmoji(Err("boom".to_owned())));
+            assert!(
+                app.status
+                    .as_ref()
+                    .is_some_and(|(s, err)| *err && s.contains("boom"))
+            );
+        }
+
+        #[test]
+        fn split_draws_no_avatars_and_text_layouts_never_draw_tiny_avatar_images() {
+            for layout in ALL {
+                let mut app = chat_scene(layout);
+                let drawn = avatar_cells(&mut app);
+                if layout == MessageLayout::Bubbles {
+                    assert!(
+                        drawn > 0 && drawn.is_multiple_of(4 * 2),
+                        "{layout:?} keeps its 4x2 photo avatars: {drawn}"
+                    );
+                } else {
+                    assert_eq!(drawn, 0, "{layout:?} draws an avatar image");
+                }
+            }
+            let mut app = chat_scene(MessageLayout::Classic);
+            let rows = pane_rows(&mut app);
+            let header = row_of(&rows, "рустем ");
+            assert!(rows[header].starts_with("Р рустем"), "{rows:#?}");
+            let mut app = chat_scene(MessageLayout::Bubbles);
+            let mut t = crate::theme::Theme::default();
+            t.layout.bubble_avatar_rows = 1;
+            app.set_theme(t);
+            assert_eq!(
+                avatar_cells(&mut app),
+                0,
+                "1-row bubble avatar stays initials"
+            );
+            assert!(pane_rows(&mut app).iter().any(|r| r.starts_with("Р")));
+        }
+    }
+
+    fn screen_rows(app: &mut App, w: u16, h: u16) -> Vec<String> {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol().to_owned()).collect())
+            .collect()
+    }
+
+    fn row_with<'a>(rows: &'a [String], needle: &str) -> &'a str {
+        rows.iter()
+            .find(|r| r.contains(needle))
+            .unwrap_or_else(|| panic!("{needle} not on screen:\n{}", rows.join("\n")))
+    }
+
+    #[test]
+    fn typing_sits_in_the_composer_border_without_moving_anything() {
+        use crate::presence::{Activity, Typing};
+        let mut app = app();
+        app.lang = format::Lang::Ru;
+        app.show_info = false;
+        app.show_folders = false;
+        app.show_chats = false;
+        app.users.insert(2, "рустем Гарипов".to_owned());
+        app.users.insert(3, "ильнур".to_owned());
+        app.users.insert(4, "Константинопольский".to_owned());
+        let quiet = snapshot(&mut app, 100, 30);
+        let typing = |who: &[i64], act: Activity, topic: Option<i32>| -> Vec<Typing> {
+            who.iter()
+                .map(|u| Typing::new(Sender::User(*u), act, topic))
+                .collect()
+        };
+        let border = quiet.iter().position(|r| r.contains("╭ Message ")).unwrap();
+        for (who, act, want) in [
+            (&[2][..], Activity::Typing, " Message · рустем печатает… "),
+            (
+                &[2, 3][..],
+                Activity::Typing,
+                " Message · рустем, ильнур печатают… ",
+            ),
+            (
+                &[2, 3, 4][..],
+                Activity::Typing,
+                " Message · рустем и ещё 2 печатают… ",
+            ),
+            (
+                &[2][..],
+                Activity::UploadingPhoto,
+                " Message · рустем отправляет фото… ",
+            ),
+            (
+                &[2][..],
+                Activity::UploadingFile,
+                " Message · рустем отправляет файл… ",
+            ),
+        ] {
+            app.typing.insert(10, typing(who, act, None));
+            let rows = snapshot(&mut app, 100, 30);
+            for y in 0..30 {
+                if y == border {
+                    assert!(rows[y].contains(want), "{}", rows[y]);
+                    assert_eq!(rows[y].chars().count(), quiet[y].chars().count());
+                    assert!(rows[y].trim_end_matches('│').ends_with('╮'), "{}", rows[y]);
+                } else {
+                    assert_eq!(rows[y], quiet[y], "row {y} moved");
+                }
+            }
+            assert!(
+                !rows[1].contains("печата"),
+                "header keeps no typing: {}",
+                rows[1]
+            );
+        }
+        app.users
+            .insert(2, "Длинноеимякотороенепомещаетсявзаголовокрамки".to_owned());
+        app.typing
+            .insert(10, typing(&[2, 3, 4], Activity::RecordingVoice, None));
+        for w in [40u16, 60, 100] {
+            let saved = app.typing.remove(&10).unwrap();
+            let calm = snapshot(&mut app, w, 30);
+            app.typing.insert(10, saved);
+            let rows = snapshot(&mut app, w, 30);
+            let y = rows.iter().position(|r| r.contains("╭ Message ")).unwrap();
+            assert_eq!(
+                rows[y].chars().count(),
+                calm[y].chars().count(),
+                "{}",
+                rows[y]
+            );
+            assert!(
+                rows[y].trim_end_matches('│').ends_with('╮'),
+                "{w}: {}",
+                rows[y]
+            );
+            assert!(rows[y].contains('…'), "{w}: {}", rows[y]);
+            assert_eq!(rows.len(), calm.len());
+        }
+        app.open_topic = Some(7);
+        app.typing
+            .insert(10, typing(&[3], Activity::Typing, Some(8)));
+        let rows = snapshot(&mut app, 100, 30);
+        assert!(
+            !rows.iter().any(|r| r.contains("печата")),
+            "other topic stays quiet"
+        );
+        app.typing
+            .insert(10, typing(&[3], Activity::Typing, Some(7)));
+        let rows = snapshot(&mut app, 100, 30);
+        assert!(
+            rows.iter()
+                .any(|r| r.contains(" Message · ильнур печатает… "))
+        );
+        app.settings.privacy.ghost_mode = true;
+        let rows = snapshot(&mut app, 100, 30);
+        assert!(
+            rows.iter().any(|r| r.contains("ильнур печатает…")),
+            "ghost mode only hides our own actions"
+        );
+    }
+
+    #[test]
+    fn loading_older_shows_late_in_a_fixed_row_without_moving_messages() {
+        let mut app = app();
+        app.show_info = false;
+        let h = app.histories.get_mut(&10).unwrap();
+        h.reached_start = false;
+        h.start_older();
+        let quiet = snapshot(&mut app, 100, 30);
+        assert!(
+            !quiet.iter().any(|r| r.contains("loading older")),
+            "{}",
+            quiet.join("\n")
+        );
+        assert!(app.animating, "keeps ticking until the delay passes");
+        app.histories.get_mut(&10).unwrap().older_since =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        let slow = snapshot(&mut app, 100, 30);
+        let changed: Vec<usize> = (0..30).filter(|y| quiet[*y] != slow[*y]).collect();
+        assert_eq!(changed.len(), 1, "{}", slow.join("\n"));
+        assert!(
+            slow[changed[0]].contains("loading older"),
+            "{}",
+            slow[changed[0]]
+        );
+        assert!(!app.animating);
+        let row = changed[0];
+        for _ in 0..3 {
+            let again = snapshot(&mut app, 100, 30);
+            assert!(again[row].contains("loading older"));
+        }
+        app.handle(Event::History {
+            chat_id: 10,
+            msgs: Vec::new(),
+            initial: false,
+            epoch: app.histories[&10].epoch,
+        });
+        let done = snapshot(&mut app, 100, 30);
+        assert!(!done.iter().any(|r| r.contains("loading older")));
+    }
+
+    #[test]
+    fn wide_titles_never_push_badges_past_the_pane_border() {
+        let mut app = app();
+        app.show_folders = true;
+        app.show_info = false;
+        app.folders = vec![(3, "🅰\u{FE0F}⚡▸ Работа и ещё много слов".to_owned())];
+        let base = app.chats[&10].clone();
+        let c10 = app.chats.get_mut(&10).unwrap();
+        c10.title = "🅰\u{FE0F}⚡▸ Очень длинный канал про всё".to_owned();
+        c10.forum = true;
+        let extra = [
+            (11, "✍ ❤\u{200D}🔥 Writers club ✍✍✍✍", 120, false),
+            (12, "ㅤ", 5, false),
+            (13, "🇺🇸🇺🇸🇺🇸🇺🇸🇺🇸🇺🇸🇺🇸🇺🇸🇺🇸🇺🇸🇺🇸🇺🇸🇺🇸🇺🇸", 7, false),
+            (14, "▸▸▸▸▸▸▸▸▸▸▸▸▸▸▸▸▸▸▸▸▸▸▸▸▸▸▸▸▸▸▸▸▸▸", 2, true),
+            (15, "⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡⚡", 3000, false),
+        ];
+        for (id, title, unread, muted) in extra {
+            let mut c = base.clone();
+            c.id = id;
+            c.title = title.to_owned();
+            c.unread = unread;
+            c.mentions = 0;
+            c.muted = muted;
+            c.positions[0].order = 100 - id;
+            c.positions[0].pinned = false;
+            app.chats.insert(id, c);
+        }
+        app.expanded = Some(10);
+        let mut topic = crate::model::Topic {
+            id: 2,
+            name: "⚡🅰\u{FE0F} Тема с длинным именем ✍".to_owned(),
+            order: 50,
+            use_default_mute: true,
+            ..crate::model::Topic::default()
+        };
+        topic.icon = "✍".to_owned();
+        topic.unread = 9;
+        topic.mentions = 1;
+        topic.pinned = true;
+        let mut list = crate::model::TopicList::default();
+        list.merge_page(vec![topic], None, 1);
+        app.topics.insert(10, list);
+        app.refresh_lists();
+        for width in [60u16, 80, 100, 140] {
+            let mut term = Terminal::new(TestBackend::new(width, 30)).unwrap();
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let buf = term.backend().buffer().clone();
+            let corners: Vec<u16> = (0..width)
+                .filter(|x| buf[(*x, 1)].symbol() == "╮")
+                .collect();
+            assert!(corners.len() >= 2, "{width}: {corners:?}");
+            let mut lefts = vec![0u16];
+            lefts.extend(corners.iter().map(|c| c + 1));
+            let mut seen = std::collections::HashSet::new();
+            for (pane, right) in corners.iter().take(2).enumerate() {
+                let left = lefts[pane];
+                for y in 2..29u16 {
+                    assert_eq!(
+                        buf[(*right, y)].symbol(),
+                        "│",
+                        "{width}: border at ({right},{y})"
+                    );
+                    let mut text = String::new();
+                    let mut x = left + 1;
+                    while x < *right {
+                        let sym = buf[(x, y)].symbol();
+                        let cw = crate::format::grapheme_cells(sym).max(1) as u16;
+                        assert!(
+                            x + cw <= *right,
+                            "{width}: {sym:?} at ({x},{y}) crosses the border"
+                        );
+                        for bad in ["✍", "ㅤ", "🇺", "🇸"] {
+                            assert_ne!(sym, bad, "{width}: unsafe glyph at ({x},{y})");
+                        }
+                        text.push_str(sym);
+                        x += cw;
+                    }
+                    let text = text.trim_end().to_owned();
+                    for (needle, badge) in [
+                        ("Writers", "120"),
+                        ("🇺🇸", "7"),
+                        ("▸▸▸", "2"),
+                        ("⚡⚡⚡", "3K"),
+                        ("Очень", "3"),
+                        ("Тема", "9"),
+                    ] {
+                        if text.contains(needle) {
+                            assert!(
+                                text.ends_with(badge),
+                                "{width}: [{text}] should end with {badge}"
+                            );
+                            seen.insert(needle);
+                        }
+                    }
+                    if pane == 0 && text.contains("Работа") {
+                        seen.insert("Работа");
+                    }
+                }
+            }
+            let needles: &[&str] = if width >= 100 {
+                &["Writers", "🇺🇸", "▸▸▸", "⚡⚡⚡", "Очень", "Работа"]
+            } else {
+                &["🇺🇸", "▸▸▸", "⚡⚡⚡"]
+            };
+            for needle in needles {
+                assert!(seen.contains(needle), "{width}: {needle} not drawn");
+            }
+        }
+    }
+
+    #[test]
+    fn forum_topics_render_under_the_chat_with_marks_and_previews() {
+        let mut app = app();
+        app.chats.get_mut(&10).unwrap().forum = true;
+        app.expanded = Some(10);
+        let topic = |id: i32, name: &str, order: i64| crate::model::Topic {
+            id,
+            name: name.to_owned(),
+            order,
+            use_default_mute: true,
+            ..crate::model::Topic::default()
+        };
+        let mut general = topic(1, "General", 5);
+        general.general = true;
+        general.hidden = true;
+        let mut releases = topic(2, "Releases", 50);
+        releases.icon = "🚀".to_owned();
+        releases.unread = 4;
+        releases.mentions = 1;
+        releases.pinned = true;
+        let mut m = msg(90, 2, 1_700_000_000, "new build is out");
+        m.topic = Some(2);
+        releases.last_message = Some(m);
+        let mut archive = topic(3, "Old stuff", 40);
+        archive.closed = true;
+        archive.color = 0x6FB9F0;
+        let mut list = crate::model::TopicList::default();
+        list.merge_page(vec![general, releases, archive], None, 3);
+        app.topics.insert(10, list);
+        app.open_topic = Some(2);
+        app.histories.get_mut(&10).unwrap().topic = Some(2);
+        app.refresh_lists();
+        let rows = screen_rows(&mut app, 140, 30);
+        let chat = rows.iter().position(|r| r.contains("▾ Rust чат")).unwrap();
+        let rel = rows.iter().position(|r| r.contains("🚀")).unwrap();
+        let old = rows.iter().position(|r| r.contains("# Old stuff")).unwrap();
+        let general_row = rows.iter().position(|r| r.contains("(hidden)")).unwrap();
+        assert!(
+            chat < rel && rel < old && old < general_row,
+            "{}",
+            rows.join("\n")
+        );
+        let r = row_with(&rows, "🚀");
+        assert!(r.contains("🚀"), "{r}");
+        assert!(r.contains("Alice"), "{r}");
+        assert!(r.contains("@ 4"), "{r}");
+        assert!(r.contains("▴"), "pinned topic: {r}");
+        assert!(row_with(&rows, "Old stuff").contains("# Old stuff"));
+        assert!(row_with(&rows, "Old stuff").contains("⊘"));
+        assert!(row_with(&rows, "General").contains("(hidden)"));
+        assert!(row_with(&rows, "Rust чат › Releases").contains("Releases"));
+
+        app.expanded = None;
+        let rows = screen_rows(&mut app, 140, 30);
+        assert!(!rows.iter().any(|r| r.contains("Old stuff")));
+        assert!(rows.iter().any(|r| r.contains("▸ Rust чат")));
+    }
+
+    #[test]
+    fn secret_chat_state_timer_and_popups_render() {
+        let mut app = app();
+        app.chats.insert(
+            50,
+            ChatInfo {
+                id: 50,
+                title: "Bob".to_owned(),
+                kind: ChatKind::Secret(2),
+                unread: 0,
+                mentions: 0,
+                reactions: 0,
+                last_read_inbox: 0,
+                last_read_outbox: 0,
+                photo: None,
+                muted: false,
+                use_default_mute: false,
+                positions: vec![Position {
+                    list: ListId::Main,
+                    order: 9,
+                    pinned: false,
+                }],
+                last_message: None,
+                group_id: 0,
+                secret_id: 7,
+                forum: false,
+                auto_delete: 30,
+                perms: crate::model::Rights::default(),
+                protected: false,
+            },
+        );
+        app.secret_chats.insert(
+            7,
+            crate::model::SecretChat {
+                id: 7,
+                user_id: 2,
+                state: crate::model::SecretState::Pending,
+                outbound: true,
+            },
+        );
+        let mut h = History::default();
+        let mut m = msg(1, 2, 1_700_000_000, "burn after reading");
+        m.chat_id = 50;
+        m.ttl = 30;
+        h.merge_older(vec![m]);
+        app.histories.insert(50, h);
+        app.open_chat = Some(50);
+        app.refresh_lists();
+        let rows = screen_rows(&mut app, 140, 30);
+        assert!(row_with(&rows, "Bob (waiting)").contains("🔒"));
+        let header = row_with(&rows, "secret chat: waiting");
+        assert!(header.contains("⏱ 30s"), "{header}");
+        assert!(
+            rows.iter()
+                .any(|r| r.contains("⏱ 30s") && !r.contains("secret chat"))
+        );
+        assert!(rows.iter().any(|r| r.contains("only on this device")));
+        assert!(rows.iter().any(|r| r.contains("Self-destruct: 30s")));
+
+        app.secret_chats.get_mut(&7).unwrap().state = crate::model::SecretState::Closed;
+        let rows = screen_rows(&mut app, 140, 30);
+        assert!(rows.iter().any(|r| r.contains("Bob (closed)")));
+
+        app.popup = Some(Popup::Ttl {
+            chat_id: 50,
+            choices: crate::model::ttl_choices(true),
+            sel: 2,
+        });
+        let rows = screen_rows(&mut app, 140, 30);
+        assert!(rows.iter().any(|r| r.contains("Self-destruct timer")));
+        assert!(rows.iter().any(|r| r.contains("30s ✓")));
+        assert!(rows.iter().any(|r| r.contains("1w")));
+        app.popup = Some(Popup::ConfirmSecret {
+            chat_id: 50,
+            secret_id: 7,
+            delete: true,
+        });
+        let rows = screen_rows(&mut app, 140, 30);
+        assert!(rows.iter().any(|r| r.contains("Delete this secret chat")));
+        app.popup = Some(Popup::NewTopic {
+            chat_id: 10,
+            input: crate::input::TextInput::with_text("Ideas"),
+        });
+        let rows = screen_rows(&mut app, 140, 30);
+        assert!(row_with(&rows, "New topic").contains("New topic"));
+        assert!(rows.iter().any(|r| r.contains("> Ideas")));
+        for w in [40u16, 60, 90] {
+            screen_rows(&mut app, w, 12);
+        }
+    }
+}
+
+#[cfg(test)]
+mod repaint_tests {
+    use super::*;
+    use crate::config::ApiCredentials;
+    use crate::keymap::Keymap;
+    use crate::model::{FileRef, History, RichText};
+    use crate::td::Event;
+    use std::cell::RefCell;
+    use std::rc::Rc;
+    use tokio::sync::mpsc::UnboundedReceiver;
+    use unicode_width::UnicodeWidthChar;
+
+    const PLACEHOLDER: char = '\u{10EEEE}';
+
+    #[derive(Clone, Default)]
+    struct Sink(Rc<RefCell<Vec<u8>>>);
+
+    impl std::io::Write for Sink {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.borrow_mut().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct Screen {
+        w: usize,
+        h: usize,
+        cells: Vec<String>,
+        x: usize,
+        y: usize,
+        saved: (usize, usize),
+    }
+
+    impl Screen {
+        fn new(w: u16, h: u16) -> Self {
+            let (w, h) = (usize::from(w), usize::from(h));
+            Self {
+                w,
+                h,
+                cells: vec![" ".to_owned(); w * h],
+                x: 0,
+                y: 0,
+                saved: (0, 0),
+            }
+        }
+
+        fn csi(&mut self, params: &str, fin: char) {
+            let n: Vec<usize> = params
+                .trim_start_matches('?')
+                .split(';')
+                .map(|v| v.parse().unwrap_or(0))
+                .collect();
+            let a = n[0].max(1);
+            match fin {
+                'H' => {
+                    self.y = (a - 1).min(self.h - 1);
+                    self.x = (n.get(1).copied().unwrap_or(1).max(1) - 1).min(self.w - 1);
+                }
+                's' => self.saved = (self.x, self.y),
+                'u' => (self.x, self.y) = self.saved,
+                'A' => self.y = self.y.saturating_sub(a),
+                'B' => self.y = (self.y + a).min(self.h - 1),
+                'C' => self.x = (self.x + a).min(self.w - 1),
+                'D' => self.x = self.x.saturating_sub(a),
+                'J' if n[0] == 2 => self.cells.fill(" ".to_owned()),
+                _ => {}
+            }
+        }
+
+        fn feed(&mut self, bytes: &[u8]) {
+            let text = String::from_utf8_lossy(bytes);
+            let mut it = text.chars().peekable();
+            while let Some(c) = it.next() {
+                if c == '\x1b' {
+                    match it.next() {
+                        Some('[') => {
+                            let mut params = String::new();
+                            for d in it.by_ref() {
+                                if ('@'..='~').contains(&d) {
+                                    self.csi(&params, d);
+                                    break;
+                                }
+                                params.push(d);
+                            }
+                        }
+                        Some('_') => {
+                            while let Some(d) = it.next() {
+                                if d == '\x1b' && it.peek() == Some(&'\\') {
+                                    it.next();
+                                    break;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    continue;
+                }
+                let cw = c.width().unwrap_or(0);
+                if cw == 0 {
+                    if self.x > 0 {
+                        self.cells[self.y * self.w + self.x - 1].push(c);
+                    }
+                    continue;
+                }
+                if self.x >= self.w {
+                    self.x = 0;
+                    self.y = (self.y + 1).min(self.h - 1);
+                }
+                self.cells[self.y * self.w + self.x] = c.to_string();
+                self.x += cw;
+            }
+        }
+
+        fn soil_blanks(&mut self) {
+            for (i, c) in self.cells.iter_mut().enumerate() {
+                if c == " " {
+                    *c = char::from(b'a' + (i % 26) as u8).to_string();
+                }
+            }
+        }
+
+        fn stale_cells(&self, buf: &Buffer) -> Vec<(u16, u16, String)> {
+            let mut out = Vec::new();
+            for y in 0..buf.area.height {
+                for x in 0..buf.area.width {
+                    let want = &buf[(x, y)];
+                    let got = &self.cells[usize::from(y) * self.w + usize::from(x)];
+                    let image = !matches!(want.diff_option, CellDiffOption::None);
+                    let ok = if image {
+                        got.starts_with(PLACEHOLDER)
+                    } else {
+                        got == want.symbol()
+                            || (got.trim().is_empty() && want.symbol().trim().is_empty())
+                    };
+                    if !ok {
+                        out.push((x, y, got.clone()));
+                    }
+                }
+            }
+            out
+        }
+    }
+
+    struct Rig {
+        app: App,
+        rx: UnboundedReceiver<Event>,
+        term: Terminal<CrosstermBackend<Sink>>,
+        sink: Sink,
+        screen: Screen,
+        layout: u64,
+        buf: Buffer,
+    }
+
+    impl Rig {
+        fn new(w: u16, h: u16) -> Self {
+            let dir = std::env::temp_dir().join(format!("gramtty-repaint-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let png = dir.join(format!("photo{n}.png"));
+            image::RgbaImage::from_pixel(320, 240, image::Rgba([200, 30, 30, 255]))
+                .save(&png)
+                .unwrap();
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            #[allow(deprecated)]
+            let mut picker =
+                ratatui_image::picker::Picker::from_fontsize(ratatui_image::FontSize {
+                    width: 10,
+                    height: 20,
+                });
+            picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+            let mut app = App::new(
+                crate::td::Td::recording(tx).0,
+                ApiCredentials {
+                    api_id: 1,
+                    api_hash: "x".to_owned(),
+                },
+                std::env::temp_dir(),
+                Keymap::default(),
+                picker,
+            );
+            app.auth = Auth::Ready;
+            let mut history = History::default();
+            history.reached_start = true;
+            for i in 0..40i64 {
+                let mut m = Msg {
+                    id: i + 1,
+                    chat_id: 10,
+                    sender: Sender::User(2 + i % 2),
+                    date: 1_700_000_000 + i * 400,
+                    edited: false,
+                    outgoing: false,
+                    state: SendState::Sent,
+                    reply_to: None,
+                    album: 0,
+                    media: None,
+                    attachments: Vec::new(),
+                    body: RichText {
+                        text: if i % 2 == 0 {
+                            "о".to_owned()
+                        } else {
+                            format!(
+                                "{i} используй этот проект https://github.com/example/project/{i}"
+                            )
+                        },
+                        entities: Vec::new(),
+                    },
+                    pinned: false,
+                    mention: false,
+                    unread_reaction: false,
+                    reactions: Vec::new(),
+                    keyboard: None,
+                    forward: None,
+                    topic: None,
+                    ttl: 0,
+                    deleted: false,
+                    meta: Default::default(),
+                };
+                if i % 4 == 1 {
+                    let f = FileRef {
+                        id: 500 + i as i32,
+                        size: 1,
+                        path: png.to_string_lossy().into_owned(),
+                        done: true,
+                        downloaded: 1,
+                        ..FileRef::default()
+                    };
+                    let visual = Visual {
+                        file: f.clone(),
+                        decode: Decode::Raster,
+                        width: 320,
+                        height: 240,
+                    };
+                    let mut a = Attachment::new(MediaKind::Photo, f);
+                    a.width = 320;
+                    a.height = 240;
+                    a.preview = Some(visual.clone());
+                    a.full = Some(visual);
+                    m.attachments = vec![a];
+                    m.body = RichText::default();
+                }
+                history.upsert(m);
+            }
+            app.histories.insert(10, history);
+            app.open_chat = Some(10);
+            app.focus = Pane::Messages;
+            let sink = Sink::default();
+            let area = Rect::new(0, 0, w, h);
+            let term = Terminal::with_options(
+                CrosstermBackend::new(sink.clone()),
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Fixed(area),
+                },
+            )
+            .unwrap();
+            Self {
+                app,
+                rx,
+                term,
+                sink,
+                screen: Screen::new(w, h),
+                layout: image_layout(&Buffer::empty(area)),
+                buf: Buffer::empty(area),
+            }
+        }
+
+        fn frame(&mut self) -> Vec<u8> {
+            let mut buf = None;
+            draw_frame(&mut self.term, &mut self.app, &mut self.layout, |b| {
+                buf = Some(b.clone())
+            })
+            .unwrap();
+            self.buf = buf.unwrap();
+            self.app.after_draw();
+            let out = std::mem::take(&mut *self.sink.0.borrow_mut());
+            self.screen.feed(&out);
+            out
+        }
+
+        async fn settle(&mut self) {
+            for _ in 0..40 {
+                self.frame();
+                match tokio::time::timeout(Duration::from_millis(200), self.rx.recv()).await {
+                    Ok(Some(ev)) => self.app.handle(ev),
+                    _ => return,
+                }
+                while let Ok(ev) = self.rx.try_recv() {
+                    self.app.handle(ev);
+                }
+            }
+        }
+
+        fn images_on_screen(&self) -> usize {
+            self.buf
+                .content
+                .iter()
+                .filter(|c| matches!(c.diff_option, CellDiffOption::ForcedWidth(_)))
+                .count()
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn forced_clear_repaints_inside_one_synchronized_update_without_terminal_queries() {
+        let mut rig = Rig::new(100, 30);
+        rig.settle().await;
+        rig.app.force_clear = true;
+        let t = std::time::Instant::now();
+        let out = rig.frame();
+        assert!(
+            t.elapsed() < Duration::from_millis(500),
+            "{:?}",
+            t.elapsed()
+        );
+        assert!(!rig.app.force_clear);
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.starts_with("\x1b[?2026h"), "{text:?}");
+        assert!(text.ends_with("\x1b[?2026l"));
+        assert!(text.contains("\x1b[2J"));
+        assert!(!text.contains("\x1b[6n"));
+        assert!(rig.screen.stale_cells(&rig.buf).is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scrolling_images_repaints_cells_the_terminal_still_shows() {
+        let mut rig = Rig::new(100, 30);
+        rig.app.msg_sel = Some(39);
+        rig.settle().await;
+        assert!(rig.images_on_screen() > 0);
+        assert!(rig.screen.stale_cells(&rig.buf).is_empty());
+        for sel in (0..39).rev() {
+            rig.app.msg_sel = Some(sel);
+            rig.settle().await;
+        }
+        rig.app.msg_sel = Some(39);
+        rig.settle().await;
+        let mut moves = 0;
+        for sel in (0..39).rev() {
+            let clean = rig.screen.clone();
+            rig.screen.soil_blanks();
+            let before = rig.layout;
+            rig.app.msg_sel = Some(sel);
+            let out = rig.frame();
+            if rig.layout == before {
+                rig.screen = clean;
+                rig.screen.feed(&out);
+                continue;
+            }
+            moves += 1;
+            let stale = rig.screen.stale_cells(&rig.buf);
+            assert!(
+                stale.is_empty(),
+                "sel {sel}: {} stale cells, e.g. {:?}",
+                stale.len(),
+                &stale[..stale.len().min(5)]
+            );
+        }
+        assert!(moves > 5, "{moves}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn opening_and_closing_viewer_repaints_everything() {
+        let mut rig = Rig::new(100, 30);
+        rig.app.msg_sel = Some(39);
+        rig.settle().await;
+        rig.screen.soil_blanks();
+        rig.app.popup = Some(Popup::Viewer {
+            chat_id: 10,
+            items: vec![(38, 0), (34, 0)],
+            pos: 0,
+        });
+        rig.frame();
+        let stale = rig.screen.stale_cells(&rig.buf);
+        assert!(
+            stale.is_empty(),
+            "viewer: {:?}",
+            &stale[..stale.len().min(5)]
+        );
+        assert!(buffer_text(&rig.buf).contains(" photo 1/2 "));
+        rig.screen.soil_blanks();
+        rig.app.popup = None;
+        rig.frame();
+        let stale = rig.screen.stale_cells(&rig.buf);
+        assert!(
+            stale.is_empty(),
+            "closed viewer: {:?}",
+            &stale[..stale.len().min(5)]
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unchanged_image_layout_does_not_clear_the_terminal() {
+        let mut rig = Rig::new(100, 30);
+        rig.app.msg_sel = Some(39);
+        rig.settle().await;
+        assert!(rig.images_on_screen() > 0);
+        let out = rig.frame();
+        let text = String::from_utf8_lossy(&out);
+        assert!(!text.contains("\x1b[2J"));
+        assert!(!text.contains(PLACEHOLDER));
+        rig.app.msg_sel = Some(30);
+        let text = String::from_utf8_lossy(&rig.frame()).into_owned();
+        assert!(text.contains("\x1b[2J"));
+        assert!(text.starts_with("\x1b[?2026h"));
+        assert!(text.ends_with("\x1b[?2026l"));
+    }
+
+    fn buffer_text(buf: &Buffer) -> String {
+        buf.content.iter().map(|c| c.symbol()).collect()
+    }
+}
+
+#[cfg(test)]
+mod layout_helper_tests {
+    use super::*;
+
+    #[test]
+    fn centered_even_and_odd_sizes() {
+        assert_eq!(
+            centered(Rect::new(0, 0, 100, 40), 40, 10),
+            Rect::new(30, 15, 40, 10)
+        );
+        assert_eq!(
+            centered(Rect::new(0, 0, 101, 41), 40, 10),
+            Rect::new(30, 15, 40, 10)
+        );
+        assert_eq!(
+            centered(Rect::new(0, 0, 100, 40), 41, 11),
+            Rect::new(29, 14, 41, 11)
+        );
+    }
+
+    #[test]
+    fn centered_respects_area_origin() {
+        assert_eq!(
+            centered(Rect::new(10, 5, 50, 20), 20, 6),
+            Rect::new(25, 12, 20, 6)
+        );
+    }
+
+    #[test]
+    fn centered_clamps_to_area_minus_border() {
+        assert_eq!(
+            centered(Rect::new(0, 0, 30, 10), 80, 40),
+            Rect::new(1, 1, 28, 8)
+        );
+        assert_eq!(
+            centered(Rect::new(3, 4, 30, 10), 30, 10),
+            Rect::new(4, 5, 28, 8)
+        );
+    }
+
+    #[test]
+    fn centered_tiny_areas_keep_one_cell() {
+        assert_eq!(
+            centered(Rect::new(0, 0, 2, 2), 10, 10),
+            Rect::new(0, 0, 1, 1)
+        );
+        assert_eq!(
+            centered(Rect::new(0, 0, 1, 1), 10, 10),
+            Rect::new(0, 0, 1, 1)
+        );
+        assert_eq!(
+            centered(Rect::new(5, 6, 0, 0), 10, 10),
+            Rect::new(5, 6, 1, 1)
+        );
+        assert_eq!(
+            centered(Rect::new(0, 0, 10, 10), 0, 0),
+            Rect::new(4, 4, 1, 1)
+        );
+    }
+
+    #[test]
+    fn split_filter_inactive_returns_whole_area() {
+        let a = Rect::new(2, 3, 20, 8);
+        assert_eq!(split_filter(a, false), (a, None));
+    }
+
+    #[test]
+    fn split_filter_active_takes_last_row() {
+        let a = Rect::new(2, 3, 20, 8);
+        assert_eq!(
+            split_filter(a, true),
+            (Rect::new(2, 3, 20, 7), Some(Rect::new(2, 10, 20, 1)))
+        );
+        assert_eq!(
+            split_filter(Rect::new(0, 0, 5, 2), true),
+            (Rect::new(0, 0, 5, 1), Some(Rect::new(0, 1, 5, 1)))
+        );
+    }
+
+    #[test]
+    fn split_filter_too_short_returns_whole_area() {
+        for h in [0, 1] {
+            let a = Rect::new(1, 1, 9, h);
+            assert_eq!(split_filter(a, true), (a, None));
+        }
     }
 }

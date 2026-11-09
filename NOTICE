@@ -1,0 +1,13 @@
+gramtty
+Copyright (C) the gramtty authors
+Licensed under the GNU General Public License, version 3 or later (see LICENSE).
+
+Third-party material
+--------------------
+
+assets/msg_incoming.ogg
+  Telegram Desktop incoming message sound, converted from msg_incoming.mp3
+  (stereo, re-encoded to Ogg Vorbis 48 kHz; audio otherwise unchanged).
+  Source:  https://github.com/telegramdesktop/tdesktop/blob/dev/Telegram/Resources/sounds/msg_incoming.mp3
+  Copyright: The Telegram Desktop Authors (see https://github.com/telegramdesktop/tdesktop/blob/dev/LEGAL)
+  License: GNU General Public License, version 3 or later (with the OpenSSL linking exception)

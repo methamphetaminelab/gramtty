@@ -339,6 +339,72 @@ pub async fn read_clipboard(uploads: PathBuf) -> Result<Clip, String> {
     Err("clipboard has nothing to paste".to_owned())
 }
 
+pub async fn copy_text(text: String) -> Result<(), String> {
+    wl_copy(text.into_bytes(), None).await
+}
+
+pub fn to_png(path: &Path) -> Result<Vec<u8>, String> {
+    let img = image::ImageReader::open(path)
+        .map_err(|e| format!("cannot open {}: {e}", path.display()))?
+        .with_guessed_format()
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?
+        .decode()
+        .map_err(|e| format!("cannot decode {}: {e}", path.display()))?;
+    let mut out = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut out, image::ImageFormat::Png)
+        .map_err(|e| format!("cannot encode PNG: {e}"))?;
+    Ok(out.into_inner())
+}
+
+pub async fn copy_image(path: PathBuf) -> Result<(), String> {
+    let png = tokio::task::spawn_blocking(move || to_png(&path))
+        .await
+        .map_err(|e| format!("image conversion failed: {e}"))??;
+    wl_copy(png, Some("image/png")).await
+}
+
+async fn wl_copy(data: Vec<u8>, mime: Option<&str>) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    if std::env::var_os("WAYLAND_DISPLAY").is_none_or(|v| v.is_empty()) {
+        return Err("copying needs a Wayland session (WAYLAND_DISPLAY is not set)".to_owned());
+    }
+    let mut cmd = tokio::process::Command::new("wl-copy");
+    if let Some(mime) = mime {
+        cmd.args(["--type", mime]);
+    }
+    let mut child = cmd
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                "copying needs wl-copy (install wl-clipboard)".to_owned()
+            } else {
+                format!("wl-copy: {e}")
+            }
+        })?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "wl-copy: no stdin".to_owned())?;
+    stdin
+        .write_all(&data)
+        .await
+        .map_err(|e| format!("wl-copy: {e}"))?;
+    drop(stdin);
+    let status = tokio::time::timeout(CLIPBOARD_TIMEOUT, child.wait())
+        .await
+        .map_err(|_| "wl-copy did not finish within 5 s".to_owned())?
+        .map_err(|e| format!("wl-copy: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("wl-copy failed ({status})"))
+    }
+}
+
 pub fn prune_uploads(dir: &Path) -> Result<(), String> {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,

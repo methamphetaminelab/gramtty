@@ -1,14 +1,23 @@
+mod admin;
 mod app;
+mod archive;
+mod bots;
 mod config;
+mod details;
 mod format;
 mod input;
 mod keymap;
 mod media;
 mod model;
+mod notify;
 mod player;
+mod popups;
+mod presence;
 mod qr;
 mod stickers;
 mod td;
+mod termcolors;
+mod termprobe;
 mod theme;
 mod ui;
 mod upload;
@@ -18,7 +27,9 @@ use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::process::ExitCode;
 use std::time::Duration;
 
-use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste, EventStream};
+use crossterm::event::{
+    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange, EventStream,
+};
 use crossterm::execute;
 use futures::StreamExt;
 
@@ -62,11 +73,62 @@ fn load_keymap(warnings: &mut Vec<String>) -> Result<Keymap, String> {
     }
 }
 
+fn print_theme(args: &[String]) -> Result<(), String> {
+    let mut notes = Vec::new();
+    let choice = match args {
+        [] => {
+            config::load_settings(&config::settings_path()?, &mut notes)?
+                .appearance
+                .theme
+        }
+        [name] => config::ThemeChoice::ALL
+            .into_iter()
+            .find(|c| c.name() == name)
+            .ok_or_else(|| {
+                format!(
+                    "unknown theme {name:?}; use one of {}",
+                    config::ThemeChoice::ALL.map(|c| c.name()).join(", ")
+                )
+            })?,
+        _ => {
+            return Err(
+                "usage: --print-theme [terminal|default|high-contrast|light|mono|custom]"
+                    .to_owned(),
+            );
+        }
+    };
+    let theme = theme::load(choice, &config::theme_path()?, &mut notes)?;
+    for note in notes {
+        eprintln!("{note}");
+    }
+    print!("{}", theme.to_toml(choice)?);
+    Ok(())
+}
+
 async fn run() -> Result<(), String> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    match args.split_first() {
+        None => {}
+        Some((flag, rest)) if flag == "--print-theme" => {
+            probe_terminal(false)?;
+            return print_theme(rest);
+        }
+        Some((other, _)) => {
+            return Err(format!(
+                "unknown argument {other:?}; usage: {} [--print-theme [preset]]",
+                config::APP_NAME
+            ));
+        }
+    }
     let creds = config::load_credentials()?;
+    let probe = probe_terminal(true)?;
     let data_dir = prepare_data_dir()?;
     let mut warnings = Vec::new();
     let keymap = load_keymap(&mut warnings)?;
+    let settings_path = config::settings_path()?;
+    let settings = config::load_settings(&settings_path, &mut warnings)?;
+    let theme_path = config::theme_path()?;
+    let theme = theme::load(settings.appearance.theme, &theme_path, &mut warnings)?;
     td::configure_logging(&data_dir.join("tdlib.log"))?;
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -75,9 +137,19 @@ async fn run() -> Result<(), String> {
     td.start();
 
     let mut terminal = ratatui::init();
-    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
-    let (picker, picker_warning) = image_picker();
+    let _ = execute!(std::io::stdout(), EnableBracketedPaste, EnableFocusChange);
+    let (picker, picker_warning) = image_picker(probe);
     let mut app = App::new(td, creds, data_dir, keymap, picker);
+    app.settings = settings;
+    app.settings_path = Some(settings_path);
+    app.set_theme(theme);
+    let watch_tx = tx.clone();
+    if let Err(e) = theme::watch(&theme_path, move |r| {
+        let _ = watch_tx.send(Event::ThemeFile(r));
+    }) {
+        warnings.push(e);
+    }
+    app.theme_path = Some(theme_path);
     if let Err(e) = upload::prune_uploads(app.uploads_dir()) {
         warnings.push(e);
     }
@@ -87,12 +159,107 @@ async fn run() -> Result<(), String> {
         app.set_status(w, true);
     }
     let result = event_loop(&mut terminal, &mut app, &mut rx).await;
-    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
+    let settled = input_barrier().and_then(|()| {
+        termprobe::settle_stdio().map_err(|e| format!("cannot drain terminal input: {e}"))
+    });
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste, DisableFocusChange);
     ratatui::restore();
-    result
+    result.and(settled)
 }
 
-fn image_picker() -> (Picker, Option<String>) {
+struct Probed {
+    answers: Option<termprobe::Answers>,
+    warning: Option<String>,
+    image: Option<termprobe::ImageQuery>,
+}
+
+fn image_query() -> termprobe::ImageQuery {
+    let tmux = Picker::halfblocks().tmux_detected();
+    let blocked = ["WEZTERM_EXECUTABLE", "KONSOLE_VERSION"]
+        .iter()
+        .any(|v| std::env::var(v).is_ok_and(|s| !s.is_empty()));
+    termprobe::ImageQuery {
+        tmux,
+        graphics: !blocked,
+    }
+}
+
+fn probe_terminal(images: bool) -> Result<Probed, String> {
+    let image = images.then(image_query);
+    let probe = termprobe::Probe {
+        palette: true,
+        images: image,
+    };
+    if crossterm::terminal::enable_raw_mode().is_err() {
+        return Ok(Probed {
+            answers: None,
+            warning: None,
+            image,
+        });
+    }
+    let result = termprobe::query_stdio(&probe, termprobe::TIMEOUT);
+    let settled = termprobe::settle_stdio();
+    crossterm::terminal::disable_raw_mode()
+        .map_err(|e| format!("cannot leave raw mode after the terminal query: {e}"))?;
+    settled.map_err(|e| format!("cannot drain terminal input: {e}"))?;
+    let (answers, warning) = match result {
+        Ok(None) => (None, None),
+        Ok(Some(o)) => {
+            let warning = (!o.complete).then(|| {
+                format!(
+                    "terminal did not answer its capability query within {} ms; using defaults for what is missing",
+                    termprobe::TIMEOUT.as_millis()
+                )
+            });
+            (Some(o.answers), warning)
+        }
+        Err(e) => (
+            None,
+            Some(format!("terminal query failed ({e}); using defaults")),
+        ),
+    };
+    termcolors::set(answers.as_ref().and_then(termprobe::Answers::palette));
+    Ok(Probed {
+        answers,
+        warning,
+        image,
+    })
+}
+
+fn input_barrier() -> Result<(), String> {
+    crossterm::event::poll(Duration::ZERO)
+        .map(|_| ())
+        .map_err(|e| format!("terminal input: {e}"))
+}
+
+fn requery_palette() -> Result<(Option<termcolors::TermPalette>, usize), String> {
+    input_barrier()?;
+    let probe = termprobe::Probe {
+        palette: true,
+        images: None,
+    };
+    match termprobe::query_stdio(&probe, termprobe::TIMEOUT) {
+        Ok(Some(o)) if o.complete => Ok((o.answers.palette(), 0)),
+        Ok(Some(o)) => {
+            termprobe::settle_stdio().map_err(|e| format!("cannot drain terminal input: {e}"))?;
+            let late = if termprobe::owed() == 0 {
+                0
+            } else {
+                probe
+                    .string_replies()
+                    .saturating_sub(o.answers.string_replies())
+            };
+            Ok((o.answers.palette(), late))
+        }
+        Ok(None) => Ok((None, 0)),
+        Err(e) => {
+            termprobe::settle_stdio().map_err(|e| format!("cannot drain terminal input: {e}"))?;
+            Err(format!("terminal colour query failed: {e}"))
+        }
+    }
+}
+
+fn image_picker(probe: Probed) -> (Picker, Option<String>) {
     let forced = std::env::var(format!("{}_IMAGE_PROTOCOL", config::env_prefix())).ok();
     let forced = match forced.as_deref().map(str::trim) {
         None | Some("") | Some("auto") => None,
@@ -109,19 +276,25 @@ fn image_picker() -> (Picker, Option<String>) {
             );
         }
     };
-    let (mut picker, warning) = match Picker::from_query_stdio() {
-        Ok(p) => (p, None),
-        Err(e) => (
-            Picker::halfblocks(),
-            Some(format!(
-                "image protocol detection failed ({e}); using half-blocks"
-            )),
-        ),
+    let image = probe.image.unwrap_or_default();
+    let answers = probe.answers.unwrap_or_default();
+    let mut picker = match answers.cell.or_else(termprobe::font_size_from_winsize) {
+        Some(size) => {
+            #[allow(deprecated)]
+            let mut p = Picker::from_fontsize(size.into());
+            if image.graphics && answers.kitty {
+                p.set_protocol_type(ProtocolType::Kitty);
+            } else if image.graphics && answers.sixel {
+                p.set_protocol_type(ProtocolType::Sixel);
+            }
+            p
+        }
+        None => Picker::halfblocks(),
     };
     if let Some(p) = forced {
         picker.set_protocol_type(p);
     }
-    (picker, warning)
+    (picker, probe.warning)
 }
 
 async fn event_loop(
@@ -130,15 +303,13 @@ async fn event_loop(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
 ) -> Result<(), String> {
     let mut input = EventStream::new();
+    let mut usr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
+        .map_err(|e| format!("cannot listen for SIGUSR1: {e}"))?;
     let mut deadline: Option<tokio::time::Instant> = None;
+    let mut late = termprobe::LateReplies::default();
+    let mut layout = ui::image_layout(&ratatui::buffer::Buffer::empty(terminal.get_frame().area()));
     loop {
-        if app.force_clear {
-            app.force_clear = false;
-            terminal.clear().map_err(|e| format!("terminal: {e}"))?;
-        }
-        terminal
-            .draw(|f| ui::draw(f, app))
-            .map_err(|e| format!("terminal: {e}"))?;
+        ui::draw_frame(terminal, app, &mut layout, |_| {}).map_err(|e| format!("terminal: {e}"))?;
         app.after_draw();
         if app.exit_ready {
             return Ok(());
@@ -146,13 +317,34 @@ async fn event_loop(
         if app.quitting && deadline.is_none() {
             deadline = Some(tokio::time::Instant::now() + Duration::from_secs(5));
         }
+        if std::mem::take(&mut app.palette_query) {
+            drop(input);
+            let palette = requery_palette();
+            input = EventStream::new();
+            match palette {
+                Ok((p, owed)) => {
+                    late.expect(owed, std::time::Instant::now());
+                    app.palette_answered(p);
+                }
+                Err(e) => {
+                    app.palette_answered(None);
+                    app.set_status(e, true);
+                }
+            }
+            continue;
+        }
         let tick = app.tick_interval().map(|d| tokio::time::Instant::now() + d);
         tokio::select! {
             ev = input.next() => match ev {
-                Some(Ok(ev)) => app.handle(Event::Input(ev)),
+                Some(Ok(ev)) => {
+                    if !late.swallow(&ev, std::time::Instant::now()) {
+                        app.handle(Event::Input(ev));
+                    }
+                }
                 Some(Err(e)) => return Err(format!("terminal input: {e}")),
                 None => return Err("terminal input closed".to_owned()),
             },
+            _ = usr1.recv() => app.palette_query = true,
             ev = rx.recv() => match ev {
                 Some(ev) => app.handle(ev),
                 None => return Err("TDLib receiver stopped".to_owned()),

@@ -884,12 +884,14 @@ dependencies = [
  "qrcode",
  "ratatui",
  "ratatui-image",
+ "rustix 1.1.6",
  "serde",
  "serde_json",
  "tdlib-rs",
  "thorvg",
  "tokio",
  "toml",
+ "unicode-segmentation",
  "unicode-width",
 ]
 

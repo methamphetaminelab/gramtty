@@ -13,6 +13,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::model::{Decode, FileRef};
 use crate::td::{Event, Td};
+use crate::theme::AvatarShape;
 
 pub const MAX_ENTRIES: usize = 96;
 pub const MAX_BYTES: u64 = 64 * 1024 * 1024;
@@ -35,7 +36,7 @@ pub struct Key {
     pub src: Src,
     pub cols: u16,
     pub rows: u16,
-    pub round: bool,
+    pub shape: Option<AvatarShape>,
     pub animate: bool,
 }
 
@@ -77,6 +78,7 @@ impl Frames {
 
 pub struct Done {
     pub key: Key,
+    pub epoch: u64,
     pub result: Result<Frames, String>,
 }
 
@@ -110,6 +112,7 @@ pub struct Media {
     requested: HashSet<i32>,
     failed_files: HashMap<i32, String>,
     downloads: Vec<(i32, i32)>,
+    epoch: u64,
 }
 
 impl Media {
@@ -125,6 +128,7 @@ impl Media {
             requested: HashSet::new(),
             failed_files: HashMap::new(),
             downloads: Vec::new(),
+            epoch: 0,
         }
     }
 
@@ -234,9 +238,10 @@ impl Media {
             self.running += 1;
             let picker = self.picker.clone();
             let tx = self.tx.clone();
+            let epoch = self.epoch;
             tokio::task::spawn_blocking(move || {
                 let result = render(&picker, &input, key);
-                let _ = tx.send(Event::Image(Done { key, result }));
+                let _ = tx.send(Event::Image(Done { key, epoch, result }));
             });
         }
         self.evict();
@@ -245,6 +250,9 @@ impl Media {
 
     pub fn on_done(&mut self, done: Done) {
         self.running = self.running.saturating_sub(1);
+        if done.epoch != self.epoch {
+            return;
+        }
         if let Some(entry) = self.cache.get_mut(&done.key) {
             entry.slot = match done.result {
                 Ok(frames) => Slot::Ready(frames),
@@ -291,8 +299,40 @@ impl Media {
         }
     }
 
+    pub fn reset(&mut self) {
+        self.cache.clear();
+        self.queue.clear();
+        self.files.clear();
+        self.requested.clear();
+        self.failed_files.clear();
+        self.downloads.clear();
+        self.epoch += 1;
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.cache.is_empty()
+            && self.queue.is_empty()
+            && self.files.is_empty()
+            && self.requested.is_empty()
+            && self.failed_files.is_empty()
+            && self.downloads.is_empty()
+    }
+
     pub fn stats(&self) -> (usize, u64) {
         (self.cache.len(), self.bytes())
+    }
+
+    #[cfg(test)]
+    pub fn insert_pending(&mut self, key: Key) {
+        self.cache.insert(
+            key,
+            Entry {
+                slot: Slot::Pending,
+                used: self.frame,
+                clean: false,
+            },
+        );
     }
 
     #[cfg(test)]
@@ -528,19 +568,83 @@ pub fn ffmpeg_args(path: &str, alpha_codec: bool) -> Vec<String> {
     args
 }
 
+const FFMPEG_TIMEOUT: Duration = Duration::from_secs(15);
+
+struct Capped {
+    success: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+fn drain(
+    mut pipe: impl Read + Send + 'static,
+) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>> {
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        pipe.read_to_end(&mut buf).map(|_| buf)
+    })
+}
+
+fn run_capped(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+) -> std::io::Result<Option<Capped>> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let out = drain(
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| std::io::Error::other("no stdout pipe"))?,
+    );
+    let err = drain(
+        child
+            .stderr
+            .take()
+            .ok_or_else(|| std::io::Error::other("no stderr pipe"))?,
+    );
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            child.kill()?;
+            child.wait()?;
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let joined = |h: std::thread::JoinHandle<std::io::Result<Vec<u8>>>| {
+        h.join()
+            .map_err(|_| std::io::Error::other("pipe reader panicked"))?
+    };
+    let stdout = joined(out)?;
+    let stderr = joined(err)?;
+    Ok(status.map(|s| Capped {
+        success: s.success(),
+        stdout,
+        stderr,
+    }))
+}
+
 fn run_ffmpeg(path: &str, alpha_codec: bool) -> Result<Vec<u8>, String> {
-    let out = std::process::Command::new("ffmpeg")
-        .args(ffmpeg_args(path, alpha_codec))
-        .stdin(std::process::Stdio::null())
-        .output()
+    let out = run_capped("ffmpeg", &ffmpeg_args(path, alpha_codec), FFMPEG_TIMEOUT)
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 "ffmpeg is required for video previews; install ffmpeg".to_owned()
             } else {
                 format!("ffmpeg: {e}")
             }
-        })?;
-    if out.status.success() && !out.stdout.is_empty() {
+        })?
+        .ok_or_else(|| format!("ffmpeg timed out after {} s", FFMPEG_TIMEOUT.as_secs()))?;
+    if out.success && !out.stdout.is_empty() {
         return Ok(out.stdout);
     }
     let err = String::from_utf8_lossy(&out.stderr);
@@ -599,15 +703,29 @@ pub fn fit_canvas(img: &DynamicImage, w: u32, h: u32) -> RgbaImage {
     canvas
 }
 
-pub fn circle_mask(img: &mut RgbaImage) {
+pub fn inside_shape(shape: AvatarShape, w: f32, h: f32, x: f32, y: f32) -> bool {
+    let r = match shape {
+        AvatarShape::Square => return true,
+        AvatarShape::Circle => w.min(h) / 2.0,
+        AvatarShape::Rounded => w.min(h) / 4.0,
+    };
+    let side = w.min(h);
+    let (ox, oy) = ((w - side) / 2.0, (h - side) / 2.0);
+    let (lx, ly) = (x - ox, y - oy);
+    if lx < 0.0 || ly < 0.0 || lx > side || ly > side {
+        return false;
+    }
+    let cx = lx.clamp(r, side - r);
+    let cy = ly.clamp(r, side - r);
+    let (dx, dy) = (lx - cx, ly - cy);
+    dx * dx + dy * dy <= r * r
+}
+
+pub fn shape_mask(img: &mut RgbaImage, shape: AvatarShape) {
     let (w, h) = (img.width() as f32, img.height() as f32);
-    let (cx, cy) = (w / 2.0, h / 2.0);
-    let r = w.min(h) / 2.0;
     for (x, y, p) in img.enumerate_pixels_mut() {
-        let dx = x as f32 + 0.5 - cx;
-        let dy = y as f32 + 0.5 - cy;
-        if dx * dx + dy * dy > r * r {
-            p.0[3] = 0;
+        if !inside_shape(shape, w, h, x as f32 + 0.5, y as f32 + 0.5) {
+            p.0 = [0, 0, 0, 0];
         }
     }
 }
@@ -624,8 +742,8 @@ pub fn render(picker: &Picker, input: &Input, key: Key) -> Result<Frames, String
     for (img, delay) in images {
         let mut canvas = fit_canvas(&img, px.0, px.1);
         drop(img);
-        if key.round {
-            circle_mask(&mut canvas);
+        if let Some(shape) = key.shape {
+            shape_mask(&mut canvas, shape);
         }
         bytes += u64::from(px.0) * u64::from(px.1) * 16 / 3;
         let proto = SlicedProtocol::new_with_resize(
@@ -759,10 +877,35 @@ mod tests {
             40,
             40,
         );
-        circle_mask(&mut sq);
-        assert_eq!(sq.get_pixel(0, 0).0[3], 0);
-        assert_eq!(sq.get_pixel(20, 20).0[3], 255);
-        circle_mask(&mut c);
+        shape_mask(&mut sq, AvatarShape::Circle);
+        assert_eq!(sq.get_pixel(0, 0).0, [0, 0, 0, 0]);
+        assert_eq!(sq.get_pixel(39, 39).0, [0, 0, 0, 0]);
+        assert_eq!(sq.get_pixel(20, 20).0, [1, 2, 3, 255]);
+        shape_mask(&mut c, AvatarShape::Circle);
+    }
+
+    #[test]
+    fn avatar_shapes_make_corners_fully_transparent() {
+        let solid = || RgbaImage::from_pixel(40, 20, image::Rgba([0, 200, 0, 255]));
+        let mut circle = solid();
+        shape_mask(&mut circle, AvatarShape::Circle);
+        for (x, y) in [(0, 0), (39, 0), (0, 19), (39, 19), (10, 0)] {
+            assert_eq!(circle.get_pixel(x, y).0, [0, 0, 0, 0], "{x},{y}");
+        }
+        assert_eq!(circle.get_pixel(20, 10).0[3], 255);
+        assert_eq!(circle.get_pixel(20, 0).0[3], 255);
+        let mut rounded = solid();
+        shape_mask(&mut rounded, AvatarShape::Rounded);
+        assert_eq!(rounded.get_pixel(10, 0).0, [0, 0, 0, 0]);
+        assert_eq!(rounded.get_pixel(11, 10).0[3], 255);
+        assert_eq!(rounded.get_pixel(18, 0).0[3], 255);
+        assert_eq!(rounded.get_pixel(0, 10).0, [0, 0, 0, 0]);
+        let mut square = solid();
+        shape_mask(&mut square, AvatarShape::Square);
+        assert_eq!(square.get_pixel(0, 0).0, [0, 200, 0, 255]);
+        let visible = circle.pixels().filter(|p| p.0[3] == 255).count();
+        let hidden = circle.pixels().filter(|p| p.0 == [0, 0, 0, 0]).count();
+        assert_eq!(visible + hidden, 40 * 20);
     }
 
     #[test]
@@ -778,7 +921,7 @@ mod tests {
             src: Src::File(1),
             cols,
             rows,
-            round: false,
+            shape: None,
             animate,
         }
     }
@@ -916,5 +1059,23 @@ mod tests {
         assert_eq!(m.downloads.len(), 1);
         m.force_download(9, 1);
         assert_eq!(m.downloads.len(), 2);
+    }
+
+    #[test]
+    fn preview_tool_is_killed_when_it_hangs() {
+        let t = std::time::Instant::now();
+        let out = run_capped("sleep", &["5".to_owned()], Duration::from_millis(100)).unwrap();
+        assert!(out.is_none());
+        assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+        let ok = run_capped("echo", &["hi".to_owned()], Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        assert!(ok.success);
+        assert_eq!(ok.stdout, b"hi\n");
+        let missing = run_capped("gramtty-no-such-tool", &[], Duration::from_secs(1));
+        assert_eq!(
+            missing.err().map(|e| e.kind()),
+            Some(std::io::ErrorKind::NotFound)
+        );
     }
 }

@@ -91,6 +91,8 @@ pub enum Action {
     CycleFocusPrevious,
     HalfPageDown,
     HalfPageUp,
+    PageDown,
+    PageUp,
     ScrollViewportDown,
     ScrollViewportUp,
     JumpTop,
@@ -112,10 +114,125 @@ pub enum Action {
     AttachFile,
     RecordVoice,
     OpenStickers,
+    CopyMessage,
+    ReactMessage,
+    ForwardMessage,
+    PinMessage,
+    GoToReply,
+    ShowMessageProfile,
+    ShowReactionUsers,
+    OpenProfile,
+    ShowPinned,
+    SearchMessages,
+    OpenInbox,
+    MarkChatRead,
+    OpenBotKeyboard,
+    OpenOptions,
+    JumpToPinned,
+    OpenNextUnread,
+    JumpToNextMention,
+    JumpToNextReaction,
+    CopyQuote,
+    TranslateMessage,
+    SaveMessage,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Group {
+    Navigate,
+    Compose,
+    Message,
+    Panes,
+    Account,
+}
+
+impl Group {
+    pub fn title(self) -> &'static str {
+        match self {
+            Group::Navigate => "Navigate",
+            Group::Compose => "Compose",
+            Group::Message => "Message",
+            Group::Panes => "Panes",
+            Group::Account => "Account",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hint {
+    pub key: String,
+    pub desc: String,
+    pub action: Action,
 }
 
 impl Action {
-    pub const ALL: [Action; 34] = [
+    pub fn group(self) -> (Group, u8) {
+        match self {
+            Action::ChatSwitcher => (Group::Navigate, 0),
+            Action::OpenPaneActions => (Group::Navigate, 1),
+            Action::OpenPaneFilter => (Group::Navigate, 2),
+            Action::FocusFolderPane => (Group::Navigate, 3),
+            Action::FocusChatPane => (Group::Navigate, 4),
+            Action::FocusMessagePane => (Group::Navigate, 5),
+            Action::FocusInfoPane => (Group::Navigate, 6),
+            Action::CycleFocusNext => (Group::Navigate, 7),
+            Action::CycleFocusPrevious => (Group::Navigate, 8),
+            Action::SelectNext => (Group::Navigate, 9),
+            Action::SelectPrevious => (Group::Navigate, 10),
+            Action::HalfPageDown => (Group::Navigate, 11),
+            Action::HalfPageUp => (Group::Navigate, 12),
+            Action::PageDown => (Group::Navigate, 26),
+            Action::PageUp => (Group::Navigate, 27),
+            Action::ScrollViewportDown => (Group::Navigate, 13),
+            Action::ScrollViewportUp => (Group::Navigate, 14),
+            Action::JumpTop => (Group::Navigate, 15),
+            Action::JumpBottom => (Group::Navigate, 16),
+            Action::ClosePopup => (Group::Navigate, 17),
+            Action::StartComposer => (Group::Compose, 0),
+            Action::AttachFile => (Group::Compose, 1),
+            Action::RecordVoice => (Group::Compose, 2),
+            Action::OpenStickers => (Group::Compose, 3),
+            Action::ReplyMessage => (Group::Message, 0),
+            Action::EditMessage => (Group::Message, 1),
+            Action::PlayMedia => (Group::Message, 2),
+            Action::ViewAttachment => (Group::Message, 3),
+            Action::OpenMessageUrl => (Group::Message, 4),
+            Action::DeleteMessage => (Group::Message, 5),
+            Action::ToggleFolderPane => (Group::Panes, 0),
+            Action::ToggleChatPane => (Group::Panes, 1),
+            Action::ToggleInfoPane => (Group::Panes, 2),
+            Action::RefreshScreen => (Group::Panes, 3),
+            Action::Quit => (Group::Account, 1),
+            Action::LogOut => (Group::Account, 2),
+            Action::CopyMessage => (Group::Message, 6),
+            Action::ReactMessage => (Group::Message, 7),
+            Action::ForwardMessage => (Group::Message, 8),
+            Action::PinMessage => (Group::Message, 9),
+            Action::GoToReply => (Group::Message, 10),
+            Action::ShowMessageProfile => (Group::Message, 11),
+            Action::ShowReactionUsers => (Group::Message, 12),
+            Action::OpenProfile => (Group::Navigate, 18),
+            Action::ShowPinned => (Group::Navigate, 19),
+            Action::SearchMessages => (Group::Navigate, 20),
+            Action::OpenInbox => (Group::Navigate, 21),
+            Action::MarkChatRead => (Group::Navigate, 22),
+            Action::OpenBotKeyboard => (Group::Compose, 4),
+            Action::OpenOptions => (Group::Account, 0),
+            Action::JumpToPinned => (Group::Navigate, 23),
+            Action::OpenNextUnread => (Group::Navigate, 24),
+            Action::JumpToNextMention => (Group::Navigate, 25),
+            Action::JumpToNextReaction => (Group::Navigate, 28),
+            Action::CopyQuote => (Group::Message, 13),
+            Action::TranslateMessage => (Group::Message, 14),
+            Action::SaveMessage => (Group::Message, 15),
+        }
+    }
+
+    pub fn destructive(self) -> bool {
+        matches!(self, Action::LogOut | Action::DeleteMessage)
+    }
+
+    pub const ALL: [Action; 57] = [
         Action::StartComposer,
         Action::OpenPaneFilter,
         Action::ClosePopup,
@@ -129,6 +246,8 @@ impl Action {
         Action::CycleFocusPrevious,
         Action::HalfPageDown,
         Action::HalfPageUp,
+        Action::PageDown,
+        Action::PageUp,
         Action::ScrollViewportDown,
         Action::ScrollViewportUp,
         Action::JumpTop,
@@ -150,6 +269,27 @@ impl Action {
         Action::AttachFile,
         Action::RecordVoice,
         Action::OpenStickers,
+        Action::CopyMessage,
+        Action::ReactMessage,
+        Action::ForwardMessage,
+        Action::PinMessage,
+        Action::GoToReply,
+        Action::ShowMessageProfile,
+        Action::ShowReactionUsers,
+        Action::OpenProfile,
+        Action::ShowPinned,
+        Action::SearchMessages,
+        Action::OpenInbox,
+        Action::MarkChatRead,
+        Action::OpenBotKeyboard,
+        Action::OpenOptions,
+        Action::JumpToPinned,
+        Action::OpenNextUnread,
+        Action::JumpToNextMention,
+        Action::JumpToNextReaction,
+        Action::CopyQuote,
+        Action::TranslateMessage,
+        Action::SaveMessage,
     ];
 
     pub fn name(self) -> &'static str {
@@ -167,6 +307,8 @@ impl Action {
             Action::CycleFocusPrevious => "CycleFocusPrevious",
             Action::HalfPageDown => "HalfPageDown",
             Action::HalfPageUp => "HalfPageUp",
+            Action::PageDown => "PageDown",
+            Action::PageUp => "PageUp",
             Action::ScrollViewportDown => "ScrollViewportDown",
             Action::ScrollViewportUp => "ScrollViewportUp",
             Action::JumpTop => "JumpTop",
@@ -188,6 +330,27 @@ impl Action {
             Action::AttachFile => "AttachFile",
             Action::RecordVoice => "RecordVoiceMessage",
             Action::OpenStickers => "OpenStickerPicker",
+            Action::CopyMessage => "CopyMessage",
+            Action::ReactMessage => "ReactMessage",
+            Action::ForwardMessage => "ForwardMessage",
+            Action::PinMessage => "PinMessage",
+            Action::GoToReply => "GoToReferencedMessage",
+            Action::ShowMessageProfile => "ShowMessageProfile",
+            Action::ShowReactionUsers => "ShowReactionUsers",
+            Action::OpenProfile => "OpenProfile",
+            Action::ShowPinned => "ShowPinnedMessages",
+            Action::SearchMessages => "SearchMessages",
+            Action::OpenInbox => "OpenNotificationInbox",
+            Action::MarkChatRead => "MarkChatRead",
+            Action::OpenBotKeyboard => "OpenBotKeyboard",
+            Action::OpenOptions => "OpenOptions",
+            Action::JumpToPinned => "JumpToPinnedMessage",
+            Action::OpenNextUnread => "OpenNextUnread",
+            Action::JumpToNextMention => "JumpToNextMention",
+            Action::JumpToNextReaction => "JumpToNextReaction",
+            Action::CopyQuote => "CopyQuote",
+            Action::TranslateMessage => "TranslateMessage",
+            Action::SaveMessage => "SaveMessage",
         }
     }
 
@@ -210,6 +373,8 @@ impl Action {
             Action::CycleFocusPrevious => "previous pane",
             Action::HalfPageDown => "half page down",
             Action::HalfPageUp => "half page up",
+            Action::PageDown => "page down",
+            Action::PageUp => "page up",
             Action::ScrollViewportDown => "scroll down",
             Action::ScrollViewportUp => "scroll up",
             Action::JumpTop => "top",
@@ -231,6 +396,27 @@ impl Action {
             Action::AttachFile => "attach file",
             Action::RecordVoice => "record voice message",
             Action::OpenStickers => "stickers & GIFs",
+            Action::CopyMessage => "copy text",
+            Action::ReactMessage => "react",
+            Action::ForwardMessage => "forward",
+            Action::PinMessage => "pin / unpin",
+            Action::GoToReply => "go to replied message",
+            Action::ShowMessageProfile => "sender profile",
+            Action::ShowReactionUsers => "who reacted",
+            Action::OpenProfile => "profile",
+            Action::ShowPinned => "pinned messages",
+            Action::SearchMessages => "search all chats",
+            Action::OpenInbox => "notification inbox",
+            Action::MarkChatRead => "mark chat read",
+            Action::OpenBotKeyboard => "bot buttons",
+            Action::OpenOptions => "options",
+            Action::JumpToPinned => "jump to pinned message",
+            Action::OpenNextUnread => "next unread chat",
+            Action::JumpToNextMention => "next unread mention or reply",
+            Action::JumpToNextReaction => "next unread reaction",
+            Action::CopyQuote => "copy as quote",
+            Action::TranslateMessage => "translate message",
+            Action::SaveMessage => "save to Saved Messages",
         }
     }
 
@@ -249,10 +435,12 @@ impl Action {
             Action::CycleFocusPrevious => &["<S-tab>", "h", "left"],
             Action::HalfPageDown => &["<C-d>"],
             Action::HalfPageUp => &["<C-u>"],
+            Action::PageDown => &["pagedown"],
+            Action::PageUp => &["pageup"],
             Action::ScrollViewportDown => &["J"],
             Action::ScrollViewportUp => &["K"],
-            Action::JumpTop => &["gg"],
-            Action::JumpBottom => &["G"],
+            Action::JumpTop => &["gg", "home"],
+            Action::JumpBottom => &["G", "end"],
             Action::Quit => &["q"],
             Action::ReplyMessage => &["R"],
             Action::DeleteMessage => &["d"],
@@ -270,6 +458,25 @@ impl Action {
             Action::AttachFile => &["<leader>u"],
             Action::RecordVoice => &["<leader>v"],
             Action::OpenStickers => &["<leader>s"],
+            Action::CopyMessage => &["y"],
+            Action::ReactMessage => &["r"],
+            Action::ForwardMessage => &["f"],
+            Action::PinMessage => &["P"],
+            Action::GoToReply => &[],
+            Action::ShowMessageProfile => &[],
+            Action::ShowReactionUsers => &[],
+            Action::OpenProfile => &["<leader>p"],
+            Action::ShowPinned => &["<leader>P"],
+            Action::SearchMessages => &["<leader>/"],
+            Action::OpenInbox => &["<leader>n"],
+            Action::MarkChatRead => &["<leader>m"],
+            Action::OpenBotKeyboard => &["<leader>k"],
+            Action::OpenOptions => &["<leader>o"],
+            Action::JumpToPinned => &["gp"],
+            Action::OpenNextUnread => &["]u"],
+            Action::JumpToNextMention => &["]m"],
+            Action::JumpToNextReaction => &["]r"],
+            Action::CopyQuote | Action::TranslateMessage | Action::SaveMessage => &[],
         }
     }
 }
@@ -489,8 +696,8 @@ impl Keymap {
             .collect()
     }
 
-    pub fn continuations(&self, pending: &[Chord]) -> Vec<(String, String)> {
-        let mut out: Vec<(String, String)> = Vec::new();
+    pub fn continuations(&self, pending: &[Chord]) -> Vec<Hint> {
+        let mut out: Vec<Hint> = Vec::new();
         for (keys, action) in &self.bindings {
             if keys.len() > pending.len() && keys[..pending.len()] == pending[..] {
                 let rest = &keys[pending.len()..];
@@ -500,9 +707,27 @@ impl Keymap {
                 } else {
                     format!("+{}", action.description())
                 };
-                if !out.iter().any(|(l, _)| *l == label) {
-                    out.push((label, desc));
+                if !out.iter().any(|h| h.key == label) {
+                    out.push(Hint {
+                        key: label,
+                        desc,
+                        action: *action,
+                    });
                 }
+            }
+        }
+        out
+    }
+
+    pub fn grouped_continuations(&self, pending: &[Chord]) -> Vec<(Group, Vec<Hint>)> {
+        let mut hints = self.continuations(pending);
+        hints.sort_by_key(|h| h.action.group());
+        let mut out: Vec<(Group, Vec<Hint>)> = Vec::new();
+        for h in hints {
+            let g = h.action.group().0;
+            match out.last_mut() {
+                Some((last, items)) if *last == g => items.push(h),
+                _ => out.push((g, vec![h])),
             }
         }
         out
@@ -594,6 +819,29 @@ mod tests {
     }
 
     #[test]
+    fn bracket_sequences_reach_unread_and_mentions() {
+        let map = Keymap::default();
+        assert_eq!(map.feed(&[], key(']')), Feed::Pending);
+        assert_eq!(
+            map.feed(&[key(']')], key('u')),
+            Feed::Action(Action::OpenNextUnread)
+        );
+        assert_eq!(
+            map.feed(&[key(']')], key('m')),
+            Feed::Action(Action::JumpToNextMention)
+        );
+        assert_eq!(
+            map.feed(&[key(']')], key('r')),
+            Feed::Action(Action::JumpToNextReaction)
+        );
+        assert_eq!(map.label_for(Action::OpenNextUnread).as_deref(), Some("]u"));
+        assert_eq!(
+            map.label_for(Action::JumpToNextReaction).as_deref(),
+            Some("]r")
+        );
+    }
+
+    #[test]
     fn feed_resolves_sequences() {
         let map = Keymap::default();
         assert_eq!(map.feed(&[], key('g')), Feed::Pending);
@@ -668,7 +916,7 @@ Bogus = "x"
         assert!(
             map.continuations(&[space()])
                 .iter()
-                .any(|(k, d)| k == "L" && d == "log out")
+                .any(|h| h.key == "L" && h.desc == "log out")
         );
     }
 
@@ -676,11 +924,52 @@ Bogus = "x"
     fn continuations_list_leader_menu() {
         let map = Keymap::default();
         let items = map.continuations(&[space()]);
-        assert!(items.iter().any(|(k, d)| k == "1" && d == "toggle folders"));
-        assert!(items.iter().any(|(k, d)| k == "Space" && d == "find chat"));
+        assert!(
+            items
+                .iter()
+                .any(|h| h.key == "1" && h.desc == "toggle folders")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|h| h.key == "Space" && h.desc == "find chat")
+        );
         assert_eq!(
             map.label_for(Action::ChatSwitcher).unwrap(),
             "<leader><leader>"
         );
+    }
+
+    #[test]
+    fn leader_hints_are_grouped_in_order_with_log_out_last() {
+        let map = Keymap::default();
+        let groups = map.grouped_continuations(&[space()]);
+        let titles: Vec<&str> = groups.iter().map(|(g, _)| g.title()).collect();
+        assert_eq!(titles, ["Navigate", "Compose", "Panes", "Account"]);
+        let keys: Vec<Vec<&str>> = groups
+            .iter()
+            .map(|(_, h)| h.iter().map(|h| h.key.as_str()).collect())
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                vec!["Space", "a", "p", "P", "/", "n", "m"],
+                vec!["u", "v", "s", "k"],
+                vec!["1", "2", "4", "r"],
+                vec!["o", "L"]
+            ]
+        );
+        assert!(
+            groups
+                .last()
+                .unwrap()
+                .1
+                .last()
+                .unwrap()
+                .action
+                .destructive()
+        );
+        let total: usize = groups.iter().map(|(_, h)| h.len()).sum();
+        assert_eq!(total, map.continuations(&[space()]).len());
     }
 }

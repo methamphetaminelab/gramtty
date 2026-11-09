@@ -1,6 +1,7 @@
-use chrono::{DateTime, Local, TimeZone};
+use chrono::{DateTime, Datelike, Local, TimeZone};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::model::{EntityKind, RichText};
@@ -93,8 +94,14 @@ fn cells_to_line(prefix: Option<Span<'static>>, cells: &[Cell]) -> Line<'static>
 fn block_prefix(block: Block) -> Option<Span<'static>> {
     match block {
         Block::None => None,
-        Block::Quote => Some(Span::styled("▎ ", theme::mention())),
-        Block::Pre => Some(Span::styled("│ ", theme::muted())),
+        Block::Quote => Some(Span::styled(
+            format!("{} ", theme::get().glyphs.quote_bar),
+            theme::quote(),
+        )),
+        Block::Pre => Some(Span::styled(
+            format!("{} ", theme::get().glyphs.code_bar),
+            theme::code_bar(),
+        )),
     }
 }
 
@@ -159,15 +166,29 @@ pub fn utf16_slice(text: &str, offset: usize, length: usize) -> String {
     out
 }
 
-pub fn urls(rt: &RichText) -> Vec<String> {
+pub struct Link {
+    pub url: String,
+    pub hidden: bool,
+}
+
+pub fn links(rt: &RichText) -> Vec<Link> {
     rt.entities
         .iter()
-        .filter_map(|e| match &e.kind {
-            EntityKind::Link(Some(url)) => Some(url.clone()),
-            EntityKind::Link(None) => Some(utf16_slice(&rt.text, e.offset, e.length)),
-            _ => None,
+        .filter_map(|e| {
+            let shown = utf16_slice(&rt.text, e.offset, e.length);
+            match &e.kind {
+                EntityKind::Link(Some(url)) => Some(Link {
+                    hidden: normalize_url(shown.trim()) != normalize_url(url),
+                    url: url.clone(),
+                }),
+                EntityKind::Link(None) => Some(Link {
+                    url: shown,
+                    hidden: false,
+                }),
+                _ => None,
+            }
         })
-        .filter(|u| !u.is_empty())
+        .filter(|l| !l.url.is_empty())
         .collect()
 }
 
@@ -188,6 +209,46 @@ pub fn duration(secs: i32) -> String {
     }
 }
 
+pub fn ttl(secs: i32) -> String {
+    if secs < 0 {
+        return "view once".to_owned();
+    }
+    if secs == 0 {
+        return "off".to_owned();
+    }
+    for (unit, label) in [(604_800, "w"), (86_400, "d"), (3600, "h"), (60, "m")] {
+        if secs % unit == 0 {
+            return format!("{}{label}", secs / unit);
+        }
+    }
+    format!("{secs}s")
+}
+
+pub fn count(n: i64, exact: bool) -> String {
+    let a = n.unsigned_abs();
+    if exact || a < 1000 {
+        return n.to_string();
+    }
+    let sign = if n < 0 { "-" } else { "" };
+    let (value, unit) = if a < 1_000_000 {
+        (a as f64 / 1000.0, "K")
+    } else if a < 1_000_000_000 {
+        (a as f64 / 1_000_000.0, "M")
+    } else {
+        (a as f64 / 1_000_000_000.0, "B")
+    };
+    let tenths = (value * 10.0).floor() / 10.0;
+    if tenths >= 100.0 || tenths.fract() == 0.0 {
+        format!("{sign}{}{unit}", tenths.floor() as u64)
+    } else {
+        format!("{sign}{tenths:.1}{unit}")
+    }
+}
+
+pub fn stamp(ts: i64) -> String {
+    local(ts).map_or_else(String::new, |t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+}
+
 pub fn file_size(bytes: i64) -> String {
     let b = bytes.max(0) as f64;
     if b < 1024.0 {
@@ -206,11 +267,99 @@ fn local(ts: i64) -> Option<DateTime<Local>> {
 }
 
 pub fn time_label(ts: i64) -> String {
-    local(ts).map_or_else(String::new, |t| t.format("%H:%M").to_string())
+    let layout = &theme::get().layout;
+    let pattern = match (layout.clock, layout.seconds) {
+        (theme::Clock::H24, false) => "%H:%M",
+        (theme::Clock::H24, true) => "%H:%M:%S",
+        (theme::Clock::H12, false) => "%-I:%M %p",
+        (theme::Clock::H12, true) => "%-I:%M:%S %p",
+    };
+    local(ts).map_or_else(String::new, |t| t.format(pattern).to_string())
 }
 
 pub fn date_label(ts: i64) -> String {
     local(ts).map_or_else(String::new, |t| t.format("%Y-%m-%d").to_string())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Lang {
+    Ru,
+    En,
+}
+
+impl Lang {
+    pub fn from_locale(value: Option<&str>) -> Lang {
+        match value {
+            Some(v) if v.to_ascii_lowercase().starts_with("en") => Lang::En,
+            _ => Lang::Ru,
+        }
+    }
+
+    pub fn detect() -> Lang {
+        let value = ["LC_ALL", "LC_TIME", "LC_MESSAGES", "LANG"]
+            .iter()
+            .filter_map(|k| std::env::var(k).ok())
+            .find(|v| !v.is_empty());
+        Lang::from_locale(value.as_deref())
+    }
+}
+
+const MONTHS_RU: [&str; 12] = [
+    "января",
+    "февраля",
+    "марта",
+    "апреля",
+    "мая",
+    "июня",
+    "июля",
+    "августа",
+    "сентября",
+    "октября",
+    "ноября",
+    "декабря",
+];
+const MONTHS_EN: [&str; 12] = [
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+];
+
+pub fn day_label(lang: Lang, ts: i64, now: i64) -> String {
+    let (Some(t), Some(n)) = (local(ts), local(now)) else {
+        return String::new();
+    };
+    let (day, today) = (t.date_naive(), n.date_naive());
+    if day == today {
+        return match lang {
+            Lang::Ru => "Сегодня",
+            Lang::En => "Today",
+        }
+        .to_owned();
+    }
+    if today.pred_opt() == Some(day) {
+        return match lang {
+            Lang::Ru => "Вчера",
+            Lang::En => "Yesterday",
+        }
+        .to_owned();
+    }
+    let month = day.month0() as usize;
+    let same_year = day.year() == today.year();
+    match (lang, same_year) {
+        (Lang::Ru, true) => format!("{} {}", day.day(), MONTHS_RU[month]),
+        (Lang::Ru, false) => format!("{} {} {}", day.day(), MONTHS_RU[month], day.year()),
+        (Lang::En, true) => format!("{} {}", MONTHS_EN[month], day.day()),
+        (Lang::En, false) => format!("{} {}, {}", MONTHS_EN[month], day.day(), day.year()),
+    }
 }
 
 pub fn same_day(a: i64, b: i64) -> bool {
@@ -220,19 +369,137 @@ pub fn same_day(a: i64, b: i64) -> bool {
     }
 }
 
+const VS16: char = '\u{FE0F}';
+const VS15: char = '\u{FE0E}';
+
+const WIDE_MODIFIER_BASES: [char; 9] = [
+    '\u{261D}',
+    '\u{26F9}',
+    '\u{270C}',
+    '\u{270D}',
+    '\u{1F3CB}',
+    '\u{1F3CC}',
+    '\u{1F574}',
+    '\u{1F575}',
+    '\u{1F590}',
+];
+
+const NARROW_IN_TERMINAL: [(u32, u32); 8] = [
+    (0x1F1AE, 0x1F1AE),
+    (0x1F6D9, 0x1F6D9),
+    (0x1F7DA, 0x1F7DA),
+    (0x1FA8B, 0x1FA8D),
+    (0x1FACC, 0x1FACC),
+    (0x1FADD, 0x1FADD),
+    (0x1FAEB, 0x1FAEB),
+    (0x1FAF9, 0x1FAFA),
+];
+
+pub const EMOJI_PLACEHOLDER: &str = "•";
+
+fn narrow_in_terminal(c: char) -> bool {
+    let c = c as u32;
+    NARROW_IN_TERMINAL
+        .iter()
+        .any(|(lo, hi)| (*lo..=*hi).contains(&c))
+}
+
+fn regional(c: char) -> bool {
+    ('\u{1F1E6}'..='\u{1F1FF}').contains(&c)
+}
+
+fn private_use(c: char) -> bool {
+    ('\u{E000}'..='\u{F8FF}').contains(&c) || c >= '\u{F0000}'
+}
+
+pub fn grapheme_cells(g: &str) -> usize {
+    if g.len() == 1 {
+        usize::from(!g.as_bytes()[0].is_ascii_control())
+    } else {
+        g.width()
+    }
+}
+
+pub fn cells(text: &str) -> usize {
+    text.graphemes(true).map(grapheme_cells).sum()
+}
+
+fn safe_grapheme(g: &str, out: &mut String) {
+    let mut chars = g.chars();
+    let first = chars.next();
+    let lone = chars.next().is_none();
+    match first {
+        Some('\u{3164}' | '\u{FFA0}') if lone => out.push(' '),
+        Some(c) if lone && WIDE_MODIFIER_BASES.contains(&c) => {
+            out.push(c);
+            out.push(VS16);
+        }
+        Some(c) if lone && regional(c) => out.push('\u{FFFD}'),
+        Some(c) if narrow_in_terminal(c) => out.push('\u{FFFD}'),
+        _ => out.push_str(g),
+    }
+}
+
+pub fn sanitize(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for g in text.graphemes(true) {
+        safe_grapheme(g, &mut out);
+    }
+    out
+}
+
+fn qualify(g: &str) -> String {
+    let chars: Vec<char> = g.chars().filter(|c| *c != VS16).collect();
+    let mut out = String::with_capacity(g.len() + 4);
+    for (i, c) in chars.iter().enumerate() {
+        out.push(*c);
+        let next = chars.get(i + 1).copied();
+        let modifier = next.is_some_and(|n| ('\u{1F3FB}'..='\u{1F3FF}').contains(&n));
+        if c.width() == Some(1)
+            && next != Some(VS15)
+            && !modifier
+            && format!("{c}{VS16}").width() == 2
+        {
+            out.push(VS16);
+        }
+    }
+    out
+}
+
+pub fn emoji_cell(label: &str) -> Option<String> {
+    let mut out = String::new();
+    for g in label.graphemes(true) {
+        let q = qualify(g);
+        let mut safe = String::new();
+        safe_grapheme(&q, &mut safe);
+        let ok = grapheme_cells(&safe) == 2
+            && !safe.contains('\u{FFFD}')
+            && !safe.chars().any(private_use);
+        if !ok {
+            return None;
+        }
+        out.push_str(&safe);
+    }
+    (!out.is_empty()).then_some(out)
+}
+
 pub fn truncate(text: &str, width: usize) -> String {
-    if text.width() <= width {
-        return text.to_owned();
+    let text = sanitize(text);
+    if cells(&text) <= width {
+        return text;
+    }
+    if width == 0 {
+        return String::new();
     }
     let mut out = String::new();
     let mut w = 0;
-    for ch in text.chars() {
-        let cw = ch.width().unwrap_or(0);
-        if w + cw + 1 > width {
+    for g in text.graphemes(true) {
+        let gw = grapheme_cells(g);
+        if w + gw + 1 > width {
             break;
         }
-        out.push(ch);
-        w += cw;
+        out.push_str(g);
+        w += gw;
     }
     out.push('…');
     out
@@ -247,13 +514,121 @@ pub fn separator(label: &str, width: usize) -> String {
     let total = width.max(lw + 2);
     let dashes = total - lw;
     let left = dashes / 2;
-    format!("{}{}{}", "─".repeat(left), label, "─".repeat(dashes - left))
+    let rule = theme::get().glyphs.separator.clone();
+    format!(
+        "{}{}{}",
+        rule.repeat(left),
+        label,
+        rule.repeat(dashes - left)
+    )
+}
+
+pub fn quote_block(text: &str, author: &str, when: &str) -> String {
+    let mut out: Vec<String> = text
+        .trim_end()
+        .lines()
+        .map(|l| {
+            if l.is_empty() {
+                ">".to_owned()
+            } else {
+                format!("> {l}")
+            }
+        })
+        .collect();
+    let sign = match (author.is_empty(), when.is_empty()) {
+        (false, false) => format!("— {author}, {when}"),
+        (false, true) => format!("— {author}"),
+        (true, false) => format!("— {when}"),
+        (true, true) => String::new(),
+    };
+    if !sign.is_empty() {
+        out.push(sign);
+    }
+    out.join("\n")
+}
+
+pub fn quote_position(full: &str, fragment: &str) -> Option<i32> {
+    if fragment.is_empty() {
+        return None;
+    }
+    let byte = full.find(fragment)?;
+    i32::try_from(full[..byte].encode_utf16().count()).ok()
 }
 
 #[cfg(test)]
 mod tests {
+    use unicode_segmentation::UnicodeSegmentation;
+
+    #[test]
+    fn counts_round_unless_exact() {
+        assert_eq!(count(999, false), "999");
+        assert_eq!(count(1000, false), "1K");
+        assert_eq!(count(1234, false), "1.2K");
+        assert_eq!(count(1299, false), "1.2K");
+        assert_eq!(count(15_670, false), "15.6K");
+        assert_eq!(count(999_999, false), "999K");
+        assert_eq!(count(2_500_000, false), "2.5M");
+        assert_eq!(count(3_000_000_000, false), "3B");
+        assert_eq!(count(1234, true), "1234");
+        assert_eq!(count(2_500_000, true), "2500000");
+        assert_eq!(count(-1500, false), "-1.5K");
+    }
+
+    #[test]
+    fn ttl_labels() {
+        assert_eq!(ttl(0), "off");
+        assert_eq!(ttl(-1), "view once");
+        assert_eq!(ttl(5), "5s");
+        assert_eq!(ttl(30), "30s");
+        assert_eq!(ttl(90), "90s");
+        assert_eq!(ttl(60), "1m");
+        assert_eq!(ttl(3600), "1h");
+        assert_eq!(ttl(7200), "2h");
+        assert_eq!(ttl(86_400), "1d");
+        assert_eq!(ttl(604_800), "1w");
+        assert_eq!(ttl(2_678_400), "31d");
+    }
+
     use super::*;
+
+    #[test]
+    fn quotes_prefix_lines_and_sign() {
+        assert_eq!(
+            quote_block("one\n\ntwo\n", "Alice", "2026-11-09 10:00"),
+            "> one\n>\n> two\n— Alice, 2026-11-09 10:00"
+        );
+        assert_eq!(quote_block("x", "", ""), "> x");
+        assert_eq!(quote_position("ab😀cd", "cd"), Some(4));
+        assert_eq!(quote_position("привет мир", "мир"), Some(7));
+        assert_eq!(quote_position("abc", "zz"), None);
+        assert_eq!(quote_position("abc", ""), None);
+    }
     use crate::model::Entity;
+
+    #[test]
+    fn day_labels_are_localised() {
+        let now = Local
+            .with_ymd_and_hms(2026, 11, 9, 15, 0, 0)
+            .single()
+            .unwrap()
+            .timestamp();
+        let at = |y, m, d| {
+            Local
+                .with_ymd_and_hms(y, m, d, 10, 0, 0)
+                .single()
+                .unwrap()
+                .timestamp()
+        };
+        assert_eq!(day_label(Lang::Ru, now - 60, now), "Сегодня");
+        assert_eq!(day_label(Lang::Ru, at(2026, 11, 8), now), "Вчера");
+        assert_eq!(day_label(Lang::Ru, at(2026, 11, 1), now), "1 ноября");
+        assert_eq!(day_label(Lang::Ru, at(2025, 3, 2), now), "2 марта 2025");
+        assert_eq!(day_label(Lang::En, at(2026, 11, 1), now), "November 1");
+        assert_eq!(day_label(Lang::En, now, now), "Today");
+        assert_eq!(Lang::from_locale(Some("en_US.UTF-8")), Lang::En);
+        assert_eq!(Lang::from_locale(Some("ru_RU.UTF-8")), Lang::Ru);
+        assert_eq!(Lang::from_locale(None), Lang::Ru);
+    }
 
     fn ent(offset: usize, length: usize, kind: EntityKind) -> Entity {
         Entity {
@@ -350,7 +725,19 @@ mod tests {
                 ent(20, 4, EntityKind::Link(Some("https://docs.rs".to_owned()))),
             ],
         };
-        assert_eq!(urls(&rt), vec!["example.com", "https://docs.rs"]);
+        let urls: Vec<String> = links(&rt).into_iter().map(|l| l.url).collect();
+        assert_eq!(urls, vec!["example.com", "https://docs.rs"]);
+        let hidden: Vec<bool> = links(&rt).iter().map(|l| l.hidden).collect();
+        assert_eq!(hidden, vec![false, true]);
+        let same = RichText {
+            text: "docs.rs".to_owned(),
+            entities: vec![ent(
+                0,
+                7,
+                EntityKind::Link(Some("https://docs.rs".to_owned())),
+            )],
+        };
+        assert!(!links(&same)[0].hidden);
         assert_eq!(normalize_url("example.com"), "https://example.com");
         assert_eq!(normalize_url("https://a.b"), "https://a.b");
     }
@@ -365,5 +752,86 @@ mod tests {
         assert_eq!(one_line("a\n b\tc"), "a b c");
         assert_eq!(separator(" x ", 9), "─── x ───");
         assert_eq!(utf16_slice("😀ab", 2, 1), "a");
+    }
+
+    const KITTY_WIDTHS: [(&str, usize); 16] = [
+        ("❤\u{FE0F}", 2),
+        ("👍🏽", 2),
+        ("👨\u{200D}👩\u{200D}👧", 2),
+        ("1\u{FE0F}\u{20E3}", 2),
+        ("❤\u{FE0F}\u{200D}🔥", 2),
+        ("🤷\u{200D}♂\u{FE0F}", 2),
+        ("✍\u{FE0F}", 2),
+        ("✍🏽", 2),
+        ("🕊\u{FE0F}", 2),
+        ("🏳\u{FE0F}\u{200D}🌈", 2),
+        ("🅰\u{FE0F}", 2),
+        ("🇺🇸", 2),
+        ("🅰", 1),
+        ("⚡", 2),
+        ("▸", 1),
+        ("•", 1),
+    ];
+
+    fn kitty(g: &str) -> usize {
+        KITTY_WIDTHS
+            .iter()
+            .find(|(k, _)| *k == g)
+            .map(|(_, w)| *w)
+            .unwrap_or_else(|| panic!("no measured kitty width for {g:?}"))
+    }
+
+    #[test]
+    fn reaction_emoji_become_two_cell_graphemes_that_kitty_agrees_with() {
+        for (raw, want) in [
+            ("❤", "❤\u{FE0F}"),
+            ("❤\u{FE0F}", "❤\u{FE0F}"),
+            ("👍🏽", "👍🏽"),
+            ("👨\u{200D}👩\u{200D}👧", "👨\u{200D}👩\u{200D}👧"),
+            ("1\u{FE0F}\u{20E3}", "1\u{FE0F}\u{20E3}"),
+            ("1\u{20E3}", "1\u{FE0F}\u{20E3}"),
+            ("❤\u{200D}🔥", "❤\u{FE0F}\u{200D}🔥"),
+            ("🤷\u{200D}♂", "🤷\u{200D}♂\u{FE0F}"),
+            ("✍", "✍\u{FE0F}"),
+            ("✍🏽", "✍🏽"),
+            ("🕊", "🕊\u{FE0F}"),
+            ("🏳\u{200D}🌈", "🏳\u{FE0F}\u{200D}🌈"),
+            ("🇺🇸", "🇺🇸"),
+        ] {
+            let got = emoji_cell(raw).unwrap_or_else(|| panic!("{raw:?} rejected"));
+            assert_eq!(got, want, "{raw:?}");
+            assert_eq!(got.graphemes(true).count(), 1, "{raw:?}");
+            assert_eq!(cells(&got), 2, "{raw:?}");
+            assert_eq!(cells(&got), kitty(&got), "{raw:?}");
+        }
+        for bad in ["", "\u{E000}", "\u{1FAEB}", "\u{1F1FA}", "a", "◆"] {
+            assert_eq!(emoji_cell(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn truncate_counts_graphemes_and_keeps_terminal_widths() {
+        assert_eq!(truncate("abc", 0), "");
+        assert_eq!(truncate("abc", 1), "…");
+        assert_eq!(
+            truncate("🅰\u{FE0F}🅰\u{FE0F}🅰\u{FE0F}", 5),
+            "🅰\u{FE0F}🅰\u{FE0F}…"
+        );
+        assert_eq!(cells(&truncate("❤\u{FE0F}\u{200D}🔥 hot ▸ ⚡ news", 6)), 6);
+        for title in ["🅰⚡▸ Канал", "✍ пишем", "ㅤ", "🇺 x", "👍🏽👍🏽👍🏽"]
+        {
+            for w in 0..12 {
+                let t = truncate(title, w);
+                assert!(cells(&t) <= w, "{title:?} {w} -> {t:?}");
+                for g in t.graphemes(true) {
+                    if KITTY_WIDTHS.iter().any(|(k, _)| *k == g) {
+                        assert_eq!(grapheme_cells(g), kitty(g), "{g:?}");
+                    }
+                }
+            }
+        }
+        assert_eq!(truncate("✍", 4), "✍\u{FE0F}");
+        assert_eq!(truncate("ㅤ", 4), " ");
+        assert_eq!(truncate("🇺 x", 4), "\u{FFFD} x");
     }
 }

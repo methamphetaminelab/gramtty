@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -10,6 +11,57 @@ pub const WAVEFORM_LEN: usize = 100;
 pub const MIN_SAMPLES: usize = (RATE / 2) as usize;
 pub const MAX_SECONDS: u64 = 15 * 60;
 const ENCODE_TIMEOUT: Duration = Duration::from_secs(60);
+pub const LEVEL_SAMPLES: usize = RATE as usize / 20;
+const LEVEL_FLOOR_DB: f32 = 48.0;
+const LIVE_BARS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+pub type Levels = Arc<Mutex<Vec<u16>>>;
+
+#[derive(Debug, Default)]
+pub struct LevelMeter {
+    carry: Option<u8>,
+    count: usize,
+    peak: u16,
+}
+
+impl LevelMeter {
+    pub fn feed(&mut self, bytes: &[u8], out: &mut Vec<u16>) {
+        let mut it = bytes.iter().copied();
+        while let Some(lo) = self.carry.take().or_else(|| it.next()) {
+            let Some(hi) = it.next() else {
+                self.carry = Some(lo);
+                break;
+            };
+            self.peak = self.peak.max(i16::from_le_bytes([lo, hi]).unsigned_abs());
+            self.count += 1;
+            if self.count == LEVEL_SAMPLES {
+                out.push(self.peak);
+                self.count = 0;
+                self.peak = 0;
+            }
+        }
+    }
+}
+
+pub fn level_index(peak: u16) -> usize {
+    if peak == 0 {
+        return 0;
+    }
+    let db = 20.0 * (f32::from(peak) / f32::from(i16::MAX)).log10();
+    let frac = ((db + LEVEL_FLOOR_DB) / LEVEL_FLOOR_DB).clamp(0.0, 1.0);
+    (frac * (LIVE_BARS.len() - 1) as f32).round() as usize
+}
+
+pub fn live_tail(levels: &[u16], width: usize) -> &[u16] {
+    &levels[levels.len().saturating_sub(width)..]
+}
+
+pub fn live_bars(levels: &[u16], width: usize) -> String {
+    live_tail(levels, width)
+        .iter()
+        .map(|p| LIVE_BARS[level_index(*p)])
+        .collect()
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VoiceNote {
@@ -176,6 +228,7 @@ pub enum Stop {
 pub struct Recorder {
     child: tokio::process::Child,
     reader: tokio::task::JoinHandle<std::io::Result<Vec<u8>>>,
+    levels: Levels,
 }
 
 impl Recorder {
@@ -192,12 +245,38 @@ impl Recorder {
             .stdout
             .take()
             .ok_or_else(|| "pw-record: no stdout".to_owned())?;
+        let levels = Levels::default();
+        let shared = levels.clone();
         let reader = tokio::spawn(async move {
-            let mut buf = Vec::with_capacity(RATE as usize * 2 * 10);
-            stdout.read_to_end(&mut buf).await?;
-            Ok(buf)
+            let mut pcm = Vec::with_capacity(RATE as usize * 2 * 10);
+            let mut chunk = vec![0u8; LEVEL_SAMPLES * 2];
+            let mut meter = LevelMeter::default();
+            let mut fresh = Vec::new();
+            loop {
+                let n = stdout.read(&mut chunk).await?;
+                if n == 0 {
+                    break;
+                }
+                pcm.extend_from_slice(&chunk[..n]);
+                meter.feed(&chunk[..n], &mut fresh);
+                if !fresh.is_empty() {
+                    shared
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .append(&mut fresh);
+                }
+            }
+            Ok(pcm)
         });
-        Ok(Self { child, reader })
+        Ok(Self {
+            child,
+            reader,
+            levels,
+        })
+    }
+
+    pub fn levels(&self) -> Levels {
+        self.levels.clone()
     }
 
     pub async fn run(mut self, stop: oneshot::Receiver<Stop>) -> Result<Option<Vec<u8>>, String> {
@@ -330,6 +409,53 @@ mod tests {
         assert!(!is_ogg_opus(b"RIFF....WAVE"));
     }
 
+    #[test]
+    fn level_meter_emits_one_peak_per_chunk_across_split_reads() {
+        let mut pcm = Vec::new();
+        for i in 0..LEVEL_SAMPLES * 3 + 10 {
+            let v: i16 = match i / LEVEL_SAMPLES {
+                0 => 100,
+                1 => -20_000,
+                _ => 5,
+            };
+            pcm.extend_from_slice(&v.to_le_bytes());
+        }
+        let mut meter = LevelMeter::default();
+        let mut out = Vec::new();
+        for part in pcm.chunks(777) {
+            meter.feed(part, &mut out);
+        }
+        assert_eq!(out, vec![100, 20_000, 5]);
+        meter.feed(&[], &mut out);
+        assert_eq!(out.len(), 3);
+    }
+
+    #[test]
+    fn level_index_is_monotonic_and_bounded() {
+        assert_eq!(level_index(0), 0);
+        assert_eq!(level_index(1), 0);
+        assert_eq!(level_index(u16::MAX), 7);
+        assert_eq!(level_index(i16::MAX as u16), 7);
+        let mut last = 0;
+        for p in (0..=32_767u16).step_by(97) {
+            let i = level_index(p);
+            assert!(i >= last && i <= 7);
+            last = i;
+        }
+        assert!(level_index(3000) > level_index(300));
+    }
+
+    #[test]
+    fn live_bars_keep_newest_on_the_right() {
+        let levels: Vec<u16> = (0..10).map(|i| if i < 7 { 0 } else { 32_767 }).collect();
+        assert_eq!(live_tail(&levels, 4), &[0, 32_767, 32_767, 32_767]);
+        assert_eq!(live_bars(&levels, 4), "▁███");
+        assert_eq!(live_bars(&levels, 50).chars().count(), 10);
+        assert!(live_bars(&levels, 50).ends_with('█'));
+        assert_eq!(live_bars(&levels, 0), "");
+        assert_eq!(live_bars(&[], 5), "");
+    }
+
     fn scratch() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("gramtty-voice-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -358,6 +484,53 @@ mod tests {
         let head = std::fs::read(&note.path).unwrap();
         assert!(is_ogg_opus(&head));
         assert!(encode(vec![0; 100], enc, &dir).await.is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn live_levels_update_while_recording() {
+        let enc = check_tools().unwrap();
+        let rec = Recorder::start().unwrap();
+        let levels = rec.levels();
+        let (tx, rx) = oneshot::channel();
+        let task = tokio::spawn(rec.run(rx));
+        let mut counts = Vec::new();
+        for step in 1..=6 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let l = levels.lock().unwrap().clone();
+            eprintln!(
+                "t={:.1}s bars={} last={:?} live={}",
+                step as f32 * 0.5,
+                l.len(),
+                live_tail(&l, 6),
+                live_bars(&l, 30)
+            );
+            counts.push(l.len());
+        }
+        let _ = tx.send(Stop::Send);
+        let pcm = task.await.unwrap().unwrap().unwrap();
+        assert!(counts.windows(2).all(|w| w[1] > w[0]));
+        let all = levels.lock().unwrap().clone();
+        let distinct: std::collections::BTreeSet<u16> = all.iter().copied().collect();
+        eprintln!(
+            "total {} bars, {} distinct peaks, min {:?} max {:?}",
+            all.len(),
+            distinct.len(),
+            all.iter().min(),
+            all.iter().max()
+        );
+        assert!(all.len() >= 50);
+        assert!(distinct.len() > 1);
+        let dir = scratch();
+        let note = encode(pcm, enc, &dir).await.unwrap();
+        eprintln!(
+            "file {} duration {} s, final waveform {}",
+            note.path.display(),
+            note.duration,
+            crate::model::waveform_bars(&note.waveform, 50)
+        );
+        assert_eq!(note.duration, 3);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -9,11 +9,14 @@ use tdlib_rs::enums::{
 use tdlib_rs::types;
 use tokio::sync::mpsc::UnboundedSender;
 
+use crate::bots::{Button, ButtonAction, Command, Keyboard};
 use crate::format::duration;
 use crate::model::{
-    Attachment, ChatInfo, ChatKind, Decode, Entity, EntityKind, FileRef, ListId, MediaKind, Msg,
-    Position, RichText, SendState, Sender, Visual,
+    self, Attachment, ChatInfo, ChatKind, Decode, Entity, EntityKind, FileRef, ListId, MediaKind,
+    Membership, Msg, MsgMeta, Origin, Position, Profile, ProfileTarget, Reaction, RichText, Rights,
+    SecretChat, SecretState, SendState, Sender, Topic, TopicCursor, Visual,
 };
+use crate::presence::{Activity, Status};
 use crate::stickers::{Data as StickerData, Item, ItemKind};
 use crate::upload::{self, Kind as UploadKind, Pending, ToolResult};
 
@@ -28,6 +31,22 @@ pub enum Event {
         chat_id: i64,
         msgs: Vec<Msg>,
         initial: bool,
+        epoch: u64,
+    },
+    HistoryFailed {
+        chat_id: i64,
+        epoch: u64,
+        error: String,
+    },
+    NewerHistory {
+        chat_id: i64,
+        msgs: Vec<Msg>,
+        epoch: u64,
+    },
+    HistoryAround {
+        chat_id: i64,
+        target: i64,
+        result: Result<Vec<Msg>, String>,
     },
     EditText {
         chat_id: i64,
@@ -56,7 +75,109 @@ pub enum Event {
     Voice(Result<Option<crate::voice::VoiceNote>, String>),
     Stickers(crate::stickers::Data),
     StickersFailed(String),
+    NotifyFailed(String),
+    Profile(ProfileTarget, Result<Profile, String>),
+    BotCommands {
+        chat_id: i64,
+        result: Result<Vec<Command>, String>,
+    },
+    CallbackAnswer(Result<Answer, String>),
+    AvailableReactions {
+        chat_id: i64,
+        message_id: i64,
+        result: Result<ReactionChoices, String>,
+    },
+    ReactionList {
+        chat_id: i64,
+        message_id: i64,
+        result: Result<Vec<(Sender, String)>, String>,
+    },
+    CustomEmoji(Result<std::collections::HashMap<i64, String>, String>),
+    Search {
+        token: u64,
+        result: Result<Vec<Msg>, String>,
+    },
+    Fetched(Msg),
+    Properties {
+        chat_id: i64,
+        message_id: i64,
+        result: Result<Flags, String>,
+    },
+    Blocked(Result<Vec<Sender>, String>),
+    Mention {
+        chat_id: i64,
+        result: Result<Option<(i64, Option<i32>)>, String>,
+    },
+    Reaction {
+        chat_id: i64,
+        result: Result<Option<(i64, Option<i32>)>, String>,
+    },
+    Topics {
+        chat_id: i64,
+        result: Result<TopicPage, String>,
+    },
+    TopicRefreshed {
+        chat_id: i64,
+        result: Result<Topic, String>,
+    },
+    TopicCreated {
+        chat_id: i64,
+        result: Result<Topic, String>,
+    },
+    TopicLink(Result<String, String>),
+    SecretCreated(Result<i64, String>),
+    Pinned {
+        chat_id: i64,
+        result: Result<Option<Msg>, String>,
+    },
+    SoundFailed(String),
+    Translated {
+        chat_id: i64,
+        message_id: i64,
+        result: Result<String, String>,
+    },
+    Members {
+        token: u64,
+        result: Result<crate::admin::MemberPage, String>,
+    },
+    ActionLog {
+        chat_id: i64,
+        from: i64,
+        result: Result<Vec<crate::admin::LogEntry>, String>,
+    },
+    ImageCopied(Result<(), String>),
+    SettingsSaved(Result<(), String>),
+    ThemeFile(Result<(), String>),
 }
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Answer {
+    pub text: String,
+    pub alert: bool,
+    pub url: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Flags {
+    pub can_be_saved: bool,
+    pub can_be_forwarded: bool,
+    pub can_be_copied: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReactionChoices {
+    pub emojis: Vec<String>,
+    pub note: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TopicPage {
+    pub topics: Vec<Topic>,
+    pub next: Option<TopicCursor>,
+    pub total: i32,
+}
+
+pub type RequestLog = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 
 fn execute(request: &serde_json::Value) -> Result<(), String> {
     let raw = CString::new(request.to_string()).map_err(|e| e.to_string())?;
@@ -134,6 +255,7 @@ pub fn friendly_error(err: &types::Error) -> String {
 pub struct Td {
     pub client_id: i32,
     tx: UnboundedSender<Event>,
+    log: Option<RequestLog>,
 }
 
 impl Td {
@@ -141,6 +263,30 @@ impl Td {
         Self {
             client_id: tdlib_rs::create_client(),
             tx,
+            log: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn recording(tx: UnboundedSender<Event>) -> (Self, RequestLog) {
+        let log = RequestLog::default();
+        (
+            Self {
+                client_id: 0,
+                tx,
+                log: Some(log.clone()),
+            },
+            log,
+        )
+    }
+
+    fn fake(&self, what: &str) -> bool {
+        match &self.log {
+            Some(log) => {
+                log.lock().expect("request log").push(what.to_owned());
+                true
+            }
+            None => false,
         }
     }
 
@@ -152,6 +298,9 @@ impl Td {
     where
         F: Future<Output = Result<(), types::Error>> + Send + 'static,
     {
+        if self.fake(context) {
+            return;
+        }
         let tx = self.tx.clone();
         tokio::spawn(async move {
             if let Err(e) = fut.await {
@@ -262,6 +411,9 @@ impl Td {
     }
 
     pub fn load_chats(&self, list: ListId) {
+        if self.fake("load chats") {
+            return;
+        }
         let c = self.client_id;
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -287,38 +439,101 @@ impl Td {
         });
     }
 
-    pub fn load_history(&self, chat_id: i64, from_message_id: i64, initial: bool) {
+    pub fn load_history(
+        &self,
+        chat_id: i64,
+        from_message_id: i64,
+        initial: bool,
+        epoch: u64,
+        topic: Option<i32>,
+    ) {
+        self.note(format!("history {chat_id} topic {topic:?}"));
+        if self.fake("load history") {
+            return;
+        }
         let c = self.client_id;
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result =
-                tdlib_rs::functions::get_chat_history(chat_id, from_message_id, 0, 50, false, c)
-                    .await;
-            let ev = match result {
-                Ok(enums::Messages::Messages(m)) => Event::History {
+            let ev = match history_page(chat_id, from_message_id, 0, 50, topic, c).await {
+                Ok(msgs) => Event::History {
                     chat_id,
-                    msgs: m
-                        .messages
-                        .into_iter()
-                        .flatten()
-                        .map(convert_message)
-                        .collect(),
+                    msgs,
                     initial,
+                    epoch,
                 },
-                Err(e) => Event::Error(format!("load history: {}", friendly_error(&e))),
+                Err(error) => Event::HistoryFailed {
+                    chat_id,
+                    epoch,
+                    error,
+                },
             };
             let _ = tx.send(ev);
         });
     }
 
-    pub fn view_messages(&self, chat_id: i64, ids: Vec<i64>) {
+    pub fn load_newer(&self, chat_id: i64, from_message_id: i64, epoch: u64, topic: Option<i32>) {
         let c = self.client_id;
-        self.spawn("mark read", false, async move {
-            tdlib_rs::functions::view_messages(chat_id, ids, None, true, c).await
+        self.task("load newer", async move {
+            match history_page(chat_id, from_message_id, -49, 50, topic, c).await {
+                Ok(msgs) => Event::NewerHistory {
+                    chat_id,
+                    msgs,
+                    epoch,
+                },
+                Err(e) => Event::Error(format!("load newer messages: {e}")),
+            }
         });
     }
 
-    pub fn send_text(&self, chat_id: i64, text: String, reply_to: Option<i64>, edit: Option<i64>) {
+    pub fn load_around(&self, chat_id: i64, target: i64, topic: Option<i32>) {
+        self.note(format!("around {chat_id} {target} topic {topic:?}"));
+        let c = self.client_id;
+        self.task("load around", async move {
+            let result = match tdlib_rs::functions::get_message(chat_id, target, c).await {
+                Err(e) if e.code == 404 => Err("that message was deleted".to_owned()),
+                Err(e) => Err(format!("cannot open that message: {}", friendly_error(&e))),
+                Ok(enums::Message::Message(m)) => {
+                    around_window(convert_message(m), || {
+                        history_page(chat_id, target, AROUND_OFFSET, AROUND_LIMIT, topic, c)
+                    })
+                    .await
+                }
+            };
+            Event::HistoryAround {
+                chat_id,
+                target,
+                result,
+            }
+        });
+    }
+
+    pub fn view_messages(&self, chat_id: i64, ids: Vec<i64>, topic: Option<i32>) {
+        self.note(format!("view {chat_id} {ids:?} topic {topic:?}"));
+        let c = self.client_id;
+        let source = topic.map(|_| enums::MessageSource::ForumTopicHistory);
+        self.spawn("mark read", false, async move {
+            tdlib_rs::functions::view_messages(chat_id, ids, source, true, c).await
+        });
+    }
+
+    pub fn send_text(
+        &self,
+        chat_id: i64,
+        text: String,
+        reply_to: Option<i64>,
+        edit: Option<i64>,
+        topic: Option<i32>,
+        quote: Option<(String, i32)>,
+    ) {
+        self.note(format!(
+            "send {chat_id} topic {topic:?} reply {reply_to:?} edit {edit:?}"
+        ));
+        if let Some((q, pos)) = &quote {
+            self.note(format!("quote {pos} {q}"));
+        }
+        if self.fake("send") {
+            return;
+        }
         let c = self.client_id;
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -347,12 +562,25 @@ impl Td {
                         let reply = reply_to.map(|message_id| {
                             enums::InputMessageReplyTo::Message(types::InputMessageReplyToMessage {
                                 message_id,
-                                quote: None,
+                                quote: quote.map(|(text, position)| types::InputTextQuote {
+                                    text: types::FormattedText {
+                                        text,
+                                        entities: Vec::new(),
+                                    },
+                                    position,
+                                }),
                                 checklist_task_id: 0,
                             })
                         });
-                        tdlib_rs::functions::send_message(chat_id, None, reply, None, content, c)
-                            .await
+                        tdlib_rs::functions::send_message(
+                            chat_id,
+                            message_topic(topic),
+                            reply,
+                            None,
+                            content,
+                            c,
+                        )
+                        .await
                     }
                 }
             }
@@ -365,6 +593,9 @@ impl Td {
     }
 
     pub fn fetch_edit_text(&self, chat_id: i64, message_id: i64, body: RichText) {
+        if self.fake("fetch edit text") {
+            return;
+        }
         let c = self.client_id;
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -396,6 +627,9 @@ impl Td {
     }
 
     pub fn download_file(&self, file_id: i32, priority: i32) {
+        if self.fake("download") {
+            return;
+        }
         let c = self.client_id;
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -410,6 +644,39 @@ impl Td {
             let _ = tx.send(ev);
         });
     }
+}
+
+async fn oldest_found(
+    chat_id: i64,
+    topic: Option<i32>,
+    filter: enums::SearchMessagesFilter,
+    c: i32,
+) -> Result<Option<(i64, Option<i32>)>, String> {
+    tdlib_rs::functions::search_chat_messages(
+        chat_id,
+        message_topic(topic),
+        String::new(),
+        None,
+        0,
+        0,
+        100,
+        Some(filter),
+        c,
+    )
+    .await
+    .map(|enums::FoundChatMessages::FoundChatMessages(f)| {
+        f.messages
+            .iter()
+            .min_by_key(|m| m.id)
+            .map(|m| (m.id, msg_topic(&m.topic_id)))
+    })
+    .map_err(|e| friendly_error(&e))
+}
+
+fn message_topic(topic: Option<i32>) -> Option<enums::MessageTopic> {
+    topic.map(|forum_topic_id| {
+        enums::MessageTopic::Forum(types::MessageTopicForum { forum_topic_id })
+    })
 }
 
 fn reply_to_message(reply_to: Option<i64>) -> Option<enums::InputMessageReplyTo> {
@@ -605,7 +872,14 @@ impl Td {
         text: String,
         reply_to: Option<i64>,
         uploads: std::path::PathBuf,
+        topic: Option<i32>,
     ) {
+        self.note(format!(
+            "send uploads {chat_id} topic {topic:?} reply {reply_to:?}"
+        ));
+        if self.fake("send uploads") {
+            return;
+        }
         let c = self.client_id;
         let tx = self.tx.clone();
         tokio::spawn(async move {
@@ -628,11 +902,23 @@ impl Td {
                     let r = reply_to_message(reply.take());
                     if contents.len() == 1 {
                         let content = contents.pop().expect("one content");
-                        tdlib_rs::functions::send_message(chat_id, None, r, None, content, c)
-                            .await?;
+                        tdlib_rs::functions::send_message(
+                            chat_id,
+                            message_topic(topic),
+                            r,
+                            None,
+                            content,
+                            c,
+                        )
+                        .await?;
                     } else {
                         tdlib_rs::functions::send_message_album(
-                            chat_id, None, r, None, contents, c,
+                            chat_id,
+                            message_topic(topic),
+                            r,
+                            None,
+                            contents,
+                            c,
                         )
                         .await?;
                     }
@@ -645,8 +931,15 @@ impl Td {
                             link_preview_options: None,
                             clear_draft: true,
                         });
-                    tdlib_rs::functions::send_message(chat_id, None, None, None, content, c)
-                        .await?;
+                    tdlib_rs::functions::send_message(
+                        chat_id,
+                        message_topic(topic),
+                        None,
+                        None,
+                        content,
+                        c,
+                    )
+                    .await?;
                 }
                 Ok(())
             }
@@ -661,8 +954,17 @@ impl Td {
         });
     }
 
-    pub fn send_voice(&self, chat_id: i64, note: crate::voice::VoiceNote, reply_to: Option<i64>) {
+    pub fn send_voice(
+        &self,
+        chat_id: i64,
+        note: crate::voice::VoiceNote,
+        reply_to: Option<i64>,
+        topic: Option<i32>,
+    ) {
         use base64::Engine;
+        self.note(format!(
+            "send voice {chat_id} topic {topic:?} reply {reply_to:?}"
+        ));
         let c = self.client_id;
         let waveform = base64::engine::general_purpose::STANDARD
             .encode(crate::voice::pack_waveform(&note.waveform));
@@ -677,7 +979,7 @@ impl Td {
                 });
             tdlib_rs::functions::send_message(
                 chat_id,
-                None,
+                message_topic(topic),
                 reply_to_message(reply_to),
                 None,
                 content,
@@ -688,7 +990,10 @@ impl Td {
         });
     }
 
-    pub fn send_item(&self, chat_id: i64, item: Item, reply_to: Option<i64>) {
+    pub fn send_item(&self, chat_id: i64, item: Item, reply_to: Option<i64>, topic: Option<i32>) {
+        self.note(format!(
+            "send sticker {chat_id} topic {topic:?} reply {reply_to:?}"
+        ));
         let c = self.client_id;
         self.spawn("send sticker", false, async move {
             let file = enums::InputFile::Id(types::InputFileId { id: item.file_id });
@@ -718,7 +1023,7 @@ impl Td {
             };
             tdlib_rs::functions::send_message(
                 chat_id,
-                None,
+                message_topic(topic),
                 reply_to_message(reply_to),
                 None,
                 content,
@@ -733,6 +1038,9 @@ impl Td {
     where
         F: Future<Output = Result<StickerData, types::Error>> + Send + 'static,
     {
+        if self.fake("stickers") {
+            return;
+        }
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let ev = match fut.await {
@@ -800,6 +1108,909 @@ impl Td {
     }
 }
 
+impl Td {
+    fn task<F>(&self, context: &'static str, fut: F)
+    where
+        F: Future<Output = Event> + Send + 'static,
+    {
+        if self.fake(context) {
+            return;
+        }
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(fut.await);
+        });
+    }
+
+    pub fn set_online(&self, online: bool) {
+        let c = self.client_id;
+        let context = if online { "go online" } else { "go offline" };
+        self.spawn(context, false, async move {
+            tdlib_rs::functions::set_option(
+                "online".to_owned(),
+                Some(enums::OptionValue::Boolean(types::OptionValueBoolean {
+                    value: online,
+                })),
+                c,
+            )
+            .await
+        });
+    }
+
+    pub fn send_chat_action(&self, chat_id: i64, action: enums::ChatAction, topic: Option<i32>) {
+        let c = self.client_id;
+        self.spawn("chat action", false, async move {
+            tdlib_rs::functions::send_chat_action(chat_id, message_topic(topic), Some(action), c)
+                .await
+        });
+    }
+
+    fn note(&self, entry: String) {
+        if let Some(log) = &self.log {
+            log.lock().expect("request log").push(entry);
+        }
+    }
+
+    pub fn notify(&self, title: String, body: String, icon: crate::notify::Icon) {
+        if self.fake("notify") {
+            self.note(format!("notify icon {icon:?}"));
+            return;
+        }
+        let tx = self.tx.clone();
+        let c = self.client_id;
+        match icon {
+            crate::notify::Icon::None => crate::notify::send(title, body, None, tx),
+            crate::notify::Icon::Path(p) => crate::notify::send(title, body, Some(p), tx),
+            crate::notify::Icon::Download(id) => {
+                tokio::spawn(async move {
+                    let fetched = tokio::time::timeout(
+                        std::time::Duration::from_secs(5),
+                        tdlib_rs::functions::download_file(id, 16, 0, 0, true, c),
+                    )
+                    .await;
+                    let path = match fetched {
+                        Ok(Ok(enums::File::File(f))) => convert_file(&f).local().map(str::to_owned),
+                        _ => None,
+                    };
+                    crate::notify::send(title, body, path, tx);
+                });
+            }
+        }
+    }
+
+    pub fn play_sound(&self, cmd: crate::notify::SoundCommand, file: std::path::PathBuf) {
+        if self.fake("sound") {
+            self.note(format!("sound {} {}", cmd.program, cmd.args.join(" ")));
+            return;
+        }
+        crate::notify::play(cmd, file, self.tx.clone());
+    }
+
+    pub fn load_pinned(&self, chat_id: i64) {
+        let c = self.client_id;
+        self.task("load pinned", async move {
+            let result = match tdlib_rs::functions::get_chat_pinned_message(chat_id, c).await {
+                Ok(enums::Message::Message(m)) => Ok(Some(convert_message(m))),
+                Err(e) if e.code == 404 => Ok(None),
+                Err(e) => Err(friendly_error(&e)),
+            };
+            Event::Pinned { chat_id, result }
+        });
+    }
+
+    pub fn read_all_mentions(&self, chat_id: i64) {
+        self.note(format!("read all mentions {chat_id}"));
+        let c = self.client_id;
+        self.spawn("read mentions", false, async move {
+            tdlib_rs::functions::read_all_chat_mentions(chat_id, c).await
+        });
+    }
+
+    pub fn load_profile(&self, target: ProfileTarget) {
+        let c = self.client_id;
+        self.task("load profile", async move {
+            let result = fetch_profile(target, c)
+                .await
+                .map_err(|e| friendly_error(&e));
+            Event::Profile(target, result)
+        });
+    }
+
+    pub fn load_bot_commands(&self, chat_id: i64) {
+        let c = self.client_id;
+        self.task("bot commands", async move {
+            let result = fetch_commands(chat_id, c)
+                .await
+                .map_err(|e| friendly_error(&e));
+            Event::BotCommands { chat_id, result }
+        });
+    }
+
+    pub fn press_callback(&self, chat_id: i64, message_id: i64, data: String) {
+        let c = self.client_id;
+        self.task("callback", async move {
+            let payload =
+                enums::CallbackQueryPayload::Data(types::CallbackQueryPayloadData { data });
+            let result =
+                tdlib_rs::functions::get_callback_query_answer(chat_id, message_id, payload, c)
+                    .await
+                    .map(
+                        |enums::CallbackQueryAnswer::CallbackQueryAnswer(a)| Answer {
+                            text: a.text,
+                            alert: a.show_alert,
+                            url: a.url,
+                        },
+                    )
+                    .map_err(|e| friendly_error(&e));
+            Event::CallbackAnswer(result)
+        });
+    }
+
+    pub fn load_available_reactions(&self, chat_id: i64, message_id: i64) {
+        let c = self.client_id;
+        self.task("available reactions", async move {
+            let result =
+                tdlib_rs::functions::get_message_available_reactions(chat_id, message_id, 8, c)
+                    .await
+                    .map(|enums::AvailableReactions::AvailableReactions(a)| reaction_choices(&a))
+                    .map_err(|e| friendly_error(&e));
+            Event::AvailableReactions {
+                chat_id,
+                message_id,
+                result,
+            }
+        });
+    }
+
+    pub fn load_custom_emoji(&self, ids: Vec<i64>) {
+        let c = self.client_id;
+        self.task("custom emoji", async move {
+            Event::CustomEmoji(custom_emoji_names(ids, c).await)
+        });
+    }
+
+    pub fn set_reaction(&self, chat_id: i64, message_id: i64, emoji: String, add: bool) {
+        let c = self.client_id;
+        self.spawn("react", false, async move {
+            let r = enums::ReactionType::Emoji(types::ReactionTypeEmoji { emoji });
+            if add {
+                tdlib_rs::functions::add_message_reaction(chat_id, message_id, r, false, true, c)
+                    .await
+            } else {
+                tdlib_rs::functions::remove_message_reaction(chat_id, message_id, r, c).await
+            }
+        });
+    }
+
+    pub fn load_reaction_list(&self, chat_id: i64, message_id: i64) {
+        let c = self.client_id;
+        self.task("reaction list", async move {
+            let result = tdlib_rs::functions::get_message_added_reactions(
+                chat_id,
+                message_id,
+                None,
+                String::new(),
+                100,
+                c,
+            )
+            .await
+            .map(|enums::AddedReactions::AddedReactions(a)| {
+                a.reactions
+                    .iter()
+                    .map(|r| {
+                        let label = match &r.r#type {
+                            enums::ReactionType::Emoji(e) => e.emoji.clone(),
+                            enums::ReactionType::CustomEmoji(_) => {
+                                crate::format::EMOJI_PLACEHOLDER.to_owned()
+                            }
+                            enums::ReactionType::Paid => "⭐".to_owned(),
+                        };
+                        (convert_sender(&r.sender_id), label)
+                    })
+                    .collect()
+            })
+            .map_err(|e| friendly_error(&e));
+            Event::ReactionList {
+                chat_id,
+                message_id,
+                result,
+            }
+        });
+    }
+
+    pub fn pin_message(&self, chat_id: i64, message_id: i64, pin: bool) {
+        let c = self.client_id;
+        self.spawn(if pin { "pin" } else { "unpin" }, false, async move {
+            if pin {
+                tdlib_rs::functions::pin_chat_message(chat_id, message_id, true, false, c).await
+            } else {
+                tdlib_rs::functions::unpin_chat_message(chat_id, message_id, c).await
+            }
+        });
+    }
+
+    pub fn forward(&self, to: i64, from: i64, message_ids: Vec<i64>) {
+        self.note(format!("forward {from} {message_ids:?} -> {to}"));
+        let c = self.client_id;
+        self.spawn("forward", false, async move {
+            tdlib_rs::functions::forward_messages(
+                to,
+                None,
+                from,
+                message_ids,
+                None,
+                false,
+                false,
+                c,
+            )
+            .await
+            .map(|_| ())
+        });
+    }
+
+    pub fn search(
+        &self,
+        token: u64,
+        chat_id: Option<i64>,
+        query: String,
+        pinned: bool,
+        sender: Option<Sender>,
+    ) {
+        self.note(format!("search {chat_id:?} sender {sender:?}"));
+        let c = self.client_id;
+        self.task("search", async move {
+            let result = match chat_id {
+                Some(chat_id) => {
+                    let filter = pinned.then_some(enums::SearchMessagesFilter::Pinned);
+                    let sender_id = sender.map(input_sender);
+                    tdlib_rs::functions::search_chat_messages(
+                        chat_id, None, query, sender_id, 0, 0, 100, filter, c,
+                    )
+                    .await
+                    .map(|enums::FoundChatMessages::FoundChatMessages(f)| f.messages)
+                }
+                None => tdlib_rs::functions::search_messages(
+                    None,
+                    query,
+                    String::new(),
+                    100,
+                    None,
+                    None,
+                    0,
+                    0,
+                    c,
+                )
+                .await
+                .map(|enums::FoundMessages::FoundMessages(f)| f.messages),
+            };
+            Event::Search {
+                token,
+                result: result
+                    .map(|m| m.into_iter().map(convert_message).collect())
+                    .map_err(|e| friendly_error(&e)),
+            }
+        });
+    }
+
+    pub fn find_unread_mention(&self, chat_id: i64, topic: Option<i32>) {
+        self.note(format!("unread search {chat_id} topic {topic:?}"));
+        let c = self.client_id;
+        self.task("find mention", async move {
+            let filter = enums::SearchMessagesFilter::UnreadMention;
+            let result = oldest_found(chat_id, topic, filter, c).await;
+            Event::Mention { chat_id, result }
+        });
+    }
+
+    pub fn find_unread_reaction(&self, chat_id: i64, topic: Option<i32>) {
+        self.note(format!("unread search {chat_id} topic {topic:?}"));
+        let c = self.client_id;
+        self.task("find reaction", async move {
+            let filter = enums::SearchMessagesFilter::UnreadReaction;
+            let result = oldest_found(chat_id, topic, filter, c).await;
+            Event::Reaction { chat_id, result }
+        });
+    }
+
+    pub fn read_all_reactions(&self, chat_id: i64) {
+        self.note(format!("read all reactions {chat_id}"));
+        let c = self.client_id;
+        self.spawn("read reactions", false, async move {
+            tdlib_rs::functions::read_all_chat_reactions(chat_id, c).await
+        });
+    }
+
+    pub fn read_topic_reactions(&self, chat_id: i64, topic: i32) {
+        self.note(format!("read topic reactions {chat_id} {topic}"));
+        let c = self.client_id;
+        self.spawn("read reactions", false, async move {
+            tdlib_rs::functions::read_all_forum_topic_reactions(chat_id, topic, c).await
+        });
+    }
+
+    pub fn load_properties(&self, chat_id: i64, message_id: i64) {
+        let c = self.client_id;
+        self.task("message properties", async move {
+            let result = tdlib_rs::functions::get_message_properties(chat_id, message_id, c)
+                .await
+                .map(|enums::MessageProperties::MessageProperties(p)| Flags {
+                    can_be_saved: p.can_be_saved,
+                    can_be_forwarded: p.can_be_forwarded,
+                    can_be_copied: p.can_be_copied,
+                })
+                .map_err(|e| friendly_error(&e));
+            Event::Properties {
+                chat_id,
+                message_id,
+                result,
+            }
+        });
+    }
+
+    pub fn load_blocked(&self) {
+        let c = self.client_id;
+        self.task("blocked senders", async move {
+            let mut all = Vec::new();
+            loop {
+                let page = tdlib_rs::functions::get_blocked_message_senders(
+                    enums::BlockList::Main,
+                    all.len() as i32,
+                    100,
+                    c,
+                )
+                .await;
+                match page {
+                    Ok(enums::MessageSenders::MessageSenders(p)) => {
+                        let got = p.senders.len();
+                        all.extend(p.senders.iter().map(convert_sender));
+                        if got == 0 || all.len() as i32 >= p.total_count {
+                            break Event::Blocked(Ok(all));
+                        }
+                    }
+                    Err(e) => break Event::Blocked(Err(friendly_error(&e))),
+                }
+            }
+        });
+    }
+
+    pub fn translate(&self, chat_id: i64, message_id: i64, lang: String) {
+        self.note(format!("translate {chat_id} {message_id} {lang}"));
+        let c = self.client_id;
+        self.task("translate", async move {
+            let result = tdlib_rs::functions::translate_message_text(chat_id, message_id, lang, c)
+                .await
+                .map(|enums::FormattedText::FormattedText(f)| f.text)
+                .map_err(|e| friendly_error(&e));
+            Event::Translated {
+                chat_id,
+                message_id,
+                result,
+            }
+        });
+    }
+
+    pub fn load_members(
+        &self,
+        token: u64,
+        supergroup_id: i64,
+        filter: crate::admin::MemberFilter,
+        query: String,
+    ) {
+        self.note(format!(
+            "members {supergroup_id} {} {query:?}",
+            filter.name()
+        ));
+        let c = self.client_id;
+        self.task("members", async move {
+            let result = tdlib_rs::functions::get_supergroup_members(
+                supergroup_id,
+                Some(filter.to_td(&query)),
+                0,
+                200,
+                c,
+            )
+            .await
+            .map(
+                |enums::ChatMembers::ChatMembers(m)| crate::admin::MemberPage {
+                    total: m.total_count,
+                    members: m
+                        .members
+                        .into_iter()
+                        .map(crate::admin::convert_member)
+                        .collect(),
+                },
+            )
+            .map_err(|e| friendly_error(&e));
+            Event::Members { token, result }
+        });
+    }
+
+    pub fn load_event_log(&self, chat_id: i64, from: i64) {
+        self.note(format!("event log {chat_id} from {from}"));
+        let c = self.client_id;
+        self.task("event log", async move {
+            let result = tdlib_rs::functions::get_chat_event_log(
+                chat_id,
+                String::new(),
+                from,
+                crate::admin::LOG_PAGE as i32,
+                None,
+                Vec::new(),
+                c,
+            )
+            .await
+            .map(|enums::ChatEvents::ChatEvents(e)| {
+                e.events
+                    .into_iter()
+                    .map(crate::admin::convert_event)
+                    .collect()
+            })
+            .map_err(|e| friendly_error(&e));
+            Event::ActionLog {
+                chat_id,
+                from,
+                result,
+            }
+        });
+    }
+
+    pub fn copy_text(&self, text: String) {
+        self.note(format!("copy {text}"));
+        self.task("clipboard", async move {
+            match upload::copy_text(text).await {
+                Ok(()) => Event::Notice("copied to clipboard".to_owned()),
+                Err(e) => Event::Error(e),
+            }
+        });
+    }
+
+    pub fn copy_image(&self, path: std::path::PathBuf) {
+        self.note(format!("copy image {}", path.display()));
+        self.task("clipboard image", async move {
+            Event::ImageCopied(upload::copy_image(path).await)
+        });
+    }
+
+    pub fn fetch_message(&self, chat_id: i64, message_id: i64) {
+        let c = self.client_id;
+        self.task("get message", async move {
+            match tdlib_rs::functions::get_message(chat_id, message_id, c).await {
+                Ok(enums::Message::Message(m)) => Event::Fetched(convert_message(m)),
+                Err(e) => Event::Error(format!("load keyboard: {}", friendly_error(&e))),
+            }
+        });
+    }
+}
+
+impl Td {
+    pub fn load_topics(&self, chat_id: i64, cursor: Option<TopicCursor>) {
+        self.note(format!("topics {chat_id} {cursor:?}"));
+        let c = self.client_id;
+        let at = cursor.unwrap_or_default();
+        self.task("load topics", async move {
+            let result = match tdlib_rs::functions::get_forum_topics(
+                chat_id,
+                String::new(),
+                at.date,
+                at.message_id,
+                at.topic_id,
+                model::TOPIC_PAGE,
+                c,
+            )
+            .await
+            {
+                Ok(enums::ForumTopics::ForumTopics(f)) => {
+                    let next = (f.next_offset_forum_topic_id != 0).then_some(TopicCursor {
+                        date: f.next_offset_date,
+                        message_id: f.next_offset_message_id,
+                        topic_id: f.next_offset_forum_topic_id,
+                    });
+                    Ok(TopicPage {
+                        topics: topics_with_icons(f.topics, c).await,
+                        next,
+                        total: f.total_count,
+                    })
+                }
+                Err(e) => Err(friendly_error(&e)),
+            };
+            Event::Topics { chat_id, result }
+        });
+    }
+
+    pub fn refresh_topic(&self, chat_id: i64, topic: i32) {
+        self.note(format!("refresh topic {chat_id} {topic}"));
+        let c = self.client_id;
+        self.task("refresh topic", async move {
+            let result = match tdlib_rs::functions::get_forum_topic(chat_id, topic, c).await {
+                Ok(enums::ForumTopic::ForumTopic(t)) => topics_with_icons(vec![t], c)
+                    .await
+                    .pop()
+                    .ok_or_else(|| "empty topic".to_owned()),
+                Err(e) => Err(friendly_error(&e)),
+            };
+            Event::TopicRefreshed { chat_id, result }
+        });
+    }
+
+    pub fn set_topic_muted(&self, chat_id: i64, topic: i32, mute: bool) {
+        self.note(format!("mute topic {chat_id} {topic} {mute}"));
+        let c = self.client_id;
+        self.spawn("topic notifications", false, async move {
+            tdlib_rs::functions::set_forum_topic_notification_settings(
+                chat_id,
+                topic,
+                topic_settings(mute),
+                c,
+            )
+            .await
+        });
+    }
+
+    pub fn pin_topic(&self, chat_id: i64, topic: i32, pin: bool) {
+        self.note(format!("pin topic {chat_id} {topic} {pin}"));
+        let c = self.client_id;
+        self.spawn("pin topic", false, async move {
+            tdlib_rs::functions::toggle_forum_topic_is_pinned(chat_id, topic, pin, c).await
+        });
+    }
+
+    pub fn close_topic(&self, chat_id: i64, topic: i32, close: bool) {
+        self.note(format!("close topic {chat_id} {topic} {close}"));
+        let c = self.client_id;
+        self.spawn("close topic", false, async move {
+            tdlib_rs::functions::toggle_forum_topic_is_closed(chat_id, topic, close, c).await
+        });
+    }
+
+    pub fn hide_general(&self, chat_id: i64, hide: bool) {
+        self.note(format!("hide general {chat_id} {hide}"));
+        let c = self.client_id;
+        self.spawn("hide General", false, async move {
+            tdlib_rs::functions::toggle_general_forum_topic_is_hidden(chat_id, hide, c).await
+        });
+    }
+
+    pub fn read_topic_mentions(&self, chat_id: i64, topic: i32) {
+        self.note(format!("read topic mentions {chat_id} {topic}"));
+        let c = self.client_id;
+        self.spawn("read mentions", false, async move {
+            tdlib_rs::functions::read_all_forum_topic_mentions(chat_id, topic, c).await
+        });
+    }
+
+    pub fn topic_link(&self, chat_id: i64, topic: i32) {
+        self.note(format!("topic link {chat_id} {topic}"));
+        let c = self.client_id;
+        self.task("topic link", async move {
+            Event::TopicLink(
+                match tdlib_rs::functions::get_forum_topic_link(chat_id, topic, c).await {
+                    Ok(enums::MessageLink::MessageLink(l)) => Ok(l.link),
+                    Err(e) => Err(friendly_error(&e)),
+                },
+            )
+        });
+    }
+
+    pub fn create_topic(&self, chat_id: i64, name: String) {
+        self.note(format!("create topic {chat_id} {name}"));
+        let c = self.client_id;
+        self.task("create topic", async move {
+            let icon = types::ForumTopicIcon {
+                color: TOPIC_ICON_COLOR,
+                custom_emoji_id: 0,
+            };
+            let result = match tdlib_rs::functions::create_forum_topic(
+                chat_id, name, false, icon, c,
+            )
+            .await
+            {
+                Ok(enums::ForumTopicInfo::ForumTopicInfo(i)) => Ok(convert_topic_info(i)),
+                Err(e) => Err(friendly_error(&e)),
+            };
+            Event::TopicCreated { chat_id, result }
+        });
+    }
+
+    pub fn create_secret_chat(&self, user_id: i64) {
+        self.note(format!("secret new {user_id}"));
+        let c = self.client_id;
+        self.task("new secret chat", async move {
+            Event::SecretCreated(
+                match tdlib_rs::functions::create_new_secret_chat(user_id, c).await {
+                    Ok(enums::Chat::Chat(chat)) => Ok(chat.id),
+                    Err(e) => Err(friendly_error(&e)),
+                },
+            )
+        });
+    }
+
+    pub fn close_secret_chat(&self, secret_id: i32) {
+        self.note(format!("secret close {secret_id}"));
+        let c = self.client_id;
+        self.spawn("close secret chat", false, async move {
+            tdlib_rs::functions::close_secret_chat(secret_id, c).await
+        });
+    }
+
+    pub fn delete_secret_chat(&self, chat_id: i64, secret_id: i32, open: bool) {
+        self.note(format!("secret delete {chat_id} {secret_id} {open}"));
+        let c = self.client_id;
+        self.spawn("delete secret chat", false, async move {
+            if open {
+                tdlib_rs::functions::close_secret_chat(secret_id, c).await?;
+            }
+            tdlib_rs::functions::delete_chat_history(chat_id, true, false, c).await
+        });
+    }
+
+    pub fn set_auto_delete(&self, chat_id: i64, secs: i32) {
+        self.note(format!("auto delete {chat_id} {secs}"));
+        let c = self.client_id;
+        self.spawn("auto-delete timer", false, async move {
+            tdlib_rs::functions::set_chat_message_auto_delete_time(chat_id, secs, c).await
+        });
+    }
+}
+
+pub const AROUND_OFFSET: i32 = -20;
+pub const AROUND_LIMIT: i32 = 40;
+pub const AROUND_ATTEMPTS: usize = 3;
+
+async fn history_page(
+    chat_id: i64,
+    from_message_id: i64,
+    offset: i32,
+    limit: i32,
+    topic: Option<i32>,
+    client_id: i32,
+) -> Result<Vec<Msg>, String> {
+    let page = match topic {
+        Some(t) => {
+            tdlib_rs::functions::get_forum_topic_history(
+                chat_id,
+                t,
+                from_message_id,
+                offset,
+                limit,
+                client_id,
+            )
+            .await
+        }
+        None => {
+            tdlib_rs::functions::get_chat_history(
+                chat_id,
+                from_message_id,
+                offset,
+                limit,
+                false,
+                client_id,
+            )
+            .await
+        }
+    };
+    match page {
+        Ok(enums::Messages::Messages(m)) => Ok(m
+            .messages
+            .into_iter()
+            .flatten()
+            .map(convert_message)
+            .collect()),
+        Err(e) => Err(friendly_error(&e)),
+    }
+}
+
+pub async fn around_window<F, Fut>(target: Msg, mut fetch: F) -> Result<Vec<Msg>, String>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = Result<Vec<Msg>, String>>,
+{
+    let mut out: Vec<Msg> = Vec::new();
+    for _ in 0..AROUND_ATTEMPTS {
+        for m in fetch().await? {
+            if !out.iter().any(|o| o.id == m.id) {
+                out.push(m);
+            }
+        }
+        if out.iter().any(|m| m.id == target.id) {
+            break;
+        }
+    }
+    if !out.iter().any(|m| m.id == target.id) {
+        out.push(target);
+    }
+    out.sort_by_key(|m| m.id);
+    Ok(out)
+}
+
+fn reaction_choices(a: &types::AvailableReactions) -> ReactionChoices {
+    let mut emojis: Vec<String> = Vec::new();
+    for r in a
+        .top_reactions
+        .iter()
+        .chain(&a.recent_reactions)
+        .chain(&a.popular_reactions)
+    {
+        if r.needs_premium {
+            continue;
+        }
+        if let enums::ReactionType::Emoji(e) = &r.r#type
+            && !emojis.contains(&e.emoji)
+        {
+            emojis.push(e.emoji.clone());
+        }
+    }
+    let note = a.unavailability_reason.as_ref().map(|r| match r {
+        enums::ReactionUnavailabilityReason::AnonymousAdministrator => {
+            "anonymous administrators can't react".to_owned()
+        }
+        enums::ReactionUnavailabilityReason::Guest => "join the chat to react".to_owned(),
+    });
+    ReactionChoices { emojis, note }
+}
+
+fn usernames(u: &Option<types::Usernames>) -> Vec<String> {
+    u.as_ref()
+        .map(|n| n.active_usernames.clone())
+        .unwrap_or_default()
+}
+
+fn tme(names: &[String]) -> Vec<String> {
+    names.iter().map(|n| format!("https://t.me/{n}")).collect()
+}
+
+fn bot_commands(list: &[types::BotCommand], bot: &str) -> Vec<Command> {
+    list.iter()
+        .map(|c| Command {
+            name: c.command.clone(),
+            description: c.description.clone(),
+            bot: bot.to_owned(),
+        })
+        .collect()
+}
+
+async fn user_profile(user_id: i64, c: i32) -> Result<Profile, types::Error> {
+    let enums::User::User(u) = tdlib_rs::functions::get_user(user_id, c).await?;
+    let enums::UserFullInfo::UserFullInfo(full) =
+        tdlib_rs::functions::get_user_full_info(user_id, c).await?;
+    let names = usernames(&u.usernames);
+    let bot = full.bot_info.as_ref();
+    let bio = match (&full.bio, bot) {
+        (Some(b), _) if !b.text.is_empty() => b.text.clone(),
+        (_, Some(info)) if !info.description.is_empty() => info.description.clone(),
+        (_, Some(info)) => info.short_description.clone(),
+        _ => String::new(),
+    };
+    let kind = match u.r#type {
+        enums::UserType::Bot(_) => "bot",
+        enums::UserType::Deleted => "deleted account",
+        _ => "user",
+    };
+    Ok(Profile {
+        title: user_name(&u),
+        kind: kind.to_owned(),
+        id: u.id,
+        user_id: Some(u.id),
+        links: tme(&names),
+        phone: if u.phone_number.is_empty() {
+            String::new()
+        } else {
+            format!("+{}", u.phone_number)
+        },
+        commands: bot
+            .map(|b| bot_commands(&b.commands, names.first().map_or("", String::as_str)))
+            .unwrap_or_default(),
+        usernames: names,
+        bio,
+        common_chats: Some(full.group_in_common_count),
+        members: None,
+    })
+}
+
+async fn fetch_profile(target: ProfileTarget, c: i32) -> Result<Profile, types::Error> {
+    let chat_id = match target {
+        ProfileTarget::User(id) => return user_profile(id, c).await,
+        ProfileTarget::Chat(id) => id,
+    };
+    let enums::Chat::Chat(chat) = tdlib_rs::functions::get_chat(chat_id, c).await?;
+    match chat.r#type {
+        enums::ChatType::Private(p) => user_profile(p.user_id, c).await,
+        enums::ChatType::Secret(s) => {
+            let mut p = user_profile(s.user_id, c).await?;
+            p.kind = "secret chat".to_owned();
+            Ok(p)
+        }
+        enums::ChatType::BasicGroup(g) => {
+            let enums::BasicGroup::BasicGroup(group) =
+                tdlib_rs::functions::get_basic_group(g.basic_group_id, c).await?;
+            let enums::BasicGroupFullInfo::BasicGroupFullInfo(full) =
+                tdlib_rs::functions::get_basic_group_full_info(g.basic_group_id, c).await?;
+            Ok(Profile {
+                title: chat.title,
+                kind: "group".to_owned(),
+                id: chat.id,
+                bio: full.description,
+                members: Some(group.member_count),
+                links: full
+                    .invite_link
+                    .map(|l| l.invite_link)
+                    .into_iter()
+                    .collect(),
+                ..Profile::default()
+            })
+        }
+        enums::ChatType::Supergroup(s) => {
+            let enums::Supergroup::Supergroup(group) =
+                tdlib_rs::functions::get_supergroup(s.supergroup_id, c).await?;
+            let enums::SupergroupFullInfo::SupergroupFullInfo(full) =
+                tdlib_rs::functions::get_supergroup_full_info(s.supergroup_id, c).await?;
+            let names = usernames(&group.usernames);
+            let mut links = tme(&names);
+            links.extend(full.invite_link.map(|l| l.invite_link));
+            Ok(Profile {
+                title: chat.title,
+                kind: if group.is_channel {
+                    "channel"
+                } else {
+                    "supergroup"
+                }
+                .to_owned(),
+                id: chat.id,
+                usernames: names,
+                bio: full.description,
+                members: Some(full.member_count.max(group.member_count)),
+                links,
+                ..Profile::default()
+            })
+        }
+    }
+}
+
+async fn group_commands(
+    list: Vec<types::BotCommands>,
+    c: i32,
+) -> Result<Vec<Command>, types::Error> {
+    let mut out = Vec::new();
+    for b in list {
+        let enums::User::User(u) = tdlib_rs::functions::get_user(b.bot_user_id, c).await?;
+        let names = usernames(&u.usernames);
+        out.extend(bot_commands(
+            &b.commands,
+            names.first().map_or("", String::as_str),
+        ));
+    }
+    Ok(out)
+}
+
+async fn fetch_commands(chat_id: i64, c: i32) -> Result<Vec<Command>, types::Error> {
+    let enums::Chat::Chat(chat) = tdlib_rs::functions::get_chat(chat_id, c).await?;
+    match chat.r#type {
+        enums::ChatType::Private(p) => {
+            let enums::User::User(u) = tdlib_rs::functions::get_user(p.user_id, c).await?;
+            if !matches!(u.r#type, enums::UserType::Bot(_)) {
+                return Ok(Vec::new());
+            }
+            let enums::UserFullInfo::UserFullInfo(full) =
+                tdlib_rs::functions::get_user_full_info(p.user_id, c).await?;
+            let names = usernames(&u.usernames);
+            Ok(full
+                .bot_info
+                .map(|b| bot_commands(&b.commands, names.first().map_or("", String::as_str)))
+                .unwrap_or_default())
+        }
+        enums::ChatType::BasicGroup(g) => {
+            let enums::BasicGroupFullInfo::BasicGroupFullInfo(full) =
+                tdlib_rs::functions::get_basic_group_full_info(g.basic_group_id, c).await?;
+            group_commands(full.bot_commands, c).await
+        }
+        enums::ChatType::Supergroup(s) if !s.is_channel => {
+            let enums::SupergroupFullInfo::SupergroupFullInfo(full) =
+                tdlib_rs::functions::get_supergroup_full_info(s.supergroup_id, c).await?;
+            group_commands(full.bot_commands, c).await
+        }
+        _ => Ok(Vec::new()),
+    }
+}
+
 pub fn to_chat_list(list: ListId) -> ChatList {
     match list {
         ListId::Main => ChatList::Main,
@@ -832,15 +2043,29 @@ pub fn convert_chat(chat: types::Chat) -> ChatInfo {
         enums::ChatType::Supergroup(_) => ChatKind::Supergroup,
         enums::ChatType::Secret(s) => ChatKind::Secret(s.user_id),
     };
+    let (group_id, secret_id) = match &chat.r#type {
+        enums::ChatType::Supergroup(s) => (s.supergroup_id, 0),
+        enums::ChatType::Secret(s) => (0, s.secret_chat_id),
+        _ => (0, 0),
+    };
     ChatInfo {
+        group_id,
+        secret_id,
+        forum: false,
+        auto_delete: chat.message_auto_delete_time,
+        perms: convert_perms(&chat.permissions),
+        protected: chat.has_protected_content,
         id: chat.id,
         title: chat.title,
         kind,
         unread: chat.unread_count,
         mentions: chat.unread_mention_count,
+        reactions: chat.unread_reaction_count,
         last_read_inbox: chat.last_read_inbox_message_id,
-        muted: !chat.notification_settings.use_default_mute_for
-            && chat.notification_settings.mute_for > 0,
+        last_read_outbox: chat.last_read_outbox_message_id,
+        photo: chat.photo.as_ref().map(|p| convert_file(&p.small)),
+        muted: chat.notification_settings.mute_for > 0,
+        use_default_mute: chat.notification_settings.use_default_mute_for,
         positions: chat
             .positions
             .iter()
@@ -1264,6 +2489,13 @@ pub fn split_camel(name: &str) -> String {
     out
 }
 
+pub fn input_sender(s: Sender) -> MessageSender {
+    match s {
+        Sender::User(user_id) => MessageSender::User(types::MessageSenderUser { user_id }),
+        Sender::Chat(chat_id) => MessageSender::Chat(types::MessageSenderChat { chat_id }),
+    }
+}
+
 pub fn convert_sender(s: &MessageSender) -> Sender {
     match s {
         MessageSender::User(u) => Sender::User(u.user_id),
@@ -1272,6 +2504,26 @@ pub fn convert_sender(s: &MessageSender) -> Sender {
 }
 
 pub fn convert_message(m: types::Message) -> Msg {
+    let story = matches!(m.content, enums::MessageContent::MessageStory(_));
+    let info = m.interaction_info.as_ref();
+    let meta = MsgMeta {
+        edit_date: i64::from(m.edit_date),
+        forward_date: m.forward_info.as_ref().map_or(0, |f| i64::from(f.date)),
+        views: info.map_or(0, |i| i.view_count),
+        forwards: info.map_or(0, |i| i.forward_count),
+        replies: info
+            .and_then(|i| i.reply_info.as_ref())
+            .map_or(0, |r| r.reply_count),
+        can_be_saved: m.can_be_saved,
+        channel_post: m.is_channel_post,
+        reply_chat: match &m.reply_to {
+            Some(enums::MessageReplyTo::Message(r)) if r.chat_id != m.chat_id => r.chat_id,
+            _ => 0,
+        },
+        via_bot: m.via_bot_user_id,
+        signature: m.author_signature.clone(),
+        story,
+    };
     let content = convert_content(m.content);
     let state = match m.sending_state {
         None => SendState::Sent,
@@ -1296,6 +2548,315 @@ pub fn convert_message(m: types::Message) -> Msg {
         media: content.media,
         attachments: content.attachments,
         body: content.body,
+        pinned: m.is_pinned,
+        mention: m.contains_unread_mention,
+        unread_reaction: !m.unread_reactions.is_empty(),
+        reactions: convert_reactions(m.interaction_info.as_ref()),
+        keyboard: convert_markup(m.reply_markup),
+        forward: m.forward_info.map(|f| convert_origin(f.origin)),
+        topic: msg_topic(&m.topic_id),
+        ttl: match m.self_destruct_type {
+            Some(enums::MessageSelfDestructType::Timer(t)) => t.self_destruct_time,
+            Some(enums::MessageSelfDestructType::Immediately) => -1,
+            None => 0,
+        },
+        deleted: false,
+        meta,
+    }
+}
+
+pub fn msg_topic(t: &Option<enums::MessageTopic>) -> Option<i32> {
+    match t {
+        Some(enums::MessageTopic::Forum(f)) => Some(f.forum_topic_id),
+        _ => None,
+    }
+}
+
+pub fn convert_perms(p: &types::ChatPermissions) -> Rights {
+    Rights {
+        manage_topics: false,
+        create_topics: p.can_create_topics,
+        pin: p.can_pin_messages,
+        change_info: p.can_change_info,
+    }
+}
+
+pub fn convert_membership(s: &enums::ChatMemberStatus) -> Membership {
+    match s {
+        enums::ChatMemberStatus::Creator(_) => Membership::Creator,
+        enums::ChatMemberStatus::Administrator(a) => Membership::Admin(Rights {
+            manage_topics: a.rights.can_manage_topics,
+            create_topics: a.rights.can_manage_topics,
+            pin: a.rights.can_pin_messages,
+            change_info: a.rights.can_change_info,
+        }),
+        enums::ChatMemberStatus::Member(_) => Membership::Member,
+        enums::ChatMemberStatus::Restricted(r) if r.is_member => {
+            Membership::Restricted(convert_perms(&r.permissions))
+        }
+        _ => Membership::Left,
+    }
+}
+
+pub fn convert_secret(s: &types::SecretChat) -> SecretChat {
+    SecretChat {
+        id: s.id,
+        user_id: s.user_id,
+        state: match s.state {
+            enums::SecretChatState::Pending => SecretState::Pending,
+            enums::SecretChatState::Ready => SecretState::Ready,
+            enums::SecretChatState::Closed => SecretState::Closed,
+        },
+        outbound: s.is_outbound,
+    }
+}
+
+pub fn convert_topic_info(i: types::ForumTopicInfo) -> Topic {
+    Topic {
+        id: i.forum_topic_id,
+        name: i.name,
+        icon: String::new(),
+        color: i.icon.color,
+        general: i.is_general,
+        closed: i.is_closed,
+        hidden: i.is_hidden,
+        outgoing: i.is_outgoing,
+        ..Topic::default()
+    }
+}
+
+pub fn convert_topic(t: types::ForumTopic) -> Topic {
+    let info = t.info;
+    let muted = t.notification_settings.mute_for > 0;
+    let use_default_mute = t.notification_settings.use_default_mute_for;
+    Topic {
+        pinned: t.is_pinned,
+        order: t.order,
+        unread: t.unread_count,
+        mentions: t.unread_mention_count,
+        reactions: t.unread_reaction_count,
+        last_read_inbox: t.last_read_inbox_message_id,
+        last_read_outbox: t.last_read_outbox_message_id,
+        muted,
+        use_default_mute,
+        last_message: t.last_message.map(convert_message),
+        ..convert_topic_info(info)
+    }
+}
+
+fn topic_icon_ids(t: &types::ForumTopic) -> i64 {
+    t.info.icon.custom_emoji_id
+}
+
+async fn emoji_for(ids: Vec<i64>, c: i32) -> std::collections::HashMap<i64, String> {
+    custom_emoji_names(ids, c).await.unwrap_or_default()
+}
+
+async fn custom_emoji_names(
+    ids: Vec<i64>,
+    c: i32,
+) -> Result<std::collections::HashMap<i64, String>, String> {
+    let mut out = std::collections::HashMap::new();
+    if ids.is_empty() {
+        return Ok(out);
+    }
+    let enums::Stickers::Stickers(list) = tdlib_rs::functions::get_custom_emoji_stickers(ids, c)
+        .await
+        .map_err(|e| friendly_error(&e))?;
+    for st in list.stickers {
+        if let enums::StickerFullType::CustomEmoji(e) = &st.full_type {
+            out.insert(e.custom_emoji_id, st.emoji.clone());
+        }
+    }
+    Ok(out)
+}
+
+async fn topics_with_icons(raw: Vec<types::ForumTopic>, c: i32) -> Vec<Topic> {
+    let ids: Vec<i64> = raw
+        .iter()
+        .map(topic_icon_ids)
+        .filter(|id| *id != 0)
+        .collect();
+    let emoji = emoji_for(ids, c).await;
+    raw.into_iter()
+        .map(|t| {
+            let id = topic_icon_ids(&t);
+            let mut topic = convert_topic(t);
+            if let Some(e) = emoji.get(&id) {
+                topic.icon = e.clone();
+            }
+            topic
+        })
+        .collect()
+}
+
+fn topic_settings(mute: bool) -> types::ChatNotificationSettings {
+    types::ChatNotificationSettings {
+        use_default_mute_for: false,
+        mute_for: if mute { MUTE_FOREVER } else { 0 },
+        use_default_sound: true,
+        sound_id: 0,
+        use_default_show_preview: true,
+        show_preview: true,
+        use_default_mute_stories: true,
+        mute_stories: false,
+        use_default_story_sound: true,
+        story_sound_id: 0,
+        use_default_show_story_poster: true,
+        show_story_poster: true,
+        use_default_disable_pinned_message_notifications: true,
+        disable_pinned_message_notifications: false,
+        use_default_disable_mention_notifications: true,
+        disable_mention_notifications: false,
+    }
+}
+
+const MUTE_FOREVER: i32 = 367 * 86_400;
+pub const TOPIC_ICON_COLOR: i32 = 0x6F_B9_F0;
+
+pub fn convert_origin(o: enums::MessageOrigin) -> Origin {
+    match o {
+        enums::MessageOrigin::User(u) => Origin::Sender(Sender::User(u.sender_user_id)),
+        enums::MessageOrigin::HiddenUser(u) => Origin::Name(u.sender_name),
+        enums::MessageOrigin::Chat(c) => Origin::Sender(Sender::Chat(c.sender_chat_id)),
+        enums::MessageOrigin::Channel(c) => Origin::Sender(Sender::Chat(c.chat_id)),
+    }
+}
+
+pub fn convert_reactions(info: Option<&types::MessageInteractionInfo>) -> Vec<Reaction> {
+    let Some(r) = info.and_then(|i| i.reactions.as_ref()) else {
+        return Vec::new();
+    };
+    r.reactions
+        .iter()
+        .map(|x| {
+            let (label, emoji, custom) = match &x.r#type {
+                enums::ReactionType::Emoji(e) => (e.emoji.clone(), Some(e.emoji.clone()), 0),
+                enums::ReactionType::CustomEmoji(c) => (
+                    crate::format::EMOJI_PLACEHOLDER.to_owned(),
+                    None,
+                    c.custom_emoji_id,
+                ),
+                enums::ReactionType::Paid => ("⭐".to_owned(), None, 0),
+            };
+            Reaction {
+                label,
+                emoji,
+                custom,
+                count: x.total_count,
+                chosen: x.is_chosen,
+            }
+        })
+        .collect()
+}
+
+pub fn convert_markup(markup: Option<enums::ReplyMarkup>) -> Option<Keyboard> {
+    use enums::InlineKeyboardButtonType as I;
+    use enums::KeyboardButtonType as K;
+    match markup? {
+        enums::ReplyMarkup::InlineKeyboard(k) => Some(Keyboard {
+            inline: true,
+            placeholder: String::new(),
+            rows: k
+                .rows
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|b| Button {
+                            text: b.text,
+                            action: match b.r#type {
+                                I::Callback(c) => ButtonAction::Callback(c.data),
+                                I::Url(u) => ButtonAction::Url(u.url),
+                                I::LoginUrl(u) => ButtonAction::Url(u.url),
+                                I::WebApp(u) => ButtonAction::Url(u.url),
+                                I::User(u) => ButtonAction::User(u.user_id),
+                                I::CopyText(t) => ButtonAction::CopyText(t.text),
+                                I::CallbackWithPassword(_) => {
+                                    ButtonAction::Unsupported("password-protected buttons")
+                                }
+                                I::CallbackGame => ButtonAction::Unsupported("games"),
+                                I::SwitchInline(_) => ButtonAction::Unsupported("inline mode"),
+                                I::Buy => ButtonAction::Unsupported("payments"),
+                            },
+                        })
+                        .collect()
+                })
+                .collect(),
+        }),
+        enums::ReplyMarkup::ShowKeyboard(k) => Some(Keyboard {
+            inline: false,
+            placeholder: k.input_field_placeholder,
+            rows: k
+                .rows
+                .into_iter()
+                .map(|row| {
+                    row.into_iter()
+                        .map(|b| Button {
+                            text: b.text,
+                            action: match b.r#type {
+                                K::Text => ButtonAction::Text,
+                                K::WebApp(u) => ButtonAction::Url(u.url),
+                                K::RequestPhoneNumber => {
+                                    ButtonAction::Unsupported("sharing your phone number")
+                                }
+                                K::RequestLocation => {
+                                    ButtonAction::Unsupported("sharing your location")
+                                }
+                                K::RequestPoll(_) => ButtonAction::Unsupported("creating polls"),
+                                K::RequestUsers(_) | K::RequestChat(_) => {
+                                    ButtonAction::Unsupported("sharing chats")
+                                }
+                            },
+                        })
+                        .collect()
+                })
+                .collect(),
+        }),
+        enums::ReplyMarkup::RemoveKeyboard(_) | enums::ReplyMarkup::ForceReply(_) => None,
+    }
+}
+
+pub fn convert_status(s: &enums::UserStatus) -> Status {
+    match s {
+        enums::UserStatus::Empty => Status::Unknown,
+        enums::UserStatus::Online(o) => Status::Online {
+            expires: i64::from(o.expires),
+        },
+        enums::UserStatus::Offline(o) => Status::Offline {
+            was_online: i64::from(o.was_online),
+        },
+        enums::UserStatus::Recently(_) => Status::Recently,
+        enums::UserStatus::LastWeek(_) => Status::LastWeek,
+        enums::UserStatus::LastMonth(_) => Status::LastMonth,
+    }
+}
+
+pub fn convert_activity(a: &enums::ChatAction) -> Option<Activity> {
+    use enums::ChatAction as A;
+    Some(match a {
+        A::Cancel => return None,
+        A::Typing => Activity::Typing,
+        A::RecordingVoiceNote | A::UploadingVoiceNote(_) => Activity::RecordingVoice,
+        A::RecordingVideo => Activity::RecordingVideo,
+        A::RecordingVideoNote | A::UploadingVideoNote(_) => Activity::RecordingVideoNote,
+        A::UploadingPhoto(_) => Activity::UploadingPhoto,
+        A::UploadingVideo(_) => Activity::UploadingVideo,
+        A::UploadingDocument(_) => Activity::UploadingFile,
+        A::ChoosingSticker => Activity::ChoosingSticker,
+        _ => Activity::Other,
+    })
+}
+
+pub fn user_meta(u: &types::User) -> crate::model::UserMeta {
+    crate::model::UserMeta {
+        status: convert_status(&u.status),
+        bot: matches!(u.r#type, enums::UserType::Bot(_)),
+        usernames: u
+            .usernames
+            .as_ref()
+            .map(|n| n.active_usernames.clone())
+            .unwrap_or_default(),
+        photo: u.profile_photo.as_ref().map(|p| convert_file(&p.small)),
     }
 }
 
@@ -1314,6 +2875,83 @@ pub fn user_name(u: &types::User) -> String {
 mod tests {
     use super::*;
     use serde_json::{Value, json};
+
+    fn plain(id: i64) -> Msg {
+        Msg {
+            id,
+            chat_id: 1,
+            sender: Sender::User(2),
+            date: id,
+            edited: false,
+            outgoing: false,
+            state: SendState::Sent,
+            reply_to: None,
+            album: 0,
+            media: None,
+            attachments: Vec::new(),
+            body: RichText::plain(format!("m{id}")),
+            pinned: false,
+            mention: false,
+            unread_reaction: false,
+            reactions: Vec::new(),
+            keyboard: None,
+            forward: None,
+            topic: None,
+            ttl: 0,
+            deleted: false,
+            meta: Default::default(),
+        }
+    }
+
+    type Page = std::future::Ready<Result<Vec<Msg>, String>>;
+
+    fn scripted(
+        pages: Vec<Result<Vec<i64>, String>>,
+    ) -> (std::rc::Rc<std::cell::Cell<usize>>, impl FnMut() -> Page) {
+        let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = calls.clone();
+        let mut pages = pages.into_iter();
+        let fetch = move || {
+            seen.set(seen.get() + 1);
+            let page = pages
+                .next()
+                .expect("no more scripted pages")
+                .map(|ids| ids.into_iter().rev().map(plain).collect());
+            std::future::ready(page)
+        };
+        (calls, fetch)
+    }
+
+    #[test]
+    fn around_window_retries_until_the_target_is_in_the_page() {
+        let (calls, fetch) = scripted(vec![
+            Ok(vec![]),
+            Ok((90..=99).collect()),
+            Ok((80..=119).collect()),
+        ]);
+        let got = futures::executor::block_on(around_window(plain(100), fetch)).unwrap();
+        assert_eq!(calls.get(), 3);
+        let ids: Vec<i64> = got.iter().map(|m| m.id).collect();
+        assert_eq!(ids, (80..=119).collect::<Vec<_>>());
+        let (calls, fetch) = scripted(vec![Ok((95..=130).collect())]);
+        let got = futures::executor::block_on(around_window(plain(100), fetch)).unwrap();
+        assert_eq!(calls.get(), 1, "stops as soon as the target arrives");
+        assert_eq!(got.first().map(|m| m.id), Some(95));
+    }
+
+    #[test]
+    fn around_window_keeps_the_confirmed_target_when_pages_miss_it() {
+        let (calls, fetch) = scripted(vec![Ok(vec![1, 2]), Ok(vec![2, 3]), Ok(vec![])]);
+        let got = futures::executor::block_on(around_window(plain(100), fetch)).unwrap();
+        assert_eq!(calls.get(), AROUND_ATTEMPTS);
+        let ids: Vec<i64> = got.iter().map(|m| m.id).collect();
+        assert_eq!(ids, vec![1, 2, 3, 100]);
+        let (_, fetch) = scripted(vec![Ok(vec![1]), Err("flood wait".to_owned())]);
+        assert_eq!(
+            futures::executor::block_on(around_window(plain(100), fetch)),
+            Err("flood wait".to_owned())
+        );
+    }
 
     fn file(id: i32, size: i64, done: bool) -> Value {
         json!({
@@ -1481,6 +3119,124 @@ mod tests {
     }
 
     #[test]
+    fn converts_keyboards_reactions_and_status() {
+        let style = json!({"@type": "buttonStyleDefault"});
+        let ib = |text: &str, t: Value| json!({"@type": "inlineKeyboardButton", "text": text, "icon_custom_emoji_id": "0", "style": style.clone(), "type": t});
+        let inline: enums::ReplyMarkup = serde_json::from_value(json!({
+            "@type": "replyMarkupInlineKeyboard",
+            "rows": [
+                [ib("Yes", json!({"@type": "inlineKeyboardButtonTypeCallback", "data": "eWVz"})),
+                 ib("Site", json!({"@type": "inlineKeyboardButtonTypeUrl", "url": "https://x.org"}))],
+                [ib("Pay", json!({"@type": "inlineKeyboardButtonTypeBuy"})),
+                 ib("Copy", json!({"@type": "inlineKeyboardButtonTypeCopyText", "text": "code"}))]
+            ]
+        }))
+        .expect("inline markup json");
+        let kb = convert_markup(Some(inline)).unwrap();
+        assert!(kb.inline);
+        assert_eq!(kb.buttons().len(), 4);
+        assert_eq!(kb.rows[0][0].action, ButtonAction::Callback("eWVz".into()));
+        assert_eq!(
+            kb.rows[0][1].action,
+            ButtonAction::Url("https://x.org".into())
+        );
+        assert_eq!(kb.rows[1][0].action, ButtonAction::Unsupported("payments"));
+        assert_eq!(kb.rows[1][1].action, ButtonAction::CopyText("code".into()));
+        let kbtn = |text: &str, t: &str| json!({"@type": "keyboardButton", "text": text, "icon_custom_emoji_id": "0", "style": style.clone(), "type": {"@type": t}});
+        let reply: enums::ReplyMarkup = serde_json::from_value(json!({
+            "@type": "replyMarkupShowKeyboard",
+            "rows": [[kbtn("Hi", "keyboardButtonTypeText"), kbtn("Phone", "keyboardButtonTypeRequestPhoneNumber")]],
+            "is_persistent": false, "resize_keyboard": true, "one_time": false,
+            "is_personal": false, "input_field_placeholder": "pick"
+        }))
+        .expect("reply markup json");
+        let kb = convert_markup(Some(reply)).unwrap();
+        assert!(!kb.inline);
+        assert_eq!(kb.placeholder, "pick");
+        assert_eq!(kb.rows[0][0].action, ButtonAction::Text);
+        assert!(matches!(kb.rows[0][1].action, ButtonAction::Unsupported(_)));
+        let remove: enums::ReplyMarkup = serde_json::from_value(
+            json!({"@type": "replyMarkupRemoveKeyboard", "is_personal": false}),
+        )
+        .expect("remove json");
+        assert!(convert_markup(Some(remove)).is_none());
+        assert!(convert_markup(None).is_none());
+        let info: types::MessageInteractionInfo = serde_json::from_value(json!({
+            "@type": "messageInteractionInfo", "view_count": 0, "forward_count": 0, "reply_info": null,
+            "reactions": {
+                "@type": "messageReactions", "are_tags": false, "paid_reactors": [],
+                "can_get_added_reactions": true,
+                "reactions": [
+                    {"@type": "messageReaction", "type": {"@type": "reactionTypeEmoji", "emoji": "👍"},
+                     "total_count": 4, "is_chosen": true, "used_sender_id": null, "recent_sender_ids": []},
+                    {"@type": "messageReaction", "type": {"@type": "reactionTypeCustomEmoji", "custom_emoji_id": "5"},
+                     "total_count": 1, "is_chosen": false, "used_sender_id": null, "recent_sender_ids": []},
+                    {"@type": "messageReaction", "type": {"@type": "reactionTypePaid"},
+                     "total_count": 2, "is_chosen": false, "used_sender_id": null, "recent_sender_ids": []}
+                ]
+            }
+        }))
+        .expect("interaction json");
+        let r = convert_reactions(Some(&info));
+        assert_eq!(r.len(), 3);
+        assert_eq!(
+            (r[0].label.as_str(), r[0].count, r[0].chosen),
+            ("👍", 4, true)
+        );
+        assert_eq!(r[0].emoji.as_deref(), Some("👍"));
+        assert_eq!((r[1].label.as_str(), r[1].emoji.as_deref()), ("•", None));
+        assert_eq!((r[0].custom, r[1].custom, r[2].custom), (0, 5, 0));
+        assert_eq!(r[2].label, "⭐");
+        assert!(convert_reactions(None).is_empty());
+        let st = |v: Value| convert_status(&serde_json::from_value(v).expect("status json"));
+        assert_eq!(
+            st(json!({"@type": "userStatusOnline", "expires": 50})),
+            Status::Online { expires: 50 }
+        );
+        assert_eq!(
+            st(json!({"@type": "userStatusOffline", "was_online": 40})),
+            Status::Offline { was_online: 40 }
+        );
+        assert_eq!(
+            st(json!({"@type": "userStatusRecently", "by_my_privacy_settings": false})),
+            Status::Recently
+        );
+        assert_eq!(st(json!({"@type": "userStatusEmpty"})), Status::Unknown);
+        let act = |t: &str| {
+            convert_activity(&serde_json::from_value(json!({"@type": t})).expect("action json"))
+        };
+        assert_eq!(act("chatActionTyping"), Some(Activity::Typing));
+        assert_eq!(
+            act("chatActionRecordingVoiceNote"),
+            Some(Activity::RecordingVoice)
+        );
+        assert_eq!(act("chatActionCancel"), None);
+    }
+
+    #[test]
+    fn reaction_choices_skip_premium_and_duplicates() {
+        let a: types::AvailableReactions = serde_json::from_value(json!({
+            "@type": "availableReactions",
+            "top_reactions": [
+                {"@type": "availableReaction", "type": {"@type": "reactionTypeEmoji", "emoji": "👍"}, "needs_premium": false},
+                {"@type": "availableReaction", "type": {"@type": "reactionTypeEmoji", "emoji": "🦄"}, "needs_premium": true}
+            ],
+            "recent_reactions": [
+                {"@type": "availableReaction", "type": {"@type": "reactionTypeEmoji", "emoji": "👍"}, "needs_premium": false},
+                {"@type": "availableReaction", "type": {"@type": "reactionTypeCustomEmoji", "custom_emoji_id": "9"}, "needs_premium": false}
+            ],
+            "popular_reactions": [
+                {"@type": "availableReaction", "type": {"@type": "reactionTypeEmoji", "emoji": "🔥"}, "needs_premium": false}
+            ],
+            "allow_custom_emoji": false, "are_tags": false, "unavailability_reason": null
+        }))
+        .expect("available reactions json");
+        let c = reaction_choices(&a);
+        assert_eq!(c.emojis, ["👍", "🔥"]);
+        assert_eq!(c.note, None);
+    }
+
+    #[test]
     fn other_content_is_one_readable_line() {
         let loc = content(json!({
             "@type": "messageLocation",
@@ -1501,5 +3257,135 @@ mod tests {
         assert_eq!(theme.media.as_deref(), Some("took a screenshot"));
         assert_eq!(split_camel("ChatSetTheme"), "chat set theme");
         assert!(loc.attachments.is_empty());
+    }
+
+    fn message_json(id: i64, topic: Value, destruct: Value) -> Value {
+        json!({
+            "@type": "message",
+            "id": id,
+            "sender_id": {"@type": "messageSenderUser", "user_id": 2},
+            "chat_id": -100,
+            "is_outgoing": false,
+            "date": 1_700_000_000,
+            "topic_id": topic,
+            "self_destruct_type": destruct,
+            "content": {"@type": "messageText", "text": caption("hi")},
+            "is_pinned": false, "is_from_offline": false, "can_be_saved": true,
+            "has_timestamped_media": false, "is_channel_post": false,
+            "is_paid_star_suggested_post": false, "is_paid_ton_suggested_post": false,
+            "contains_unread_mention": false, "edit_date": 0, "unread_reactions": [],
+            "self_destruct_in": 0.0, "auto_delete_in": 0.0, "via_bot_user_id": 0,
+            "sender_business_bot_user_id": 0, "sender_boost_count": 0,
+            "paid_message_star_count": 0, "author_signature": "", "media_album_id": "0",
+            "effect_id": "0", "summary_language_code": "",
+        })
+    }
+
+    fn notification_json(mute_for: i32) -> Value {
+        json!({
+            "@type": "chatNotificationSettings", "use_default_mute_for": false, "mute_for": mute_for,
+            "use_default_sound": true, "sound_id": "0", "use_default_show_preview": true,
+            "show_preview": true, "use_default_mute_stories": true, "mute_stories": false,
+            "use_default_story_sound": true, "story_sound_id": "0",
+            "use_default_show_story_poster": true, "show_story_poster": true,
+            "use_default_disable_pinned_message_notifications": true,
+            "disable_pinned_message_notifications": false,
+            "use_default_disable_mention_notifications": true,
+            "disable_mention_notifications": false,
+        })
+    }
+
+    #[test]
+    fn messages_carry_forum_topic_and_self_destruct_timer() {
+        let m: types::Message = serde_json::from_value(message_json(
+            5,
+            json!({"@type": "messageTopicForum", "forum_topic_id": 7}),
+            json!({"@type": "messageSelfDestructTypeTimer", "self_destruct_time": 30}),
+        ))
+        .expect("message JSON");
+        let msg = convert_message(m);
+        assert_eq!(msg.topic, Some(7));
+        assert_eq!(msg.ttl, 30);
+        let once: types::Message = serde_json::from_value(message_json(
+            6,
+            json!({"@type": "messageTopicThread", "message_thread_id": 3}),
+            json!({"@type": "messageSelfDestructTypeImmediately"}),
+        ))
+        .expect("message JSON");
+        let once = convert_message(once);
+        assert_eq!(once.topic, None);
+        assert_eq!(once.ttl, -1);
+        let plain: types::Message =
+            serde_json::from_value(message_json(7, Value::Null, Value::Null)).expect("JSON");
+        let plain = convert_message(plain);
+        assert_eq!((plain.topic, plain.ttl), (None, 0));
+    }
+
+    #[test]
+    fn forum_topics_secret_chats_and_rights_convert() {
+        let t: types::ForumTopic = serde_json::from_value(json!({
+            "@type": "forumTopic",
+            "info": {"@type": "forumTopicInfo", "chat_id": -100, "forum_topic_id": 9, "name": "Releases",
+                     "icon": {"@type": "forumTopicIcon", "color": 0x6FB9F0, "custom_emoji_id": "0"},
+                     "creation_date": 1, "creator_id": {"@type": "messageSenderUser", "user_id": 1},
+                     "is_general": false, "is_outgoing": true, "is_closed": true, "is_hidden": false, "is_name_implicit": false},
+            "order": "12345",
+            "is_pinned": true,
+            "unread_count": 4,
+            "last_read_inbox_message_id": 10,
+            "last_read_outbox_message_id": 11,
+            "unread_mention_count": 1,
+            "unread_reaction_count": 0,
+            "notification_settings": notification_json(100),
+        }))
+        .expect("topic JSON");
+        let t = convert_topic(t);
+        assert_eq!((t.id, t.name.as_str(), t.order), (9, "Releases", 12345));
+        assert!(t.pinned && t.closed && t.outgoing && t.muted && !t.use_default_mute);
+        assert_eq!((t.unread, t.mentions, t.last_read_inbox), (4, 1, 10));
+        assert_eq!(t.color, 0x6FB9F0);
+
+        let sc: types::SecretChat = serde_json::from_value(json!({
+            "@type": "secretChat", "id": 3, "user_id": 2,
+            "state": {"@type": "secretChatStatePending"}, "is_outbound": true, "key_hash": "", "layer": 144,
+        }))
+        .expect("secret chat JSON");
+        assert_eq!(
+            convert_secret(&sc),
+            SecretChat {
+                id: 3,
+                user_id: 2,
+                state: SecretState::Pending,
+                outbound: true
+            }
+        );
+
+        let admin: enums::ChatMemberStatus = serde_json::from_value(json!({
+            "@type": "chatMemberStatusAdministrator", "custom_title": "", "can_be_edited": false,
+            "rights": {"@type": "chatAdministratorRights", "can_manage_chat": false, "can_change_info": true, "can_post_messages": false, "can_edit_messages": false, "can_delete_messages": false, "can_invite_users": false, "can_restrict_members": false, "can_pin_messages": false, "can_manage_topics": true, "can_promote_members": false, "can_manage_video_chats": false, "can_post_stories": false, "can_edit_stories": false, "can_delete_stories": false, "can_manage_direct_messages": false, "is_anonymous": false},
+        }))
+        .expect("admin JSON");
+        assert_eq!(
+            convert_membership(&admin),
+            Membership::Admin(Rights {
+                manage_topics: true,
+                create_topics: true,
+                pin: false,
+                change_info: true
+            })
+        );
+        let left: enums::ChatMemberStatus = serde_json::from_value(json!({
+            "@type": "chatMemberStatusRestricted", "is_member": false, "restricted_until_date": 0,
+            "permissions": {"@type": "chatPermissions", "can_send_basic_messages": false, "can_send_audios": false, "can_send_documents": false, "can_send_photos": false, "can_send_videos": false, "can_send_video_notes": false, "can_send_voice_notes": false, "can_send_polls": false, "can_send_other_messages": false, "can_add_link_previews": false, "can_change_info": false, "can_invite_users": false, "can_pin_messages": false, "can_create_topics": false},
+        }))
+        .expect("restricted JSON");
+        assert_eq!(convert_membership(&left), Membership::Left);
+        assert_eq!(
+            message_topic(Some(4)),
+            Some(enums::MessageTopic::Forum(types::MessageTopicForum {
+                forum_topic_id: 4
+            }))
+        );
+        assert_eq!(message_topic(None), None);
     }
 }

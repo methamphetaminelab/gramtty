@@ -80,6 +80,27 @@ pub fn spawn_mpv(
     Ok(stop_tx)
 }
 
+const RUNNABLE_EXTENSIONS: [&str; 14] = [
+    "desktop", "sh", "bash", "zsh", "fish", "run", "bin", "appimage", "exe", "msi", "bat", "cmd",
+    "jar", "command",
+];
+
+pub fn runnable(path: &Path) -> Result<Option<&'static str>, String> {
+    use std::os::unix::fs::PermissionsExt;
+    let ext = path
+        .extension()
+        .map(|e| e.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    if RUNNABLE_EXTENSIONS.contains(&ext.as_str()) {
+        return Ok(Some("this file type can run as a program"));
+    }
+    let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    if meta.permissions().mode() & 0o111 != 0 {
+        return Ok(Some("the file is executable"));
+    }
+    Ok(None)
+}
+
 pub fn xdg_open(target: &str) -> Result<(), String> {
     std::process::Command::new("xdg-open")
         .arg(target)
@@ -221,6 +242,26 @@ mod tests {
         assert_eq!(std::fs::read(&b).unwrap(), b"abc");
         assert_eq!(sanitize("  "), "file");
         assert_eq!(unique_target(&out, "noext").file_name().unwrap(), "noext");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn runnable_files_are_not_handed_to_xdg_open() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = std::env::temp_dir().join(format!("gramtty-runnable-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let doc = dir.join("notes.pdf");
+        std::fs::write(&doc, b"x").unwrap();
+        std::fs::set_permissions(&doc, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(runnable(&doc), Ok(None));
+        let launcher = dir.join("Game.DESKTOP");
+        std::fs::write(&launcher, b"[Desktop Entry]").unwrap();
+        assert!(runnable(&launcher).unwrap().is_some());
+        let exe = dir.join("tool");
+        std::fs::write(&exe, b"x").unwrap();
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(runnable(&exe), Ok(Some("the file is executable")));
+        assert!(runnable(&dir.join("missing.pdf")).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
