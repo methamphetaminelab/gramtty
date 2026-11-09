@@ -45,6 +45,15 @@ Runtime tools, looked up on `PATH`:
 | `wl-copy`, `wl-paste` (wl-clipboard) | clipboard copy and `Ctrl+V` paste; Wayland only | optional |
 | `xdg-open` | opening files and links externally | optional |
 
+## Install from AUR (Arch Linux)
+
+```
+yay -S gramtty-bin   # prebuilt binary
+yay -S gramtty       # build from source
+```
+
+Any AUR helper works (`paru -S ...`), or manually: `git clone https://aur.archlinux.org/gramtty-bin.git && cd gramtty-bin && makepkg -si`.
+
 ## Build and run
 
 ```

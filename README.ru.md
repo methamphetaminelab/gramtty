@@ -45,6 +45,15 @@
 | `wl-copy`, `wl-paste` (wl-clipboard) | копирование и вставка `Ctrl+V`; только Wayland | нет |
 | `xdg-open` | открытие файлов и ссылок во внешней программе | нет |
 
+## Установка из AUR (Arch Linux)
+
+```
+yay -S gramtty-bin   # готовый бинарник
+yay -S gramtty       # сборка из исходников
+```
+
+Подойдёт любой AUR-помощник (`paru -S ...`) или вручную: `git clone https://aur.archlinux.org/gramtty-bin.git && cd gramtty-bin && makepkg -si`.
+
 ## Сборка и запуск
 
 ```
