@@ -1,6 +1,6 @@
 [package]
 name = "gramtty"
-version = "1.0.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.99"
 description = "A terminal Telegram client"
@@ -29,9 +29,13 @@ ratatui-image = { version = "11.0.8", default-features = false, features = ["cro
 thorvg = { version = "0.5.1", default-features = false, features = ["vendored", "lottie"] }
 flate2 = "1.1.5"
 base64 = "0.22.1"
-rustix = { version = "1.1.6", features = ["fs", "event", "termios"] }
+rustix = { version = "1.1.6", features = ["fs", "event", "termios", "shm"] }
+libloading = "0.8.9"
 
 [profile.release]
 lto = "thin"
 codegen-units = 4
 strip = true
+
+[patch.crates-io]
+tdlib-rs = { path = "vendor/tdlib-rs" }

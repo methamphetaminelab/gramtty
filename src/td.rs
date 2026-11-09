@@ -61,6 +61,8 @@ pub enum Event {
         error: String,
     },
     Image(crate::media::Done),
+    Anim(crate::anim::Done),
+    Video,
     Player {
         token: u64,
         result: Result<(), String>,
@@ -2455,6 +2457,7 @@ pub fn convert_content(content: MessageContent) -> Content {
         C::MessageChatChangeTitle(t) => Content::label(format!("changed title to «{}»", t.title)),
         C::MessageChatChangePhoto(_) => Content::label("changed the chat photo"),
         C::MessageChatDeletePhoto => Content::label("removed the chat photo"),
+        C::MessageChatSetBackground(_) => Content::label("changed the chat background"),
         C::MessageBasicGroupChatCreate(_) | C::MessageSupergroupChatCreate(_) => {
             Content::label("created the group")
         }
@@ -3293,6 +3296,73 @@ mod tests {
             "use_default_disable_mention_notifications": true,
             "disable_mention_notifications": false,
         })
+    }
+
+    #[test]
+    fn history_with_chat_background_without_background_object_loads() {
+        let mut bg = message_json(9, Value::Null, Value::Null);
+        bg["content"] = json!({
+            "@type": "messageChatSetBackground",
+            "old_background_message_id": 0,
+            "background": {"@type": "chatBackground", "dark_theme_dimming": 0},
+            "only_for_self": false
+        });
+        let page: enums::Messages = serde_json::from_value(json!({
+            "@type": "messages",
+            "total_count": 2,
+            "messages": [bg, message_json(8, Value::Null, Value::Null)]
+        }))
+        .expect("messages JSON with a background-less chatBackground");
+        let enums::Messages::Messages(page) = page;
+        let msgs: Vec<Msg> = page.messages.into_iter().flatten().map(convert_message).collect();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].media.as_deref(), Some("changed the chat background"));
+        assert_eq!(msgs[1].body.text, "hi");
+    }
+
+    #[test]
+    fn history_with_gift_without_background_loads() {
+        let file = json!({
+            "@type": "file", "id": 1, "size": 0, "expected_size": 0,
+            "local": {"@type": "localFile", "path": "", "can_be_downloaded": true,
+                "can_be_deleted": false, "is_downloading_active": false,
+                "is_downloading_completed": false, "download_offset": 0,
+                "downloaded_prefix_size": 0, "downloaded_size": 0},
+            "remote": {"@type": "remoteFile", "id": "", "unique_id": "",
+                "is_uploading_active": false, "is_uploading_completed": true, "uploaded_size": 0},
+        });
+        let sender = json!({"@type": "messageSenderUser", "user_id": 7});
+        let mut gift = message_json(9, Value::Null, Value::Null);
+        gift["content"] = json!({
+            "@type": "messageGift",
+            "gift": {
+                "@type": "gift", "id": "1", "publisher_chat_id": 0,
+                "sticker": {"@type": "sticker", "id": "2", "set_id": "3", "width": 512,
+                    "height": 512, "emoji": "🎁", "format": {"@type": "stickerFormatTgs"},
+                    "full_type": {"@type": "stickerFullTypeRegular"}, "sticker": file},
+                "star_count": 15, "default_sell_star_count": 13, "upgrade_star_count": 0,
+                "upgrade_variant_count": 0, "has_colors": false, "is_for_birthday": false,
+                "is_premium": false, "next_send_date": 0, "first_send_date": 0,
+                "last_send_date": 0
+            },
+            "sender_id": sender, "receiver_id": sender, "received_gift_id": "",
+            "text": {"@type": "formattedText", "text": "", "entities": []},
+            "unique_gift_number": 0, "sell_star_count": 13, "prepaid_upgrade_star_count": 0,
+            "is_upgrade_separate": false, "is_from_auction": false, "is_private": false,
+            "is_saved": false, "is_prepaid_upgrade": false, "can_be_upgraded": false,
+            "was_converted": false, "was_upgraded": false, "was_refunded": false,
+            "upgraded_received_gift_id": "", "prepaid_upgrade_hash": ""
+        });
+        let page: enums::Messages = serde_json::from_value(json!({
+            "@type": "messages",
+            "total_count": 2,
+            "messages": [gift, message_json(8, Value::Null, Value::Null)]
+        }))
+        .expect("messages JSON with a gift that has no background");
+        let enums::Messages::Messages(page) = page;
+        let msgs: Vec<Msg> = page.messages.into_iter().flatten().map(convert_message).collect();
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[1].body.text, "hi");
     }
 
     #[test]

@@ -1,4 +1,5 @@
 use chrono::{DateTime, Datelike, Local, TimeZone};
+use ratatui::buffer::CellWidth;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
@@ -413,10 +414,10 @@ fn private_use(c: char) -> bool {
 }
 
 pub fn grapheme_cells(g: &str) -> usize {
-    if g.len() == 1 {
-        usize::from(!g.as_bytes()[0].is_ascii_control())
+    if g.contains(char::is_control) {
+        0
     } else {
-        g.width()
+        usize::from(g.cell_width())
     }
 }
 

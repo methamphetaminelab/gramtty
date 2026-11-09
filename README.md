@@ -8,7 +8,7 @@ Terminal Telegram client in Rust on TDLib.
 
 - Login by QR code, phone number, login code, email code and 2FA password
 - Chats, folders, forum topics, secret chats
-- Inline media in the terminal: photos, albums, video, video notes, stickers, voice, files (kitty graphics; sixel, iTerm2 and half-block fallbacks); playback in mpv
+- Inline media in the terminal: photos, albums, video, video notes, stickers, voice, files (kitty graphics; sixel, iTerm2 and half-block fallbacks); animated stickers and GIFs play right in the chat in kitty; video, video notes, GIFs, voice and music play with sound inside the viewer in kitty (libmpv), or in a separate mpv window
 - Sending: files, albums, clipboard paste, voice messages, stickers and GIFs; upload progress and cancel
 - Reactions, replies, edit, delete, forward, pin, copy, translate, save to Saved Messages
 - Message search, pinned messages, notification inbox
@@ -35,8 +35,9 @@ Runtime tools, looked up on `PATH`:
 
 | Tool | Used for | Required |
 |---|---|---|
-| `mpv` | playing video, video notes and voice | for playback |
-| `ffmpeg` | video and sticker previews, upload thumbnails | for previews |
+| `libmpv` (`mpv` package) | playing media with sound inside the viewer (kitty only; libmpv.so.2 is loaded dynamically, not from `PATH`) | optional |
+| `mpv` | playing media in a separate window (`x`) | optional |
+| `ffmpeg` | video and sticker previews, inline WebM stickers and GIFs, upload thumbnails | for previews |
 | `ffprobe` | probing media before upload | optional |
 | `pw-record` (PipeWire) and `opusenc` or `ffmpeg` with libopus | recording voice messages | optional |
 | `notify-send` (libnotify) | desktop notifications | optional |
@@ -87,7 +88,8 @@ Vim-style. `Space` is the leader key: press it and a popup lists every continuat
 | `R` `e` `d` | reply, edit, delete |
 | `r` `f` `y` `P` | react, forward, copy text, pin or unpin |
 | `o` | open URL in the message |
-| `v` / `x` | view attachment / play or open media |
+| `v` / `x` | view attachment (media plays inside it) / play in mpv or open |
+| in the viewer: `Space` `←` `→` `↑` `↓` `m` | pause, seek ∓5 s, volume ±5, mute |
 | `Space u` | attach file (composer: `Ctrl-o`) |
 | `Space v` | record voice message (composer: `Ctrl-r`) |
 | `Space s` | stickers and GIFs (composer: `Ctrl-s`, `Ctrl-g`) |
@@ -111,7 +113,7 @@ Keys are remapped in `~/.config/gramtty/keymap.toml`, under `[keymap]`: `leader 
 Files in `~/.config/gramtty/` (`$XDG_CONFIG_HOME` is honoured):
 
 - `api.toml`: API credentials
-- `config.toml`: settings; `Space o` edits and saves it. Sections: `[notifications]`, `[privacy]`, `[appearance]`, `[navigation]`, `[chats]`. Unknown keys are rejected
+- `config.toml`: settings; `Space o` edits and saves it. Sections: `[notifications]`, `[privacy]`, `[appearance]`, `[navigation]`, `[chats]`, `[media]`. Unknown keys are rejected
 - `theme.toml`: custom theme, used when `appearance.theme = "custom"`. Reloaded on save, no restart needed
 - `keymap.toml`: key bindings
 

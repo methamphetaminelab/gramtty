@@ -1,4 +1,5 @@
 mod admin;
+mod anim;
 mod app;
 mod archive;
 mod bots;
@@ -21,6 +22,7 @@ mod termprobe;
 mod theme;
 mod ui;
 mod upload;
+mod video;
 mod voice;
 
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
@@ -136,10 +138,35 @@ async fn run() -> Result<(), String> {
     let td = Td::new(tx.clone());
     td.start();
 
-    let mut terminal = ratatui::init();
+    drop(ratatui::init());
+    let mut terminal = match ratatui::Terminal::new(ui::Resync(
+        ratatui::backend::CrosstermBackend::new(std::io::stdout()),
+    )) {
+        Ok(t) => t,
+        Err(e) => {
+            ratatui::restore();
+            return Err(format!("terminal: {e}"));
+        }
+    };
     let _ = execute!(std::io::stdout(), EnableBracketedPaste, EnableFocusChange);
+    let tmux = probe.image.as_ref().is_some_and(|i| i.tmux);
     let (picker, picker_warning) = image_picker(probe);
+    let native_animation = picker.protocol_type() == ProtocolType::Kitty
+        && !tmux
+        && anim::kitty_terminal(
+            std::env::var("TERM").ok().as_deref(),
+            std::env::var("KITTY_WINDOW_ID").ok().as_deref(),
+        );
     let mut app = App::new(td, creds, data_dir, keymap, picker);
+    if native_animation {
+        match config::cache_dir() {
+            Ok(dir) => app.media.anim.enable(dir.join("anim")),
+            Err(e) => warnings.push(format!("inline animations are off: {e}")),
+        }
+    }
+    if native_animation {
+        app.inline.enable();
+    }
     app.settings = settings;
     app.settings_path = Some(settings_path);
     app.set_theme(theme);
@@ -162,9 +189,17 @@ async fn run() -> Result<(), String> {
     let settled = input_barrier().and_then(|()| {
         termprobe::settle_stdio().map_err(|e| format!("cannot drain terminal input: {e}"))
     });
+    let mut out = std::io::stdout();
+    app.inline.stop();
+    let cleared = app
+        .inline
+        .flush(&mut out)
+        .and_then(|()| app.media.anim.shutdown(&mut out))
+        .and_then(|()| std::io::Write::flush(&mut out))
+        .map_err(|e| format!("terminal: {e}"));
     let _ = execute!(std::io::stdout(), DisableBracketedPaste, DisableFocusChange);
     ratatui::restore();
-    result.and(settled)
+    result.and(settled).and(cleared)
 }
 
 struct Probed {
@@ -298,7 +333,9 @@ fn image_picker(probe: Probed) -> (Picker, Option<String>) {
 }
 
 async fn event_loop(
-    terminal: &mut ratatui::DefaultTerminal,
+    terminal: &mut ratatui::Terminal<
+        ui::Resync<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
+    >,
     app: &mut App,
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
 ) -> Result<(), String> {

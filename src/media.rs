@@ -113,10 +113,12 @@ pub struct Media {
     failed_files: HashMap<i32, String>,
     downloads: Vec<(i32, i32)>,
     epoch: u64,
+    pub anim: crate::anim::Anim,
 }
 
 impl Media {
     pub fn new(picker: Picker, tx: UnboundedSender<Event>) -> Self {
+        let anim = crate::anim::Anim::new(tx.clone());
         Self {
             picker,
             tx,
@@ -129,6 +131,7 @@ impl Media {
             failed_files: HashMap::new(),
             downloads: Vec::new(),
             epoch: 0,
+            anim,
         }
     }
 
@@ -245,6 +248,7 @@ impl Media {
             });
         }
         self.evict();
+        self.anim.end_frame();
         self.frame += 1;
     }
 
@@ -260,6 +264,11 @@ impl Media {
             };
             entry.clean = false;
         }
+    }
+
+    #[cfg(test)]
+    pub fn download_wanted(&self, file_id: i32) -> bool {
+        self.requested.contains(&file_id) || self.downloads.iter().any(|(id, _)| *id == file_id)
     }
 
     #[cfg(test)]
@@ -306,6 +315,7 @@ impl Media {
         self.requested.clear();
         self.failed_files.clear();
         self.downloads.clear();
+        self.anim.reset();
         self.epoch += 1;
     }
 
@@ -317,6 +327,7 @@ impl Media {
             && self.requested.is_empty()
             && self.failed_files.is_empty()
             && self.downloads.is_empty()
+            && self.anim.is_empty()
     }
 
     pub fn stats(&self) -> (usize, u64) {
@@ -443,7 +454,7 @@ pub fn decode_raster(bytes: &[u8]) -> Result<DynamicImage, String> {
     reader.decode().map_err(|e| format!("decode: {e}"))
 }
 
-fn read_tgs(path: &str) -> Result<Vec<u8>, String> {
+pub fn read_tgs(path: &str) -> Result<Vec<u8>, String> {
     check_size(path, MAX_SOURCE_BYTES)?;
     let raw = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
     if raw.starts_with(&[0x1f, 0x8b]) {
@@ -466,7 +477,58 @@ pub fn render_lottie(
     box_px: (u32, u32),
     animate: bool,
 ) -> Result<Vec<(DynamicImage, Duration)>, String> {
+    let mut out = Vec::new();
+    lottie_frames(
+        json,
+        box_px,
+        |source_frames, duration| viewer_frames(source_frames, duration, animate),
+        |img, delay| {
+            out.push((DynamicImage::ImageRgba8(img), delay));
+            Ok(())
+        },
+    )?;
+    Ok(out)
+}
+
+fn viewer_frames(source_frames: usize, duration: f32, animate: bool) -> Vec<(usize, Duration)> {
+    let count = if animate {
+        let by_time = if duration.is_finite() && duration > 0.0 {
+            (duration / MIN_FRAME_DELAY.as_secs_f32()).floor().max(1.0) as usize
+        } else {
+            MAX_ANIMATION_FRAMES
+        };
+        source_frames.min(MAX_ANIMATION_FRAMES).min(by_time).max(1)
+    } else {
+        1
+    };
+    let delay = if count > 1 && duration.is_finite() && duration > 0.0 {
+        Duration::from_secs_f32(duration / count as f32).max(MIN_FRAME_DELAY)
+    } else {
+        Duration::from_millis(100)
+    };
+    (0..count)
+        .map(|i| {
+            let index = if count > 1 {
+                i * (source_frames - 1) / (count - 1)
+            } else {
+                0
+            };
+            (index, delay)
+        })
+        .collect()
+}
+
+pub fn lottie_frames(
+    json: &[u8],
+    box_px: (u32, u32),
+    pick: impl FnOnce(usize, f32) -> Vec<(usize, Duration)>,
+    mut each: impl FnMut(RgbaImage, Duration) -> Result<(), String>,
+) -> Result<(), String> {
     use thorvg::{ColorSpace, EngineOption, Paint as _, Thorvg};
+    static THORVG: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = THORVG
+        .lock()
+        .map_err(|_| "lottie: renderer lock poisoned".to_owned())?;
     let engine = Thorvg::init().map_err(|e| format!("lottie: init: {e}"))?;
     let mut anim = engine
         .lottie_animation()
@@ -492,31 +554,13 @@ pub fn render_lottie(
     } else {
         1
     };
-    let count = if animate {
-        let by_time = if duration.is_finite() && duration > 0.0 {
-            (duration / MIN_FRAME_DELAY.as_secs_f32()).floor().max(1.0) as usize
-        } else {
-            MAX_ANIMATION_FRAMES
-        };
-        source_frames.min(MAX_ANIMATION_FRAMES).min(by_time).max(1)
-    } else {
-        1
-    };
-    let delay = if count > 1 && duration.is_finite() && duration > 0.0 {
-        Duration::from_secs_f32(duration / count as f32).max(MIN_FRAME_DELAY)
-    } else {
-        Duration::from_millis(100)
-    };
-    let mut out = Vec::with_capacity(count);
-    for i in 0..count {
-        let index = if count > 1 {
-            i * (source_frames - 1) / (count - 1)
-        } else {
-            0
-        };
-        if index > 0 {
+    let mut current = 0;
+    for (index, delay) in pick(source_frames, duration) {
+        let index = index.min(source_frames - 1);
+        if index != current {
             anim.set_frame(index as f32)
                 .map_err(|e| format!("lottie: frame {index}: {e}"))?;
+            current = index;
         }
         let picture = anim
             .picture()
@@ -536,9 +580,9 @@ pub fn render_lottie(
         drop(canvas);
         let rgba: Vec<u8> = pixels.iter().flat_map(|p| p.to_le_bytes()).collect();
         let img = RgbaImage::from_raw(w, h, rgba).ok_or_else(|| "lottie: buffer".to_owned())?;
-        out.push((DynamicImage::ImageRgba8(img), delay));
+        each(img, delay)?;
     }
-    Ok(out)
+    Ok(())
 }
 
 pub fn ffmpeg_args(path: &str, alpha_codec: bool) -> Vec<String> {
@@ -576,7 +620,7 @@ struct Capped {
     stderr: Vec<u8>,
 }
 
-fn drain(
+pub fn drain(
     mut pipe: impl Read + Send + 'static,
 ) -> std::thread::JoinHandle<std::io::Result<Vec<u8>>> {
     std::thread::spawn(move || {

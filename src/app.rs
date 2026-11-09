@@ -144,6 +144,7 @@ impl Row {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FileJob {
     Play(MediaKind, (i64, usize)),
+    Inline(MediaKind, (i64, usize)),
     Open,
     Save(String),
     CopyImage,
@@ -305,7 +306,7 @@ pub struct ButtonsView {
     pub sel: usize,
 }
 
-pub const OPTIONS: [(&str, &str); 26] = [
+pub const OPTIONS: [(&str, &str); 29] = [
     (
         "Desktop notifications",
         "notify-send for new messages in unmuted chats and mentions",
@@ -410,6 +411,18 @@ pub const OPTIONS: [(&str, &str); 26] = [
         "Hide my phone number",
         "show \"hidden\" instead of your own number in your profile, handy for screenshots",
     ),
+    (
+        "Inline animations",
+        "play animated stickers and GIFs in the chat: all visible, selected only or off; kitty only",
+    ),
+    (
+        "Max animations on screen",
+        "how many stickers and GIFs play at once, the rest stay still; h/l change",
+    ),
+    (
+        "Pause animations when unfocused",
+        "stop inline animations while the terminal window is not focused",
+    ),
 ];
 
 pub const OPTION_GROUPS: [(&str, &[usize]); 5] = [
@@ -440,13 +453,22 @@ pub const OPTION_GROUPS: [(&str, &[usize]); 5] = [
             FOLDER_COUNTER_OPTION,
             FOLDER_UNMUTED_OPTION,
             HIDE_ALL_CHATS_OPTION,
+            ANIMATIONS_OPTION,
+            MAX_ANIMATIONS_OPTION,
         ],
     ),
     (
         "Chats",
         &[TRANSLATE_OPTION, PHOTOS_AS_FILES_OPTION, SAVE_TARGET_OPTION],
     ),
-    ("Behaviour", &[OPEN_FOCUS_OPTION, AFTER_SEND_OPTION]),
+    (
+        "Behaviour",
+        &[
+            OPEN_FOCUS_OPTION,
+            AFTER_SEND_OPTION,
+            PAUSE_ANIMATIONS_OPTION,
+        ],
+    ),
 ];
 
 pub fn option_order() -> impl Iterator<Item = usize> {
@@ -474,6 +496,9 @@ pub fn option_key(index: usize) -> char {
         PHOTOS_AS_FILES_OPTION => 'p',
         SAVE_TARGET_OPTION => 'v',
         HIDE_PHONE_OPTION => 'z',
+        ANIMATIONS_OPTION => 'e',
+        MAX_ANIMATIONS_OPTION => 'r',
+        PAUSE_ANIMATIONS_OPTION => 'w',
         _ => 'm',
     }
 }
@@ -509,6 +534,9 @@ pub const TRANSLATE_OPTION: usize = 22;
 pub const PHOTOS_AS_FILES_OPTION: usize = 23;
 pub const SAVE_TARGET_OPTION: usize = 24;
 pub const HIDE_PHONE_OPTION: usize = 25;
+pub const ANIMATIONS_OPTION: usize = 26;
+pub const MAX_ANIMATIONS_OPTION: usize = 27;
+pub const PAUSE_ANIMATIONS_OPTION: usize = 28;
 
 pub struct FilePicker {
     pub input: TextInput,
@@ -613,6 +641,7 @@ pub struct App {
     pub status: Option<(String, bool)>,
     pub media: Media,
     pub playing: Option<Playing>,
+    pub inline: crate::video::Inline,
     next_token: u64,
     file_jobs: Vec<(i32, FileJob)>,
     pub anim_start: Instant,
@@ -664,6 +693,11 @@ pub struct App {
     pub blocked: std::collections::HashSet<Sender>,
     blocked_loaded: bool,
     pub revealed: std::collections::HashSet<(i64, i64)>,
+    pub visible_msgs: Vec<i64>,
+    view_key: Option<(i64, Option<i32>)>,
+    view_since: HashMap<i64, Instant>,
+    pub chat_profiles: HashMap<i64, Profile>,
+    profile_asked: std::collections::HashSet<i64>,
 }
 
 impl App {
@@ -728,6 +762,7 @@ impl App {
             status: None,
             media,
             playing: None,
+            inline: crate::video::Inline::default(),
             next_token: 0,
             file_jobs: Vec::new(),
             anim_start: Instant::now(),
@@ -783,6 +818,11 @@ impl App {
             blocked: std::collections::HashSet::new(),
             blocked_loaded: false,
             revealed: std::collections::HashSet::new(),
+            visible_msgs: Vec::new(),
+            view_key: None,
+            view_since: HashMap::new(),
+            chat_profiles: HashMap::new(),
+            profile_asked: std::collections::HashSet::new(),
         }
     }
 
@@ -791,13 +831,21 @@ impl App {
     }
 
     pub fn tick_interval(&self) -> Option<std::time::Duration> {
-        if self.animating || self.recording.as_ref().is_some_and(|r| !r.stopping) {
+        let redraw = if self.inline.waiting() {
+            Some(std::time::Duration::from_millis(10))
+        } else if self.animating || self.recording.as_ref().is_some_and(|r| !r.stopping) {
             Some(std::time::Duration::from_millis(50))
         } else if !self.typing.is_empty() {
             Some(std::time::Duration::from_millis(500))
         } else {
             None
-        }
+        };
+        let view = self
+            .view_since
+            .values()
+            .min()
+            .map(|t| VIEW_DELAY.saturating_sub(t.elapsed()));
+        redraw.into_iter().chain(view).min()
     }
 
     pub fn set_status(&mut self, text: impl Into<String>, error: bool) {
@@ -839,6 +887,11 @@ impl App {
                     && h.epoch == epoch
                 {
                     h.older_failed(std::time::Instant::now());
+                    if self.pending_open.is_some_and(|p| p.chat_id == chat_id) {
+                        self.pending_open = None;
+                        let mode = self.settings.navigation.open_chat_focus;
+                        self.finish_open(mode != OpenFocus::Messages, None);
+                    }
                 }
                 self.set_status(format!("load history: {error}"), true);
             }
@@ -888,6 +941,8 @@ impl App {
                 }
             }
             Event::Image(done) => self.media.on_done(done),
+            Event::Video => {}
+            Event::Anim(done) => self.media.anim.on_done(done),
             Event::Player { token, result } => {
                 if self.playing.as_ref().is_some_and(|p| p.token == token) {
                     self.playing = None;
@@ -911,6 +966,16 @@ impl App {
                 self.set_status(e, true);
             }
             Event::Profile(target, result) => {
+                if let ProfileTarget::Chat(id) = target
+                    && self.profile_asked.contains(&id)
+                {
+                    match &result {
+                        Ok(data) => {
+                            self.chat_profiles.insert(id, data.clone());
+                        }
+                        Err(e) => self.set_status(format!("chat info: {e}"), true),
+                    }
+                }
                 if let Some(Popup::Profile(p)) = &mut self.popup
                     && p.target == target
                 {
@@ -1169,7 +1234,23 @@ impl App {
 
     fn run_file_job(&mut self, path: &str, job: FileJob) {
         match job {
+            FileJob::Inline(kind, target) => {
+                if self.viewer_target() != Some(target) || self.inline.requested != Some(target) {
+                    return;
+                }
+                self.stop_playback();
+                let id = self.media.anim.reserve_id();
+                let tx = self.td.sender();
+                let notify = move || {
+                    let _ = tx.send(Event::Video);
+                };
+                match self.inline.play(target, kind, path, id, notify) {
+                    Ok(()) => self.status = None,
+                    Err(e) => self.set_status(format!("{e}; x opens mpv"), true),
+                }
+            }
             FileJob::Play(kind, target) => {
+                self.inline.stop();
                 self.stop_playback();
                 self.next_token += 1;
                 let token = self.next_token;
@@ -1858,6 +1939,11 @@ impl App {
         self.blocked.clear();
         self.blocked_loaded = false;
         self.revealed.clear();
+        self.visible_msgs.clear();
+        self.view_key = None;
+        self.view_since.clear();
+        self.chat_profiles.clear();
+        self.profile_asked.clear();
         self.media.reset();
     }
 
@@ -1917,6 +2003,11 @@ impl App {
             ("blocked", self.blocked.is_empty()),
             ("blocked_loaded", !self.blocked_loaded),
             ("revealed", self.revealed.is_empty()),
+            ("visible_msgs", self.visible_msgs.is_empty()),
+            ("view_key", self.view_key.is_none()),
+            ("view_since", self.view_since.is_empty()),
+            ("chat_profiles", self.chat_profiles.is_empty()),
+            ("profile_asked", self.profile_asked.is_empty()),
         ];
         checks
             .into_iter()
@@ -2841,7 +2932,7 @@ impl App {
     }
 
     fn mark_read(&mut self) {
-        if !self.settings.auto_read() {
+        if !self.settings.auto_read() || !self.term_focused {
             return;
         }
         let Some(chat_id) = self.open_chat else {
@@ -2862,7 +2953,7 @@ impl App {
         if topic.is_none() && self.is_forum(chat_id) {
             return;
         }
-        let flagged = h.get(id).is_some_and(|m| m.mention || m.unread_reaction);
+        let flagged = h.get(id).is_some_and(view_clears);
         let unread = match topic.and_then(|t| self.topic(chat_id, t)) {
             Some(t) => t.unread > 0 || t.last_read_inbox < id,
             None => self
@@ -2871,22 +2962,117 @@ impl App {
                 .is_some_and(|c| c.unread > 0 || c.last_read_inbox < id),
         };
         let fresh = unread && self.last_viewed.get(&chat_id).is_none_or(|v| *v < id);
-        if !fresh && !flagged {
+        let flagged = if flagged { vec![id] } else { Vec::new() };
+        self.report_viewed(chat_id, topic, flagged, fresh.then_some(id));
+    }
+
+    fn report_viewed(
+        &mut self,
+        chat_id: i64,
+        topic: Option<i32>,
+        mut ids: Vec<i64>,
+        read_to: Option<i64>,
+    ) {
+        ids.extend(read_to);
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
             return;
         }
-        self.td.view_messages(chat_id, vec![id], topic);
-        if flagged && let Some(m) = self.histories.get_mut(&chat_id).and_then(|h| h.get_mut(id)) {
-            m.mention = false;
-            m.unread_reaction = false;
+        self.td.view_messages(chat_id, ids.clone(), topic);
+        if let Some(h) = self.histories.get_mut(&chat_id) {
+            for id in &ids {
+                if let Some(m) = h.get_mut(*id) {
+                    if view_clears_mention(m) {
+                        m.mention = false;
+                    }
+                    m.unread_reaction = false;
+                }
+            }
         }
-        if fresh {
-            self.last_viewed.insert(chat_id, id);
+        if let Some(id) = read_to {
+            let seen = self.last_viewed.entry(chat_id).or_insert(id);
+            *seen = (*seen).max(id);
             if let Some(t) = topic
                 && let Some(list) = self.topics.get_mut(&chat_id)
             {
                 list.mark_read_up_to(t, id);
             }
         }
+    }
+
+    fn view_target(&self) -> Option<(i64, Option<i32>)> {
+        if self.auth != Auth::Ready
+            || !self.term_focused
+            || self.popup.is_some()
+            || self.pending_open.is_some()
+            || !self.settings.auto_read()
+        {
+            return None;
+        }
+        let chat_id = self.open_chat?;
+        let topic = self.histories.get(&chat_id)?.topic;
+        (topic.is_some() || !self.is_forum(chat_id)).then_some((chat_id, topic))
+    }
+
+    fn read_floor(&self, chat_id: i64, topic: Option<i32>) -> Option<i64> {
+        let (unread, last_read) = match topic.and_then(|t| self.topic(chat_id, t)) {
+            Some(t) => (t.unread, t.last_read_inbox),
+            None => self
+                .chats
+                .get(&chat_id)
+                .map(|c| (c.unread, c.last_read_inbox))?,
+        };
+        let viewed = self.last_viewed.get(&chat_id).copied().unwrap_or(0);
+        (unread > 0).then_some(last_read.max(viewed))
+    }
+
+    pub fn flush_views(&mut self, now: Instant) {
+        let target = self.view_target();
+        if target != self.view_key {
+            self.view_key = target;
+            self.view_since.clear();
+        }
+        let Some((chat_id, topic)) = target else {
+            return;
+        };
+        let Some(h) = self.histories.get(&chat_id) else {
+            return;
+        };
+        let floor = self.read_floor(chat_id, topic);
+        let mut flagged = Vec::new();
+        let mut unread = Vec::new();
+        for m in self.visible_msgs.iter().filter_map(|id| h.get(*id)) {
+            if m.deleted {
+                continue;
+            }
+            if view_clears(m) {
+                flagged.push(m.id);
+            }
+            if !m.outgoing && floor.is_some_and(|f| m.id > f) {
+                unread.push(m.id);
+            }
+        }
+        self.view_since
+            .retain(|id, _| flagged.contains(id) || unread.contains(id));
+        for id in flagged.iter().chain(&unread) {
+            self.view_since.entry(*id).or_insert(now);
+        }
+        let due = |id: &i64| {
+            self.view_since
+                .get(id)
+                .is_some_and(|t| now.saturating_duration_since(*t) >= VIEW_DELAY)
+        };
+        flagged.retain(due);
+        unread.retain(due);
+        if flagged.is_empty() && unread.is_empty() {
+            return;
+        }
+        for id in flagged.iter().chain(&unread) {
+            self.view_since.remove(id);
+        }
+        let read_to = unread.into_iter().max();
+        self.report_viewed(chat_id, topic, flagged, read_to);
     }
 
     fn on_enter(&mut self) {
@@ -2943,6 +3129,7 @@ impl App {
             }
             self.open_chat = Some(chat_id);
             self.td.open_chat(chat_id);
+            self.profile_asked.remove(&chat_id);
             self.reset_history(chat_id, topic, 0);
             self.pinned_msg.remove(&chat_id);
             self.td.load_pinned(chat_id);
@@ -3863,11 +4050,68 @@ impl App {
     }
 
     fn viewable_items(&self) -> Vec<(i64, usize)> {
+        let inline = self.inline.available().is_ok();
         self.group_attachments()
             .into_iter()
-            .filter(|(_, _, a)| a.viewable())
+            .filter(|(_, _, a)| a.viewable() || (inline && crate::video::playable(a.kind)))
             .map(|(m, i, _)| (m, i))
             .collect()
+    }
+
+    fn viewer_target(&self) -> Option<(i64, usize)> {
+        match &self.popup {
+            Some(Popup::Viewer { items, pos, .. }) => items.get(*pos).copied(),
+            _ => None,
+        }
+    }
+
+    fn start_inline(&mut self, msg_id: i64, idx: usize, att: &Attachment) {
+        self.inline.requested = Some((msg_id, idx));
+        let name = attachment_name(att, msg_id);
+        self.queue_file_job(&att.file, &name, FileJob::Inline(att.kind, (msg_id, idx)));
+    }
+
+    pub fn sync_inline(&mut self) {
+        if let Some(e) = self.inline.sync() {
+            self.set_status(format!("{e}; x opens mpv"), true);
+        }
+        let current = self.viewer_current();
+        let target = current.as_ref().map(|c| (c.1, c.2));
+        if self.inline.active().is_some() && self.inline.active() != target {
+            self.inline.stop();
+        }
+        if self.inline.requested.is_some() && self.inline.requested != target {
+            self.inline.requested = None;
+            self.file_jobs
+                .retain(|(_, j)| !matches!(j, FileJob::Inline(..)));
+        }
+        if let Some((_, msg_id, idx, att)) = current
+            && self.inline.requested.is_none()
+            && crate::video::playable(att.kind)
+            && self.inline.available().is_ok()
+        {
+            self.start_inline(msg_id, idx, &att);
+        }
+    }
+
+    fn viewer_space(&mut self) {
+        if self.inline.active().is_some() {
+            self.inline.toggle_pause();
+            return;
+        }
+        let Some((_, msg_id, idx, att)) = self.viewer_current() else {
+            return;
+        };
+        if !crate::video::playable(att.kind) {
+            return;
+        }
+        match self.inline.available() {
+            Ok(()) => {
+                self.stop_playback();
+                self.start_inline(msg_id, idx, &att);
+            }
+            Err(e) => self.set_status(format!("{e}; x opens mpv"), true),
+        }
     }
 
     fn viewer_current(&self) -> Option<(i64, i64, usize, Attachment)> {
@@ -5014,8 +5258,27 @@ impl App {
             },
             Popup::Viewer { items, pos, .. } => {
                 let len = items.len();
+                let live = self.inline.active().is_some();
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('v') => self.popup = None,
+                    KeyCode::Char(' ') => self.viewer_space(),
+                    KeyCode::Left | KeyCode::Right if live => {
+                        let step = if key.code == KeyCode::Left {
+                            -crate::video::SEEK_SECONDS
+                        } else {
+                            crate::video::SEEK_SECONDS
+                        };
+                        self.inline.command(&format!("seek {step} relative"));
+                    }
+                    KeyCode::Up | KeyCode::Down if live => {
+                        let step = if key.code == KeyCode::Down {
+                            -crate::video::VOLUME_STEP
+                        } else {
+                            crate::video::VOLUME_STEP
+                        };
+                        self.inline.command(&format!("add volume {step}"));
+                    }
+                    KeyCode::Char('m') if live => self.inline.command("cycle mute"),
                     KeyCode::Char('j' | 'l' | 'n') | KeyCode::Down | KeyCode::Right => {
                         if *pos + 1 < len {
                             *pos += 1;
@@ -5029,6 +5292,9 @@ impl App {
                         }
                     }
                     KeyCode::Char('x') | KeyCode::Enter => {
+                        self.inline.stop();
+                        self.file_jobs
+                            .retain(|(_, j)| !matches!(j, FileJob::Inline(..)));
                         if let Some((chat_id, msg_id, idx, att)) = self.viewer_current() {
                             self.play_attachment(chat_id, msg_id, idx, att);
                         }
@@ -5248,10 +5514,33 @@ impl App {
             self.td.load_custom_emoji(ids);
         }
         self.media.end_frame(&self.td);
+        if let Some(e) = self.media.anim.take_error() {
+            self.set_status(e, true);
+        }
+        if self.show_info
+            && let Some(id) = self.open_chat
+            && self.profile_asked.insert(id)
+        {
+            self.td.load_profile(ProfileTarget::Chat(id));
+        }
+        self.flush_views(Instant::now());
     }
 }
 
+fn view_clears_mention(m: &Msg) -> bool {
+    m.mention
+        && !m
+            .attachments
+            .iter()
+            .any(|a| matches!(a.kind, MediaKind::Voice | MediaKind::VideoNote))
+}
+
+fn view_clears(m: &Msg) -> bool {
+    m.unread_reaction || view_clears_mention(m)
+}
+
 const WAITING_BOT: &str = "waiting for the bot...";
+const VIEW_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 const INBOX_MAX: usize = 200;
 const TYPING_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
 
@@ -5460,7 +5749,6 @@ impl App {
         if msg.outgoing {
             return;
         }
-        let following = self.msg_sel.is_none() && self.bottom_offset == 0;
         let sound_on = self.settings.notifications.sound && !self.sound_broken;
         let cand = notify::Candidate {
             enabled: self.settings.notifications.desktop && !self.notify_broken,
@@ -5472,11 +5760,10 @@ impl App {
             mention: msg.mention,
             viewing: self.term_focused
                 && self.open_chat == Some(msg.chat_id)
-                && following
                 && self
                     .histories
                     .get(&msg.chat_id)
-                    .is_some_and(|h| h.accepts(msg)),
+                    .is_none_or(|h| h.accepts(msg)),
             age: unix_now() - msg.date,
         };
         if !notify::worth_inbox(&cand) {
@@ -5921,6 +6208,9 @@ impl App {
             PHOTOS_AS_FILES_OPTION => check(self.settings.chats.photos_as_files),
             SAVE_TARGET_OPTION => self.save_target_name(),
             HIDE_PHONE_OPTION => check(self.settings.privacy.hide_phone),
+            ANIMATIONS_OPTION => self.settings.media.animations.name().to_owned(),
+            MAX_ANIMATIONS_OPTION => self.settings.media.max_animations().to_string(),
+            PAUSE_ANIMATIONS_OPTION => check(self.settings.media.pause_unfocused),
             _ => String::new(),
         }
     }
@@ -6223,6 +6513,15 @@ impl App {
             PHOTOS_AS_FILES_OPTION => {
                 let c = &mut self.settings.chats;
                 c.photos_as_files = flip(c.photos_as_files);
+            }
+            ANIMATIONS_OPTION => {
+                let m = &mut self.settings.media;
+                m.animations = m.animations.step(fwd);
+            }
+            MAX_ANIMATIONS_OPTION => self.settings.media.step_max(dir),
+            PAUSE_ANIMATIONS_OPTION => {
+                let m = &mut self.settings.media;
+                m.pause_unfocused = flip(m.pause_unfocused);
             }
             SAVE_TARGET_OPTION => {
                 if dir.is_some() {
@@ -8291,6 +8590,38 @@ mod tests {
     }
 
     #[test]
+    fn failed_older_page_while_finding_first_unread_still_opens_and_reads() {
+        let (mut app, log) = fake_app(Settings::default());
+        set_unread(&mut app, 20, 99, 0);
+        app.enter_chat(20);
+        history(&mut app, 20, 1..=40);
+        assert_eq!(count(&log, "load history"), 2);
+        app.handle(Event::HistoryFailed {
+            chat_id: 20,
+            epoch: 0,
+            error: "cannot decode TDLib response (500)".to_owned(),
+        });
+        assert!(app.pending_open.is_none());
+        assert_eq!(app.focus, Pane::Messages);
+        assert_eq!(count(&log, "mark read"), 1);
+        assert!(app.view_target().is_some());
+    }
+
+    #[test]
+    fn no_notification_for_the_open_chat_while_a_message_is_selected() {
+        let (mut app, log) = fake_app(Settings::default());
+        set_unread(&mut app, 20, 35, 50);
+        app.enter_chat(20);
+        history(&mut app, 20, 1..=40);
+        assert!(app.msg_sel.is_some());
+        app.on_incoming(&msg(20, 510, 2));
+        assert_eq!(count(&log, "notify"), 0);
+        app.handle(Event::Input(TermEvent::FocusLost));
+        app.on_incoming(&msg(20, 520, 2));
+        assert_eq!(count(&log, "notify"), 1);
+    }
+
+    #[test]
     fn open_focus_modes_and_key_during_load_cancels_decision() {
         let mut s = Settings::default();
         s.navigation.open_chat_focus = OpenFocus::Composer;
@@ -8342,6 +8673,51 @@ mod tests {
         assert!(app.settings.navigation.after_send_next_unread);
         assert_eq!(app.option_value(AFTER_SEND_OPTION), "[x]");
         assert!(matches!(app.popup, Some(Popup::Options { sel: 9 })));
+    }
+
+    #[test]
+    fn options_set_inline_animations_their_limit_and_unfocused_pause() {
+        let (mut app, _log) = fake_app(Settings::default());
+        leader(&mut app, 'o');
+        assert_eq!(app.option_value(ANIMATIONS_OPTION), "all visible");
+        assert_eq!(app.option_value(MAX_ANIMATIONS_OPTION), "4");
+        assert_eq!(app.option_value(PAUSE_ANIMATIONS_OPTION), "[x]");
+        press(&mut app, K::Char('e'), M::NONE);
+        assert_eq!(
+            app.settings.media.animations,
+            crate::config::Animations::Selected
+        );
+        assert!(matches!(app.popup, Some(Popup::Options { sel }) if sel == ANIMATIONS_OPTION));
+        press(&mut app, K::Char('l'), M::NONE);
+        assert_eq!(app.option_value(ANIMATIONS_OPTION), "off");
+        press(&mut app, K::Char('h'), M::NONE);
+        press(&mut app, K::Char('h'), M::NONE);
+        assert_eq!(app.option_value(ANIMATIONS_OPTION), "all visible");
+        press(&mut app, K::Char('r'), M::NONE);
+        assert_eq!(app.settings.media.max_animations(), 5);
+        press(&mut app, K::Char('h'), M::NONE);
+        press(&mut app, K::Char('h'), M::NONE);
+        assert_eq!(app.option_value(MAX_ANIMATIONS_OPTION), "3");
+        press(&mut app, K::Char('l'), M::NONE);
+        assert_eq!(app.settings.media.max_animations(), 4);
+        press(&mut app, K::Char('j'), M::NONE);
+        assert!(matches!(app.popup, Some(Popup::Options { sel }) if sel == TRANSLATE_OPTION));
+        press(&mut app, K::Char('w'), M::NONE);
+        assert!(!app.settings.media.pause_unfocused);
+        assert_eq!(app.option_value(PAUSE_ANIMATIONS_OPTION), "[ ]");
+        assert!(
+            matches!(app.popup, Some(Popup::Options { sel }) if sel == PAUSE_ANIMATIONS_OPTION)
+        );
+        let keys: std::collections::HashSet<char> = (0..OPTIONS.len()).map(option_key).collect();
+        assert_eq!(keys.len(), OPTIONS.len(), "every option has its own key");
+        for i in [
+            ANIMATIONS_OPTION,
+            MAX_ANIMATIONS_OPTION,
+            PAUSE_ANIMATIONS_OPTION,
+        ] {
+            assert_eq!(option_for_key(option_key(i)), Some(i));
+            assert!(option_order().any(|o| o == i));
+        }
     }
 
     #[test]
@@ -9916,6 +10292,11 @@ mod tests {
         app.blocked.insert(Sender::User(2));
         app.blocked_loaded = true;
         app.revealed.insert((10, 400));
+        app.visible_msgs.push(400);
+        app.view_key = Some((10, None));
+        app.view_since.insert(400, Instant::now());
+        app.chat_profiles.insert(10, Profile::default());
+        app.profile_asked.insert(10);
         let key = crate::media::Key {
             src: crate::media::Src::File(5),
             cols: 4,
@@ -9981,6 +10362,11 @@ mod tests {
             "blocked",
             "blocked_loaded",
             "revealed",
+            "visible_msgs",
+            "view_key",
+            "view_since",
+            "chat_profiles",
+            "profile_asked",
         ] {
             assert!(
                 before.contains(&name),
@@ -10353,5 +10739,349 @@ mod tests {
         app.on_update(forum_topic_counts(6, 0, 1));
         app.mark_chat_read(40);
         assert_eq!(logged(&log, "read topic "), ["read topic reactions 40 6"]);
+    }
+
+    fn draw_screen(app: &mut App) -> String {
+        let mut term = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| crate::ui::draw(f, app)).unwrap();
+        let buf = term.backend().buffer();
+        (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn looked_at(app: &mut App, from: Instant, ms: u64) {
+        draw_screen(app);
+        app.flush_views(from + std::time::Duration::from_millis(ms));
+    }
+
+    fn reacted(app: &mut App, chat: i64, id: i64) {
+        let m = app.histories.get_mut(&chat).unwrap().get_mut(id).unwrap();
+        m.outgoing = true;
+        m.sender = Sender::User(1);
+        m.unread_reaction = true;
+    }
+
+    fn plain_message(chat_id: i64, id: i64) -> Update {
+        match new_message(chat_id, id, 0) {
+            Update::NewMessage(mut u) => {
+                u.message.topic_id = None;
+                Update::NewMessage(u)
+            }
+            _ => panic!("new_message builds updateNewMessage"),
+        }
+    }
+
+    #[test]
+    fn a_reaction_on_screen_is_viewed_once_after_a_short_look_and_the_badge_follows_tdlib() {
+        let (mut app, log) = fake_app(Settings::default());
+        open_with_history(&mut app, 10);
+        set_unread(&mut app, 10, 0, 400);
+        app.chats.get_mut(&10).unwrap().reactions = 1;
+        reacted(&mut app, 10, 390);
+        let views = logged(&log, "view 10").len();
+        assert!(draw_screen(&mut app).contains("]r"));
+        assert!(app.visible_msgs.contains(&390));
+        let t0 = Instant::now();
+        app.flush_views(t0);
+        assert!(
+            app.tick_interval().is_some_and(|d| d <= VIEW_DELAY),
+            "wakes up to report it"
+        );
+        looked_at(&mut app, t0, 299);
+        assert_eq!(
+            logged(&log, "view 10").len(),
+            views,
+            "a glance is not a view"
+        );
+        looked_at(&mut app, t0, 300);
+        assert_eq!(
+            logged(&log, "view 10")[views..],
+            ["view 10 [390] topic None"]
+        );
+        looked_at(&mut app, t0, 2000);
+        assert_eq!(logged(&log, "view 10").len(), views + 1, "reported once");
+        assert_eq!(
+            count(&log, "read reactions"),
+            0,
+            "read-all stays an explicit action"
+        );
+        assert!(
+            draw_screen(&mut app).contains("]r"),
+            "the badge follows TDLib, not a guess"
+        );
+        app.on_update(unread_reactions(10, 390, 0, 0));
+        assert!(!draw_screen(&mut app).contains("]r"));
+
+        app.on_update(unread_reactions(10, 390, 1, 1));
+        assert!(draw_screen(&mut app).contains("]r"));
+        let t1 = Instant::now();
+        looked_at(&mut app, t1, 0);
+        looked_at(&mut app, t1, 300);
+        assert_eq!(
+            logged(&log, "view 10")[views + 1..],
+            ["view 10 [390] topic None"],
+            "a new reaction on the same message is viewed again"
+        );
+    }
+
+    #[test]
+    fn privacy_modes_popups_and_an_unfocused_terminal_never_report_views() {
+        for settings in [no_read(), ghost()] {
+            let (mut app, log) = fake_app(settings);
+            open_with_history(&mut app, 10);
+            set_unread(&mut app, 10, 5, 0);
+            reacted(&mut app, 10, 390);
+            app.histories
+                .get_mut(&10)
+                .unwrap()
+                .get_mut(400)
+                .unwrap()
+                .mention = true;
+            let t0 = Instant::now();
+            looked_at(&mut app, t0, 0);
+            assert!(app.visible_msgs.contains(&390) && app.visible_msgs.contains(&400));
+            looked_at(&mut app, t0, 5000);
+            assert!(logged(&log, "view ").is_empty());
+            assert_eq!(count(&log, "mark read"), 0);
+            let h = &app.histories[&10];
+            assert!(h.get(390).unwrap().unread_reaction && h.get(400).unwrap().mention);
+        }
+
+        let (mut app, log) = fake_app(Settings::default());
+        app.handle(Event::Input(TermEvent::FocusLost));
+        open_with_history(&mut app, 10);
+        set_unread(&mut app, 10, 5, 0);
+        reacted(&mut app, 10, 390);
+        app.on_update(plain_message(10, 410));
+        assert_eq!(history_ids(&app, 10).last(), Some(&410));
+        let t0 = Instant::now();
+        looked_at(&mut app, t0, 0);
+        looked_at(&mut app, t0, 5000);
+        assert!(
+            logged(&log, "view ").is_empty(),
+            "nothing is read while the terminal is in the background"
+        );
+        app.handle(Event::Input(TermEvent::FocusGained));
+        app.popup = Some(Popup::ConfirmUrl("https://example.org".to_owned()));
+        let t1 = Instant::now();
+        looked_at(&mut app, t1, 0);
+        looked_at(&mut app, t1, 5000);
+        assert!(logged(&log, "view ").is_empty(), "a popup covers the chat");
+        app.popup = None;
+        let t2 = Instant::now();
+        looked_at(&mut app, t2, 0);
+        looked_at(&mut app, t2, 300);
+        assert_eq!(logged(&log, "view "), ["view 10 [390, 410] topic None"]);
+    }
+
+    #[test]
+    fn reactions_and_mentions_off_screen_wait_until_they_are_scrolled_into_view() {
+        let (mut app, log) = fake_app(Settings::default());
+        open_with_history(&mut app, 10);
+        set_unread(&mut app, 10, 0, 400);
+        reacted(&mut app, 10, 100);
+        app.histories
+            .get_mut(&10)
+            .unwrap()
+            .get_mut(110)
+            .unwrap()
+            .mention = true;
+        let views = logged(&log, "view 10").len();
+        let t0 = Instant::now();
+        looked_at(&mut app, t0, 0);
+        assert!(!app.visible_msgs.is_empty());
+        assert!(!app.visible_msgs.contains(&100) && !app.visible_msgs.contains(&110));
+        assert_eq!(app.tick_interval(), None, "nothing to wait for");
+        looked_at(&mut app, t0, 5000);
+        assert_eq!(logged(&log, "view 10").len(), views);
+
+        app.msg_sel = app.histories[&10].index_of(100);
+        let t1 = Instant::now();
+        looked_at(&mut app, t1, 0);
+        assert!(app.visible_msgs.contains(&100) && app.visible_msgs.contains(&110));
+        looked_at(&mut app, t1, 300);
+        assert_eq!(
+            logged(&log, "view 10")[views..],
+            ["view 10 [100, 110] topic None"]
+        );
+        let h = &app.histories[&10];
+        assert!(!h.get(100).unwrap().unread_reaction && !h.get(110).unwrap().mention);
+    }
+
+    #[test]
+    fn mentions_on_voice_and_video_notes_wait_for_playback_like_tdlib() {
+        let (mut app, log) = fake_app(Settings::default());
+        open_with_history(&mut app, 10);
+        set_unread(&mut app, 10, 0, 400);
+        let m = app.histories.get_mut(&10).unwrap().get_mut(390).unwrap();
+        m.mention = true;
+        m.attachments.push(Attachment {
+            kind: MediaKind::Voice,
+            file: FileRef::default(),
+            preview: None,
+            full: None,
+            mini: None,
+            width: 0,
+            height: 0,
+            duration: 3,
+            name: String::new(),
+            mime: "audio/ogg".to_owned(),
+            waveform: Vec::new(),
+        });
+        let views = logged(&log, "view 10").len();
+        let t0 = Instant::now();
+        looked_at(&mut app, t0, 0);
+        looked_at(&mut app, t0, 1000);
+        assert_eq!(logged(&log, "view 10").len(), views);
+        assert!(app.histories[&10].get(390).unwrap().mention);
+    }
+
+    #[test]
+    fn visible_unread_messages_are_read_once_whichever_path_sees_them_first() {
+        let (mut app, log) = fake_app(Settings::default());
+        open_with_history(&mut app, 10);
+        assert_eq!(logged(&log, "view 10"), ["view 10 [400] topic None"]);
+        let t0 = Instant::now();
+        looked_at(&mut app, t0, 0);
+        looked_at(&mut app, t0, 1000);
+        assert_eq!(
+            logged(&log, "view 10").len(),
+            1,
+            "opening already read it, the viewport adds nothing"
+        );
+
+        set_unread(&mut app, 10, 0, 400);
+        app.bottom_offset = 30;
+        app.on_update(plain_message(10, 410));
+        set_unread(&mut app, 10, 1, 400);
+        let t1 = Instant::now();
+        looked_at(&mut app, t1, 0);
+        assert!(!app.visible_msgs.contains(&410));
+        looked_at(&mut app, t1, 1000);
+        assert_eq!(logged(&log, "view 10").len(), 1, "scrolled away: not seen");
+
+        app.bottom_offset = 0;
+        let t2 = Instant::now();
+        looked_at(&mut app, t2, 0);
+        looked_at(&mut app, t2, 300);
+        assert_eq!(logged(&log, "view 10")[1..], ["view 10 [410] topic None"]);
+        app.focus = Pane::Messages;
+        press(&mut app, K::Char('k'), M::NONE);
+        press(&mut app, K::Esc, M::NONE);
+        looked_at(&mut app, t2, 2000);
+        assert_eq!(
+            logged(&log, "view 10").len(),
+            2,
+            "no second call for the same read"
+        );
+    }
+
+    #[test]
+    fn topics_report_views_in_their_thread_and_the_mixed_forum_view_never_does() {
+        let topic_history = |app: &mut App| {
+            app.handle(Event::History {
+                chat_id: 40,
+                msgs: (1..=40)
+                    .rev()
+                    .map(|i| tmsg(40, i * 10, 2, Some(5)))
+                    .collect(),
+                initial: true,
+                epoch: 0,
+            });
+        };
+        let (mut app, log) = forum_app(Settings::default());
+        app.expand(40);
+        feed_topics(&mut app, standard_topics(), None);
+        app.enter_topic(40, 5);
+        topic_history(&mut app);
+        reacted(&mut app, 40, 390);
+        let t0 = Instant::now();
+        looked_at(&mut app, t0, 0);
+        looked_at(&mut app, t0, 1000);
+        assert!(
+            logged(&log, "view ").is_empty(),
+            "nothing is read while the first unread is still being looked up"
+        );
+
+        let (mut app, log) = forum_app(Settings::default());
+        app.expand(40);
+        let mut topics = standard_topics();
+        topics[1].last_read_inbox = 380;
+        feed_topics(&mut app, topics, None);
+        app.enter_topic(40, 5);
+        topic_history(&mut app);
+        assert_eq!(logged(&log, "view 40"), ["view 40 [400] topic Some(5)"]);
+        reacted(&mut app, 40, 390);
+        let t1 = Instant::now();
+        looked_at(&mut app, t1, 0);
+        looked_at(&mut app, t1, 300);
+        assert_eq!(
+            logged(&log, "view 40")[1..],
+            ["view 40 [390] topic Some(5)"]
+        );
+
+        let (mut app, log) = forum_app(Settings::default());
+        app.enter_forum(40);
+        app.handle(Event::History {
+            chat_id: 40,
+            msgs: (1..=5)
+                .rev()
+                .map(|i| tmsg(40, i * 10, 2, Some(5)))
+                .collect(),
+            initial: true,
+            epoch: 0,
+        });
+        reacted(&mut app, 40, 50);
+        let t1 = Instant::now();
+        looked_at(&mut app, t1, 0);
+        looked_at(&mut app, t1, 1000);
+        assert!(logged(&log, "view ").is_empty());
+    }
+
+    #[test]
+    fn chat_info_loads_the_profile_on_each_open_and_reports_failures() {
+        let (mut app, log) = fake_app(Settings::default());
+        open_with_history(&mut app, 10);
+        app.after_draw();
+        assert_eq!(count(&log, "load profile"), 0, "hidden panel loads nothing");
+        app.show_info = true;
+        app.after_draw();
+        app.after_draw();
+        assert_eq!(count(&log, "load profile"), 1);
+        let group = Profile {
+            members: Some(5),
+            ..Profile::default()
+        };
+        app.handle(Event::Profile(ProfileTarget::Chat(10), Ok(group.clone())));
+        assert_eq!(app.chat_profiles.get(&10), Some(&group));
+        app.handle(Event::Profile(ProfileTarget::Chat(30), Ok(group.clone())));
+        app.handle(Event::Profile(ProfileTarget::User(2), Ok(group)));
+        assert_eq!(app.chat_profiles.len(), 1, "only what the panel asked for");
+
+        app.open(20);
+        app.after_draw();
+        assert_eq!(count(&log, "load profile"), 2);
+        app.handle(Event::Profile(
+            ProfileTarget::Chat(20),
+            Err("CHAT_ADMIN_REQUIRED".to_owned()),
+        ));
+        assert!(
+            matches!(&app.status, Some((s, true)) if s == "chat info: CHAT_ADMIN_REQUIRED"),
+            "{:?}",
+            app.status
+        );
+        app.open(10);
+        app.after_draw();
+        assert_eq!(count(&log, "load profile"), 3, "reopening refreshes it");
+        assert!(
+            app.chat_profiles.contains_key(&10),
+            "shown until the fresh one lands"
+        );
     }
 }

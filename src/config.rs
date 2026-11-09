@@ -426,6 +426,66 @@ impl Default for Navigation {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Deserialize, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Animations {
+    Off,
+    Selected,
+    #[default]
+    All,
+}
+
+impl Animations {
+    pub const ALL: [Animations; 3] = [Animations::All, Animations::Selected, Animations::Off];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Animations::All => "all visible",
+            Animations::Selected => "selected only",
+            Animations::Off => "off",
+        }
+    }
+
+    pub fn step(self, forward: bool) -> Animations {
+        cycle(&Self::ALL, self, forward)
+    }
+}
+
+pub const MAX_ANIMATIONS_LIMIT: u8 = 16;
+
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MediaSettings {
+    pub animations: Animations,
+    pub max_animations: u8,
+    pub pause_unfocused: bool,
+}
+
+impl Default for MediaSettings {
+    fn default() -> Self {
+        Self {
+            animations: Animations::All,
+            max_animations: 4,
+            pause_unfocused: true,
+        }
+    }
+}
+
+impl MediaSettings {
+    pub fn max_animations(&self) -> usize {
+        usize::from(self.max_animations.clamp(1, MAX_ANIMATIONS_LIMIT))
+    }
+
+    pub fn step_max(&mut self, dir: Option<bool>) {
+        let n = self.max_animations.clamp(1, MAX_ANIMATIONS_LIMIT);
+        self.max_animations = match dir {
+            None if n >= MAX_ANIMATIONS_LIMIT => 1,
+            None | Some(true) => (n + 1).min(MAX_ANIMATIONS_LIMIT),
+            Some(false) => n.saturating_sub(1).max(1),
+        };
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
@@ -434,6 +494,7 @@ pub struct Settings {
     pub appearance: Appearance,
     pub navigation: Navigation,
     pub chats: Chats,
+    pub media: MediaSettings,
 }
 
 impl Settings {
@@ -697,5 +758,54 @@ mod tests {
         assert!(Settings::parse("[navigation]\nnext = 1\n", &mut Vec::new()).is_err());
         assert_eq!(OpenFocus::Smart.step(true), OpenFocus::Composer);
         assert_eq!(OpenFocus::Messages.step(true), OpenFocus::Smart);
+    }
+
+    #[test]
+    fn media_options_default_parse_clamp_and_roundtrip() {
+        let d = Settings::default();
+        assert_eq!(d.media.animations, Animations::All);
+        assert_eq!(d.media.max_animations(), 4);
+        assert!(d.media.pause_unfocused);
+        assert!(!d.to_toml().unwrap().is_empty());
+        let s = Settings::parse(
+            "[media]\nanimations = \"selected\"\nmax_animations = 9\npause_unfocused = false\n",
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(s.media.animations, Animations::Selected);
+        assert_eq!(s.media.max_animations(), 9);
+        assert!(!s.media.pause_unfocused);
+        assert_eq!(
+            Settings::parse(&s.to_toml().unwrap(), &mut Vec::new()).unwrap(),
+            s
+        );
+        let off = Settings::parse("[media]\nanimations = \"off\"\n", &mut Vec::new()).unwrap();
+        assert_eq!(off.media.animations, Animations::Off);
+        assert_eq!(off.media.max_animations(), 4);
+        assert!(Settings::parse("[media]\nanimations = \"some\"\n", &mut Vec::new()).is_err());
+        assert!(Settings::parse("[media]\nmax = 3\n", &mut Vec::new()).is_err());
+        let zero = Settings::parse("[media]\nmax_animations = 0\n", &mut Vec::new()).unwrap();
+        assert_eq!(zero.media.max_animations(), 1);
+        let huge = Settings::parse("[media]\nmax_animations = 200\n", &mut Vec::new()).unwrap();
+        assert_eq!(
+            huge.media.max_animations(),
+            usize::from(MAX_ANIMATIONS_LIMIT)
+        );
+        let mut m = MediaSettings::default();
+        m.step_max(Some(false));
+        assert_eq!(m.max_animations, 3);
+        m.max_animations = 1;
+        m.step_max(Some(false));
+        assert_eq!(m.max_animations, 1);
+        m.max_animations = MAX_ANIMATIONS_LIMIT;
+        m.step_max(Some(true));
+        assert_eq!(m.max_animations, MAX_ANIMATIONS_LIMIT);
+        m.step_max(None);
+        assert_eq!(m.max_animations, 1);
+        m.step_max(None);
+        assert_eq!(m.max_animations, 2);
+        assert_eq!(Animations::All.step(true), Animations::Selected);
+        assert_eq!(Animations::Off.step(true), Animations::All);
+        assert_eq!(Animations::All.step(false), Animations::Off);
     }
 }

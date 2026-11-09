@@ -1,20 +1,21 @@
 use crossterm::terminal::{BeginSynchronizedUpdate, EndSynchronizedUpdate};
 use crossterm::{execute, queue};
-use ratatui::backend::{Backend, ClearType, CrosstermBackend};
-use ratatui::buffer::{Buffer, CellDiffOption};
-use ratatui::layout::{Constraint, Layout, Position, Rect};
+use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
+use ratatui::buffer::{Buffer, Cell, CellDiffOption, CellWidth};
+use ratatui::layout::{Constraint, Layout, Position, Rect, Size};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
 };
 use ratatui::{Frame, Terminal};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{App, Auth, Pane, Popup, Row};
 use crate::config::{APP_NAME, MessageLayout};
 
 const QR_CAPTION: &str = "Scan in Telegram → Settings → Devices → Link Desktop Device";
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::Duration;
@@ -31,12 +32,127 @@ use crate::theme;
 #[path = "layouts.rs"]
 mod layouts;
 
+pub struct Resync<B>(pub B);
+
+fn settled(cell: &Cell) -> bool {
+    if matches!(cell.diff_option, CellDiffOption::ForcedWidth(_)) {
+        return true;
+    }
+    let mut chars = cell.symbol().chars();
+    match (chars.next(), chars.next()) {
+        (Some(c), None) => {
+            c < '\u{600}'
+                || ('\u{2000}'..'\u{2600}').contains(&c)
+                || (c < '\u{1F000}' && UnicodeWidthChar::width(c) == Some(2))
+        }
+        _ => false,
+    }
+}
+
+impl<B: Backend> Backend for Resync<B> {
+    type Error = B::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+    where
+        I: Iterator<Item = (u16, u16, &'a Cell)>,
+    {
+        let mut cells: Vec<(u16, u16, Cow<'a, Cell>, bool)> = Vec::new();
+        let mut covered: Option<(u16, u16)> = None;
+        for (x, y, cell) in content {
+            if covered.is_some_and(|(cy, end)| cy == y && x < end) {
+                continue;
+            }
+            covered = None;
+            if settled(cell) {
+                cells.push((x, y, Cow::Borrowed(cell), false));
+                continue;
+            }
+            let w = cell.cell_width();
+            for dx in 1..w {
+                let mut blank = cell.clone();
+                blank.set_symbol(" ");
+                cells.push((x.saturating_add(dx), y, Cow::Owned(blank), false));
+            }
+            if w > 1 {
+                covered = Some((y, x.saturating_add(w)));
+            }
+            cells.push((x, y, Cow::Borrowed(cell), true));
+        }
+        let mut start = 0;
+        for i in 1..=cells.len() {
+            let cut = cells.get(i).is_none_or(|&(x, y, _, _)| {
+                let (px, py, _, unsure) = &cells[i - 1];
+                *unsure && y == *py && x == px.saturating_add(1)
+            });
+            if cut {
+                self.0.draw(
+                    cells[start..i]
+                        .iter()
+                        .map(|(x, y, c, _)| (*x, *y, c.as_ref())),
+                )?;
+                start = i;
+            }
+        }
+        if cells.is_empty() {
+            self.0.draw(std::iter::empty())?;
+        }
+        Ok(())
+    }
+
+    fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+        self.0.hide_cursor()
+    }
+
+    fn show_cursor(&mut self) -> Result<(), Self::Error> {
+        self.0.show_cursor()
+    }
+
+    fn get_cursor_position(&mut self) -> Result<Position, Self::Error> {
+        self.0.get_cursor_position()
+    }
+
+    fn set_cursor_position<P: Into<Position>>(&mut self, position: P) -> Result<(), Self::Error> {
+        self.0.set_cursor_position(position)
+    }
+
+    fn clear(&mut self) -> Result<(), Self::Error> {
+        self.0.clear()
+    }
+
+    fn clear_region(&mut self, clear_type: ClearType) -> Result<(), Self::Error> {
+        self.0.clear_region(clear_type)
+    }
+
+    fn size(&self) -> Result<Size, Self::Error> {
+        self.0.size()
+    }
+
+    fn window_size(&mut self) -> Result<WindowSize, Self::Error> {
+        self.0.window_size()
+    }
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        Backend::flush(&mut self.0)
+    }
+}
+
+impl<W: std::io::Write> std::io::Write for Resync<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(&mut self.0)
+    }
+}
+
 pub fn draw_frame<W: std::io::Write>(
-    terminal: &mut Terminal<CrosstermBackend<W>>,
+    terminal: &mut Terminal<Resync<CrosstermBackend<W>>>,
     app: &mut App,
     layout: &mut u64,
     drawn: impl FnOnce(&Buffer),
 ) -> std::io::Result<()> {
+    app.sync_inline();
     queue!(terminal.backend_mut(), BeginSynchronizedUpdate)?;
     let force = std::mem::take(&mut app.force_clear);
     let frame = terminal.draw(|f| draw(f, app))?;
@@ -49,6 +165,8 @@ pub fn draw_frame<W: std::io::Write>(
         terminal.backend_mut().clear_region(ClearType::All)?;
         drawn(terminal.draw(|f| draw(f, app))?.buffer);
     }
+    app.media.anim.finish(terminal.backend_mut())?;
+    app.inline.flush(terminal.backend_mut())?;
     execute!(terminal.backend_mut(), EndSynchronizedUpdate)
 }
 
@@ -68,6 +186,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let th = app.frame_theme();
     theme::install(th.clone());
     app.animating = false;
+    let covered = matches!(app.popup, Some(Popup::Viewer { .. } | Popup::Stickers(_)));
+    let unfocused = app.settings.media.pause_unfocused && !app.term_focused;
+    app.media.anim.begin(covered || unfocused);
+    app.visible_msgs.clear();
     app.prune_typing(std::time::Instant::now());
     frame.render_widget(Block::default().style(theme::surface()), area);
     if app.auth != Auth::Ready {
@@ -1594,7 +1716,7 @@ fn bubble_footer(
 }
 
 fn spans_width(spans: &[Span]) -> usize {
-    spans.iter().map(|s| s.content.width()).sum()
+    spans.iter().map(|s| format::cells(&s.content)).sum()
 }
 
 fn bubble_block(
@@ -1901,9 +2023,18 @@ fn draw_avatar(
         }
     }
     render_proto(frame, t, proto);
-    if !matches!(proto, SlicedProtocol::Halfblocks(_)) {
-        return;
+    if matches!(proto, SlicedProtocol::Halfblocks(_)) {
+        mask_avatar(frame, t, font, shape, behind);
     }
+}
+
+fn mask_avatar(
+    frame: &mut Frame,
+    t: ImageTarget,
+    font: (u16, u16),
+    shape: theme::AvatarShape,
+    behind: Color,
+) {
     let (fw, fh) = (f32::from(font.0.max(1)), f32::from(font.1.max(1)));
     let (w, h) = (f32::from(t.cols) * fw, f32::from(t.rows) * fh);
     let buf = frame.buffer_mut();
@@ -2157,6 +2288,15 @@ fn draw_message_list(frame: &mut Frame, area: Rect, app: &mut App) {
     if let Some(&(_, g)) = starts.iter().rev().find(|(line, _)| *line <= start) {
         app.msg_top = groups[g].start;
     }
+    app.visible_msgs = starts
+        .iter()
+        .enumerate()
+        .filter(|&(i, &(top, _))| {
+            let bottom = starts.get(i + 1).map_or(all.len(), |n| n.0);
+            (bottom > start && bottom <= end) || (top <= start && bottom >= end)
+        })
+        .flat_map(|(_, &(_, g))| msgs[groups[g].clone()].iter().map(|m| m.id))
+        .collect();
     all.truncate(end);
     lines.extend(all.drain(start..));
     app.layout_cache = cache;
@@ -2186,7 +2326,12 @@ fn draw_message_list(frame: &mut Frame, area: Rect, app: &mut App) {
         draw_scrollbar(frame, full, groups.len(), top_group, visible);
     }
     let overlay = app.popup.is_some() || !app.pending.is_empty();
-    for (abs, p) in placed {
+    let sel = sel_group.map(|g| groups[g].clone());
+    let animate = pick_animations(app, msgs, &placed, sel, |abs, rows| {
+        let y = pad as isize + abs as isize - first_line as isize;
+        y + rows as isize > 0 && y < height as isize
+    });
+    for (n, (abs, p)) in placed.into_iter().enumerate() {
         let y = pad as isize + abs as isize - first_line as isize;
         if y + p.rows as isize <= 0 || y >= height as isize {
             continue;
@@ -2204,6 +2349,9 @@ fn draw_message_list(frame: &mut Frame, area: Rect, app: &mut App) {
                 let Some(a) = m.attachments.get(att) else {
                     continue;
                 };
+                if animate.contains(&n) && draw_animation(frame, target, &mut app.media, a) {
+                    continue;
+                }
                 draw_attachment(
                     frame,
                     target,
@@ -2242,6 +2390,71 @@ fn draw_message_list(frame: &mut Frame, area: Rect, app: &mut App) {
     if want_older {
         app.want_older = true;
     }
+}
+
+fn pick_animations(
+    app: &App,
+    msgs: &[Msg],
+    placed: &[(usize, Place)],
+    sel: Option<std::ops::Range<usize>>,
+    visible: impl Fn(usize, u16) -> bool,
+) -> std::collections::HashSet<usize> {
+    let mode = app.settings.media.animations;
+    if !app.media.anim.enabled() || mode == crate::config::Animations::Off {
+        return std::collections::HashSet::new();
+    }
+    let mut picks: Vec<(bool, usize)> = placed
+        .iter()
+        .enumerate()
+        .filter_map(|(n, (abs, p))| {
+            let Pic::Att { rel, att } = p.pic else {
+                return None;
+            };
+            if !visible(*abs, p.rows) {
+                return None;
+            }
+            crate::anim::source(msgs.get(rel)?.attachments.get(att)?)?;
+            let selected = sel.as_ref().is_some_and(|r| r.contains(&rel));
+            (mode == crate::config::Animations::All || selected).then_some((selected, n))
+        })
+        .collect();
+    picks.sort_by_key(|&(selected, n)| (!selected, std::cmp::Reverse(n)));
+    picks
+        .into_iter()
+        .take(app.settings.media.max_animations())
+        .map(|(_, n)| n)
+        .collect()
+}
+
+fn draw_animation(frame: &mut Frame, t: ImageTarget, media: &mut Media, att: &Attachment) -> bool {
+    let Some((file, decode, seconds)) = crate::anim::source(att) else {
+        return false;
+    };
+    let f = media.file(&file);
+    let Some(path) = f.local().map(str::to_owned) else {
+        media.want_download(f.id, 1);
+        return false;
+    };
+    let (fw, fh) = media.font();
+    let key = crate::anim::Key {
+        file: f.id,
+        cols: t.cols,
+        rows: t.rows,
+    };
+    let job = || crate::anim::Job {
+        path,
+        decode,
+        seconds,
+        box_px: (
+            u32::from(t.cols) * u32::from(fw),
+            u32::from(t.rows) * u32::from(fh),
+        ),
+    };
+    let Some(id) = media.anim.show(key, job) else {
+        return false;
+    };
+    crate::anim::placeholders(frame.buffer_mut(), t.area, id, (t.x, t.y), (t.cols, t.rows));
+    true
 }
 
 fn draw_scrollbar(frame: &mut Frame, area: Rect, total: usize, top: usize, visible: usize) {
@@ -2466,12 +2679,18 @@ fn draw_viewer(frame: &mut Frame, area: Rect, app: &mut App) {
         Some(a) => format!(" {} {}/{} ", kind_label(a.kind), pos + 1, len),
         None => format!(" attachment {}/{} ", pos + 1, len),
     };
+    let live = app.inline.active() == Some((msg_id, idx));
+    let player = att.as_ref().is_some_and(|a| {
+        live || (crate::video::playable(a.kind) && app.inline.available().is_ok())
+    });
+    let hint = if player {
+        " space play/pause · ←/→ seek · ↑/↓ volume · m mute · j/k prev/next · x mpv · s save · Esc close "
+    } else {
+        " j/k prev/next · x play/open · s save · o xdg-open · Esc close "
+    };
     let block = theme::popup_block()
         .title(Span::styled(title, theme::popup_title()))
-        .title_bottom(Span::styled(
-            " j/k prev/next · x play/open · s save · o xdg-open · Esc close ",
-            theme::muted(),
-        ));
+        .title_bottom(Span::styled(hint, theme::muted()));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let Some(att) = att else {
@@ -2484,13 +2703,19 @@ fn draw_viewer(frame: &mut Frame, area: Rect, app: &mut App) {
     if inner.height < 2 || inner.width < 2 {
         return;
     }
-    let image_h = inner.height - 1;
-    let dims = att
-        .full
-        .as_ref()
-        .filter(|v| v.width > 0 && v.height > 0)
-        .map_or_else(|| visual_dims(&att), |v| (v.width, v.height));
-    let (cols, rows) = fit_cells(dims.0, dims.1, app.media.font(), inner.width, image_h);
+    let bar = player && inner.height > 3;
+    let image_h = inner.height - 1 - u16::from(bar);
+    let status = app.inline.status().filter(|_| live).cloned();
+    let dims = match status.as_ref().and_then(|s| s.dims) {
+        Some((w, h)) => (w as i32, h as i32),
+        None => att
+            .full
+            .as_ref()
+            .filter(|v| v.width > 0 && v.height > 0)
+            .map_or_else(|| visual_dims(&att), |v| (v.width, v.height)),
+    };
+    let font = app.media.font();
+    let (cols, rows) = fit_cells(dims.0, dims.1, font, inner.width, image_h);
     let image_area = Rect {
         height: image_h,
         ..inner
@@ -2502,8 +2727,16 @@ fn draw_viewer(frame: &mut Frame, area: Rect, app: &mut App) {
         cols,
         rows,
     };
+    if let Some(d) = status.as_ref().and_then(|s| s.dims) {
+        let (w, h) = crate::video::fit_pixels(d, (cols, rows), font);
+        app.inline.want(crate::video::Place { cols, rows, w, h });
+    }
     let elapsed = app.anim_start.elapsed();
-    let animated = if att.viewable() {
+    let video = app.inline.image().filter(|_| live);
+    let animated = if let Some(id) = video {
+        crate::anim::placeholders(frame.buffer_mut(), t.area, id, (t.x, t.y), (cols, rows));
+        false
+    } else if att.viewable() {
         draw_attachment(
             frame,
             t,
@@ -2514,6 +2747,9 @@ fn draw_viewer(frame: &mut Frame, area: Rect, app: &mut App) {
             true,
             elapsed,
         )
+    } else if player {
+        box_note(frame, t, &format!("[{}]", kind_label(att.kind)));
+        false
     } else {
         box_note(frame, t, "nothing to preview; x to open");
         false
@@ -2534,15 +2770,32 @@ fn draw_viewer(frame: &mut Frame, area: Rect, app: &mut App) {
     if f.size > 0 {
         meta.push(format::file_size(f.size));
     }
-    if let Some(p) = att
-        .full
-        .as_ref()
-        .and_then(|v| app.media.file(&v.file).percent())
-    {
+    let loading = att.full.as_ref().map_or(&att.file, |v| &v.file);
+    if let Some(p) = app.media.file(loading).percent().or_else(|| f.percent()) {
         meta.push(format!("{} {p}%", theme::get().glyphs.download));
     }
+    if bar {
+        let text = match &status {
+            Some(st) => crate::video::progress_line(st, inner.width as usize),
+            None if app.inline.requested == Some((msg_id, idx)) && f.local().is_none() => {
+                " ⧗ downloading...".to_owned()
+            }
+            None => " ▶ space to play here".to_owned(),
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(
+                format::truncate(&text, inner.width as usize),
+                theme::popup_title(),
+            )),
+            Rect {
+                y: inner.y + image_h,
+                height: 1,
+                ..inner
+            },
+        );
+    }
     let line = Rect {
-        y: inner.y + image_h,
+        y: inner.y + inner.height - 1,
         height: 1,
         ..inner
     };
@@ -2751,7 +3004,7 @@ fn draw_composer(frame: &mut Frame, area: Rect, app: &App) {
     }
 }
 
-fn draw_info(frame: &mut Frame, area: Rect, app: &App) {
+fn draw_info(frame: &mut Frame, area: Rect, app: &mut App) {
     let block = pane_block(" Chat info ".to_owned(), app.focus == Pane::Info);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -2762,6 +3015,105 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &App) {
         );
         return;
     };
+    let chat_id = chat.id;
+    let font = app.media.font();
+    let avatar = info_avatar_size(inner, font).map(|(cols, rows)| ImageTarget {
+        area: inner,
+        x: (inner.width - cols) / 2,
+        y: 1,
+        cols,
+        rows,
+    });
+    let mut lines = Vec::new();
+    if let Some(t) = avatar {
+        let color = match chat.kind {
+            ChatKind::Private(uid) | ChatKind::Secret(uid) => uid,
+            _ => chat.id,
+        };
+        let label = initials(&chat.title);
+        let cols = t.cols as usize;
+        lines.push(Line::from(""));
+        for row in 0..t.rows {
+            let text = if row == t.rows / 2 {
+                let pad = cols.saturating_sub(label.width());
+                format!(
+                    "{}{label}{}",
+                    " ".repeat(pad / 2),
+                    " ".repeat(pad - pad / 2)
+                )
+            } else {
+                " ".repeat(cols)
+            };
+            lines.push(Line::from(vec![
+                Span::raw(" ".repeat(t.x as usize)),
+                Span::styled(text, theme::avatar(color)),
+            ]));
+        }
+        lines.push(Line::from(""));
+    }
+    lines.extend(info_lines(app, chat, inner.width as usize));
+    frame.render_widget(Paragraph::new(lines), inner);
+    let Some(t) = avatar else {
+        return;
+    };
+    let behind = theme::surface().bg;
+    let shape = theme::get().layout.avatar_shape;
+    mask_avatar(frame, t, font, shape, theme::cell_bg(behind));
+    if let Some(photo) = app.profile_photo(model::ProfileTarget::Chat(chat_id)) {
+        let overlay = app.popup.is_some() || !app.pending.is_empty();
+        draw_avatar(frame, t, &mut app.media, &photo, overlay, behind);
+    }
+}
+
+fn info_avatar_size(inner: Rect, font: (u16, u16)) -> Option<(u16, u16)> {
+    let per_row = (f32::from(font.1.max(1)) / f32::from(font.0.max(1))).max(1.0);
+    let room = inner.width.saturating_sub(2);
+    let wanted = (f32::from(inner.width) * 0.6 / per_row) as u16;
+    let rows = wanted
+        .clamp(8, 12)
+        .min((f32::from(room) / per_row) as u16)
+        .min(inner.height / 2);
+    let cols = (f32::from(rows) * per_row).round() as u16;
+    (rows >= 3 && cols <= room).then_some((cols, rows))
+}
+
+fn info_field(label: &str, value: &str, width: usize) -> Vec<Line<'static>> {
+    let key = format!(" {label}: ");
+    let key_w = format::cells(&key);
+    let own_line = width < key_w + 8;
+    let indent = if own_line { 2 } else { key_w };
+    let body = render_text(
+        &model::RichText::plain(value.to_owned()),
+        theme::normal(),
+        width.saturating_sub(indent).max(1),
+    );
+    let mut out = Vec::new();
+    let mut key = Some(Span::styled(key, theme::muted()));
+    if own_line {
+        out.extend(key.take().map(Line::from));
+    }
+    for line in body {
+        let lead = key.take().unwrap_or_else(|| Span::raw(" ".repeat(indent)));
+        let mut spans = vec![lead];
+        spans.extend(line.spans);
+        out.push(Line::from(spans));
+    }
+    out
+}
+
+fn info_lines(app: &App, chat: &model::ChatInfo, width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for l in render_text(
+        &model::RichText::plain(chat.title.clone()),
+        theme::strong(),
+        width.saturating_sub(2).max(1),
+    ) {
+        let pad = width.saturating_sub(line_width(&l)) / 2;
+        let mut spans = vec![Span::raw(" ".repeat(pad))];
+        spans.extend(l.spans);
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(""));
     let kind = match chat.kind {
         ChatKind::Private(_) => "private chat",
         ChatKind::Group => "group",
@@ -2769,25 +3121,40 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &App) {
         ChatKind::Channel => "channel",
         ChatKind::Secret(_) => "secret chat",
     };
-    let field = |label: &str, value: String| {
-        Line::from(vec![
-            Span::styled(format!(" {label}: "), theme::muted()),
-            Span::raw(value),
-        ])
+    let mut field = |label: &str, value: String| lines.extend(info_field(label, &value, width));
+    field("Type", kind.to_owned());
+    let user = match chat.kind {
+        ChatKind::Private(uid) | ChatKind::Secret(uid) => Some(uid),
+        _ => None,
     };
-    let mut lines = vec![
-        Line::from(Span::styled(format!(" {}", chat.title), theme::strong())),
-        Line::from(""),
-        field("Type", kind.to_owned()),
-    ];
-    if let ChatKind::Private(uid) | ChatKind::Secret(uid) = chat.kind
-        && let Some(status) = app.user_status(uid)
-    {
-        lines.push(field("Status", status));
+    if let Some(status) = user.and_then(|uid| app.user_status(uid)) {
+        field("Status", status);
+    }
+    let profile = app.chat_profiles.get(&chat.id);
+    if let Some(p) = profile {
+        if !p.usernames.is_empty() {
+            let names: Vec<String> = p.usernames.iter().map(|n| format!("@{n}")).collect();
+            field("Username", names.join(" · "));
+        }
+        let hidden = user.is_some_and(|u| app.my_id == Some(u)) && app.settings.privacy.hide_phone;
+        if user.is_some() && !p.phone.is_empty() && !hidden {
+            field("Phone", p.phone.clone());
+        }
+        if let Some(n) = p.members.filter(|_| user.is_none()) {
+            field("Members", app.count(i64::from(n)));
+        }
+        let invites = p.links.iter().filter(|l| {
+            !p.usernames
+                .iter()
+                .any(|n| **l == format!("https://t.me/{n}"))
+        });
+        for link in invites.filter(|_| user.is_none()) {
+            field("Link", link.clone());
+        }
     }
     if let Some(sc) = app.secret_chat(chat.id) {
-        lines.push(field("Secret", sc.state.label().to_owned()));
-        lines.push(field("Stored", "only on this device".to_owned()));
+        field("Secret", sc.state.label().to_owned());
+        field("Stored", "only on this device".to_owned());
     }
     if chat.auto_delete > 0 {
         let label = if matches!(chat.kind, ChatKind::Secret(_)) {
@@ -2795,11 +3162,11 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &App) {
         } else {
             "Auto-delete"
         };
-        lines.push(field(label, format::ttl(chat.auto_delete)));
+        field(label, format::ttl(chat.auto_delete));
     }
     if chat.forum {
         let n = app.topics.get(&chat.id).map_or(0, |l| l.topics().len());
-        lines.push(field("Topics", n.to_string()));
+        field("Topics", n.to_string());
     }
     if let Some(t) = app.open_topic_info() {
         let mut state = vec![format!("{} unread", app.count(i64::from(t.unread)))];
@@ -2809,49 +3176,68 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &App) {
         if app.topic_muted(chat.id, t.id) {
             state.push("muted".to_owned());
         }
-        lines.push(field("Topic", format!("{} · {}", t.name, state.join(", "))));
+        field("Topic", format!("{} · {}", t.name, state.join(", ")));
     }
-    lines.extend([
-        field("Unread", app.count(i64::from(chat.unread))),
-        field(
-            "Muted",
-            if app.is_muted(chat.id) { "yes" } else { "no" }.to_owned(),
-        ),
-        field("ID", chat.id.to_string()),
-    ]);
-    if app.settings.appearance.show_ids {
-        if let ChatKind::Private(uid) | ChatKind::Secret(uid) = chat.kind {
-            lines.push(field("User ID", uid.to_string()));
+    field("Unread", app.count(i64::from(chat.unread)));
+    field(
+        "Muted",
+        if app.is_muted(chat.id) { "yes" } else { "no" }.to_owned(),
+    );
+    field("ID", chat.id.to_string());
+    if let Some(p) = profile.filter(|p| !p.bio.is_empty()) {
+        let heading = if p.user_id.is_some() {
+            "Bio"
+        } else {
+            "Description"
+        };
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!(" {heading}"),
+            theme::muted(),
+        )));
+        for l in render_text(
+            &model::RichText::plain(p.bio.clone()),
+            theme::normal(),
+            width.saturating_sub(2).max(1),
+        ) {
+            let mut spans = vec![Span::raw(" ")];
+            spans.extend(l.spans);
+            lines.push(Line::from(spans));
         }
-        if chat.group_id != 0 {
-            lines.push(field("Supergroup ID", chat.group_id.to_string()));
-        }
-        if chat.secret_id != 0 {
-            lines.push(field("Secret chat ID", chat.secret_id.to_string()));
-        }
-        if let Some(t) = app.open_topic {
-            lines.push(field("Topic ID", t.to_string()));
-        }
-        if let Some(m) = app.selected_message() {
-            lines.push(field("Message ID", m.id.to_string()));
-        }
+    }
+    if !app.settings.appearance.show_ids {
+        return lines;
+    }
+    lines.push(Line::from(""));
+    let mut field = |label: &str, value: String| lines.extend(info_field(label, &value, width));
+    if let Some(uid) = user {
+        field("User ID", uid.to_string());
+    }
+    if chat.group_id != 0 {
+        field("Supergroup ID", chat.group_id.to_string());
+    }
+    if chat.secret_id != 0 {
+        field("Secret chat ID", chat.secret_id.to_string());
+    }
+    if let Some(t) = app.open_topic {
+        field("Topic ID", t.to_string());
+    }
+    if let Some(m) = app.selected_message() {
+        field("Message ID", m.id.to_string());
     }
     if let Some(h) = app.histories.get(&chat.id) {
-        lines.push(field("Loaded", format!("{} messages", h.len())));
+        field("Loaded", format!("{} messages", h.len()));
     }
     let (images, bytes) = app.media.stats();
-    lines.push(field(
+    field(
         "Images",
         format!(
             "{} · {images} cached · {}",
             app.media.protocol_name(),
             format::file_size(bytes as i64)
         ),
-    ));
-    frame.render_widget(
-        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
-        inner,
     );
+    lines
 }
 
 pub(crate) fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -3343,7 +3729,7 @@ fn hint_column(group: crate::keymap::Group, hints: &[crate::keymap::Hint]) -> Ve
 }
 
 fn line_width(line: &Line) -> usize {
-    line.spans.iter().map(|s| s.content.width()).sum()
+    line.spans.iter().map(|s| format::cells(&s.content)).sum()
 }
 
 fn key_hint_lines(
@@ -4688,7 +5074,8 @@ mod tests {
     #[test]
     fn info_pane_wraps_long_values_instead_of_clipping() {
         let mut app = app();
-        let rows = snapshot(&mut app, 140, 16);
+        app.settings.appearance.show_ids = true;
+        let rows = snapshot(&mut app, 140, 40);
         let at = rows
             .iter()
             .position(|l| l.contains("Images: halfblocks"))
@@ -5516,6 +5903,208 @@ mod tests {
             }
         }
         panic!("{needle} not on screen");
+    }
+
+    fn info_rows(buf: &Buffer) -> Vec<String> {
+        let w = buf.area.width;
+        (0..buf.area.height)
+            .map(|y| {
+                let mut row = String::new();
+                let mut x = w - 30;
+                while x < w {
+                    let sym = buf[(x, y)].symbol();
+                    row.push_str(sym);
+                    x += (sym.width() as u16).max(1);
+                }
+                row
+            })
+            .collect()
+    }
+
+    fn info_app() -> App {
+        let mut app = app();
+        app.set_theme(distinctive_theme());
+        app.show_folders = false;
+        app.show_chats = false;
+        app.show_info = true;
+        app.lang = format::Lang::Ru;
+        let mut chat = app.chats[&10].clone();
+        chat.id = 20;
+        chat.title = "Alice Longname".to_owned();
+        chat.kind = ChatKind::Private(2);
+        app.chats.insert(20, chat);
+        app.histories.insert(20, History::default());
+        app.open_chat = Some(20);
+        app.user_meta.insert(
+            2,
+            crate::model::UserMeta {
+                status: crate::presence::Status::Offline {
+                    was_online: crate::app::unix_now() - 630,
+                },
+                ..Default::default()
+            },
+        );
+        app
+    }
+
+    #[test]
+    fn chat_info_avatar_grows_with_the_panel_and_keeps_room_for_text() {
+        let font = (10, 20);
+        let at = |w, h| info_avatar_size(Rect::new(0, 0, w, h), font);
+        assert_eq!(at(28, 40), Some((16, 8)));
+        assert_eq!(at(40, 40), Some((24, 12)));
+        assert_eq!(at(80, 40), Some((24, 12)));
+        assert_eq!(at(14, 40), Some((12, 6)), "narrow panels shrink it");
+        assert_eq!(at(28, 12), Some((12, 6)), "short panels keep half for text");
+        assert_eq!(at(6, 40), None);
+        assert_eq!(at(28, 5), None);
+        assert_eq!(
+            info_avatar_size(Rect::new(0, 0, 28, 40), (8, 20)),
+            Some((20, 8)),
+            "square in pixels for the real cell size"
+        );
+    }
+
+    #[test]
+    fn chat_info_puts_an_initials_avatar_on_top_and_wraps_values_under_their_column() {
+        let mut app = info_app();
+        let buf = buffer(&mut app, 120, 40);
+        let th = app.frame_theme();
+        let rows = info_rows(&buf);
+        let x0 = 120 - 30 + 1;
+        let fill = th.name_color(2).unwrap();
+        let painted: Vec<(u16, u16)> = (0..40u16)
+            .flat_map(|y| (x0..119).map(move |x| (x, y)))
+            .filter(|&(x, y)| buf[(x, y)].bg == fill)
+            .collect();
+        let xs: Vec<u16> = painted.iter().map(|p| p.0).collect();
+        let ys: Vec<u16> = painted.iter().map(|p| p.1).collect();
+        let (left, right) = (*xs.iter().min().unwrap(), *xs.iter().max().unwrap());
+        let (top, bottom) = (*ys.iter().min().unwrap(), *ys.iter().max().unwrap());
+        assert_eq!(
+            (right - left + 1, bottom - top + 1),
+            (16, 8),
+            "square avatar"
+        );
+        assert_eq!(painted.len(), 16 * 8);
+        assert_eq!(left - x0, (28 - 16) / 2, "centred");
+        assert_eq!(top, 3, "right under the pane title");
+        let label = row_of(&rows, "AL");
+        assert_eq!(label as u16, top + 4);
+
+        let title = row_of(&rows, "Alice Longname");
+        assert!(title as u16 > bottom);
+        assert_eq!(col_of(&rows[title], "Alice"), 1 + (28 - 14) / 2);
+        let status = row_of(&rows, " Status: ");
+        assert!(
+            rows[status].contains("Status: был(а) 10 мин."),
+            "{}",
+            rows[status]
+        );
+        assert!(
+            rows[status + 1].starts_with(&format!("│{}назад", " ".repeat(9))),
+            "hanging indent:\n{}",
+            rows.join("\n")
+        );
+        let key = col_of(&rows[status], "Status") as u16 + 120 - 30;
+        let value = col_of(&rows[status], "был") as u16 + 120 - 30;
+        assert_eq!(buf[(key, status as u16)].fg, th.colors.dim.0.fg.unwrap());
+        assert_eq!(buf[(value, status as u16)].fg, th.colors.text.0.fg.unwrap());
+        assert_eq!(
+            buf[(value, status as u16 + 1)].fg,
+            th.colors.text.0.fg.unwrap()
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|r| r.contains("Loaded") || r.contains("Images"))
+        );
+        assert!(!rows.iter().any(|r| r.contains("User ID")));
+
+        app.settings.appearance.show_ids = true;
+        let rows = info_rows(&buffer(&mut app, 120, 40));
+        for needle in ["User ID: 2", "Loaded: 0 messages", "Images: "] {
+            assert!(
+                rows.iter().any(|r| r.contains(needle)),
+                "{needle}:\n{}",
+                rows.join("\n")
+            );
+        }
+    }
+
+    #[test]
+    fn chat_info_avatar_follows_the_theme_shape() {
+        let mut app = info_app();
+        let mut t = distinctive_theme();
+        t.layout.avatar_shape = theme::AvatarShape::Circle;
+        app.set_theme(t);
+        let buf = buffer(&mut app, 120, 40);
+        let fill = app.frame_theme().name_color(2).unwrap();
+        let x0 = 120 - 30 + 1 + 6;
+        assert_ne!(buf[(x0, 3)].bg, fill, "corner cut");
+        assert_eq!(buf[(x0 + 8, 7)].bg, fill, "centre kept");
+        assert_eq!(buf[(x0 + 3, 3)].symbol(), "▄", "edges are half a cell");
+        assert_eq!(buf[(x0 + 3, 3)].fg, fill);
+    }
+
+    #[test]
+    fn chat_info_lists_profile_details_for_people_and_groups() {
+        let mut app = info_app();
+        app.chat_profiles.insert(
+            20,
+            crate::model::Profile {
+                user_id: Some(2),
+                usernames: vec!["alice".to_owned()],
+                phone: "+7 900 000 00 00".to_owned(),
+                bio: "Rustacean and tea enthusiast from Kazan".to_owned(),
+                links: vec!["https://t.me/alice".to_owned()],
+                common_chats: Some(3),
+                ..Default::default()
+            },
+        );
+        let rows = info_rows(&buffer(&mut app, 120, 40));
+        let text = rows.join("\n");
+        for needle in [
+            "Username: @alice",
+            "Phone: +7 900 000 00",
+            " Bio ",
+            " Rustacean and tea",
+        ] {
+            assert!(text.contains(needle), "{needle}:\n{text}");
+        }
+        assert!(
+            !text.contains("Link:") && !text.contains("Members"),
+            "{text}"
+        );
+
+        app.open_chat = Some(10);
+        app.chat_profiles.insert(
+            10,
+            crate::model::Profile {
+                usernames: vec!["rust_ru".to_owned()],
+                bio: "Everything about Rust".to_owned(),
+                members: Some(1234),
+                links: vec![
+                    "https://t.me/rust_ru".to_owned(),
+                    "https://t.me/+AbCdEf".to_owned(),
+                ],
+                ..Default::default()
+            },
+        );
+        let rows = info_rows(&buffer(&mut app, 120, 40));
+        let text = rows.join("\n");
+        let members = format!("Members: {}", app.count(1234));
+        for needle in [
+            members.as_str(),
+            "Username: @rust_ru",
+            "Link: https://t.me/+AbCdEf",
+            " Description ",
+            " Everything about Rust",
+        ] {
+            assert!(text.contains(needle), "{needle}:\n{text}");
+        }
+        assert!(!text.contains("https://t.me/rust_ru"), "{text}");
+        assert!(!text.contains("Phone"), "{text}");
     }
 
     fn themed_classic() -> (App, std::rc::Rc<theme::Theme>) {
@@ -7516,6 +8105,102 @@ mod tests {
             );
             assert!(pane_rows(&mut app).iter().any(|r| r.starts_with("Р")));
         }
+
+        fn emoji_chat(layout: MessageLayout) -> App {
+            let mut app = chat_scene(layout);
+            app.focus = Pane::Messages;
+            let now = chrono::Local::now().timestamp();
+            let base = now - now.rem_euclid(86_400) + 12 * 3600 - 86_400;
+            let texts = [
+                "привет",
+                "ок 👍🏽",
+                "сейчас скину 中文 1\u{20E3}",
+                "да ❤\u{200D}🔥 raw",
+                "хаха смешно 😀😀",
+                "ну 🤷\u{200D}♂\u{FE0F} ✓",
+            ];
+            let batch = (0..40i64)
+                .map(|i| {
+                    let sender = if i % 3 == 0 { 2 } else { 1 };
+                    let mut m = msg(i + 1, sender, base + i * 70, "");
+                    m.body = RichText::plain(texts[i as usize % texts.len()]);
+                    m.edited = false;
+                    m.reply_to = None;
+                    m.media = None;
+                    if i % 2 == 0 {
+                        let count = if sender == 1 { 3 } else { 1 };
+                        m.reactions = vec![react("❤\u{200D}🔥", 0, count, i % 4 == 0)];
+                    }
+                    m
+                })
+                .collect();
+            let mut h = History::default();
+            h.reached_start = true;
+            h.merge_older(batch);
+            app.histories.insert(10, h);
+            app.chats.get_mut(&10).unwrap().last_read_outbox = 20;
+            app
+        }
+
+        #[test]
+        fn moving_through_emoji_reactions_leaves_no_stale_cells_in_kitty() {
+            use crate::ui::repaint_tests::{Screen, Sink};
+            use crossterm::event::{KeyCode, KeyModifiers};
+            let area = Rect::new(0, 0, 120, 30);
+            let keys = [
+                (KeyCode::Up, 25),
+                (KeyCode::Down, 25),
+                (KeyCode::PageUp, 4),
+                (KeyCode::PageDown, 4),
+                (KeyCode::Char('K'), 8),
+                (KeyCode::Char('J'), 8),
+            ];
+            for layout in ALL {
+                let mut app = emoji_chat(layout);
+                let sink = Sink::default();
+                let mut term = Terminal::with_options(
+                    Resync(CrosstermBackend::new(sink.clone())),
+                    ratatui::TerminalOptions {
+                        viewport: ratatui::Viewport::Fixed(area),
+                    },
+                )
+                .unwrap();
+                let mut screen = Screen::new(area.width, area.height);
+                let mut hash = image_layout(&Buffer::empty(area));
+                let mut fire = 0;
+                let presses = keys
+                    .iter()
+                    .flat_map(|&(k, n)| std::iter::repeat_n(Some(k), n));
+                for (step, key) in std::iter::once(None).chain(presses).enumerate() {
+                    if let Some(k) = key {
+                        let mods = if matches!(k, KeyCode::Char(c) if c.is_uppercase()) {
+                            KeyModifiers::SHIFT
+                        } else {
+                            KeyModifiers::NONE
+                        };
+                        press(&mut app, k, mods);
+                    }
+                    let mut shown = None;
+                    draw_frame(&mut term, &mut app, &mut hash, |b| shown = Some(b.clone()))
+                        .unwrap();
+                    let shown = shown.unwrap();
+                    screen.feed(&std::mem::take(&mut *sink.0.borrow_mut()));
+                    fire += shown
+                        .content
+                        .iter()
+                        .filter(|c| c.symbol() == "❤\u{FE0F}\u{200D}🔥")
+                        .count();
+                    let stale = screen.stale_cells(&shown);
+                    assert!(
+                        stale.is_empty(),
+                        "{layout:?} step {step} ({key:?}): {} stale cells, e.g. {:?}",
+                        stale.len(),
+                        &stale[..stale.len().min(6)]
+                    );
+                }
+                assert!(fire > 100, "{layout:?}: {fire}");
+            }
+        }
     }
 
     fn screen_rows(app: &mut App, w: u16, h: u16) -> Vec<String> {
@@ -7949,12 +8634,12 @@ mod repaint_tests {
     use std::cell::RefCell;
     use std::rc::Rc;
     use tokio::sync::mpsc::UnboundedReceiver;
-    use unicode_width::UnicodeWidthChar;
+    use unicode_segmentation::UnicodeSegmentation;
 
     const PLACEHOLDER: char = '\u{10EEEE}';
 
     #[derive(Clone, Default)]
-    struct Sink(Rc<RefCell<Vec<u8>>>);
+    pub(super) struct Sink(pub(super) Rc<RefCell<Vec<u8>>>);
 
     impl std::io::Write for Sink {
         fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
@@ -7966,8 +8651,68 @@ mod repaint_tests {
         }
     }
 
+    fn kitty_cells(g: &str) -> usize {
+        let first = g.chars().next().unwrap_or(' ');
+        let wide_base = ('\u{1F1E6}'..='\u{1F1FF}').contains(&first)
+            || [
+                '\u{261D}',
+                '\u{26F9}',
+                '\u{270C}',
+                '\u{270D}',
+                '\u{1F3CB}',
+                '\u{1F3CC}',
+                '\u{1F574}',
+                '\u{1F575}',
+                '\u{1F590}',
+            ]
+            .contains(&first);
+        match UnicodeWidthChar::width(first).unwrap_or(0) {
+            0 => 0,
+            _ if wide_base || g.contains('\u{FE0F}') => 2,
+            w => w,
+        }
+    }
+
+    #[test]
+    fn kitty_model_widths_match_kitty() {
+        for (g, cells) in [
+            ("❤\u{FE0F}\u{200D}🔥", 2),
+            ("❤\u{200D}🔥", 1),
+            ("❤\u{FE0F}", 2),
+            ("❤", 1),
+            ("👍🏽", 2),
+            ("🤷\u{200D}♂\u{FE0F}", 2),
+            ("🤷\u{200D}♂", 2),
+            ("👨\u{200D}👩\u{200D}👧", 2),
+            ("🏳\u{FE0F}\u{200D}🌈", 2),
+            ("🇺🇸", 2),
+            ("🇺", 2),
+            ("😀", 2),
+            ("✍", 2),
+            ("中", 2),
+            ("1\u{FE0F}\u{20E3}", 2),
+            ("1\u{20E3}", 1),
+            ("e\u{301}", 1),
+            ("✓", 1),
+            ("▎", 1),
+            ("─", 1),
+        ] {
+            assert_eq!(kitty_cells(g), cells, "{g:?}");
+            let mut screen = Screen::new(8, 1);
+            screen.feed(format!("{g}x").as_bytes());
+            assert_eq!(screen.cells[cells], "x", "{g:?}");
+        }
+        let mut screen = Screen::new(8, 1);
+        screen.feed("abcdefgh\x1b[1;1H❤\u{FE0F}\u{200D}🔥 3".as_bytes());
+        assert_eq!(screen.cells[..5].concat(), "❤\u{FE0F}\u{200D}🔥 3e");
+        screen.feed(b"\x1b[1;2Hz");
+        assert_eq!(screen.cells[..4].concat(), " z 3");
+        screen.feed("\x1b[1;4H中\x1b[1;3H🔥".as_bytes());
+        assert_eq!(screen.cells[2..6].concat(), "🔥 f");
+    }
+
     #[derive(Clone)]
-    struct Screen {
+    pub(super) struct Screen {
         w: usize,
         h: usize,
         cells: Vec<String>,
@@ -7977,7 +8722,7 @@ mod repaint_tests {
     }
 
     impl Screen {
-        fn new(w: u16, h: u16) -> Self {
+        pub(super) fn new(w: u16, h: u16) -> Self {
             let (w, h) = (usize::from(w), usize::from(h));
             Self {
                 w,
@@ -8012,11 +8757,13 @@ mod repaint_tests {
             }
         }
 
-        fn feed(&mut self, bytes: &[u8]) {
+        pub(super) fn feed(&mut self, bytes: &[u8]) {
             let text = String::from_utf8_lossy(bytes);
             let mut it = text.chars().peekable();
+            let mut run = String::new();
             while let Some(c) = it.next() {
                 if c == '\x1b' {
+                    self.print(&std::mem::take(&mut run));
                     match it.next() {
                         Some('[') => {
                             let mut params = String::new();
@@ -8040,19 +8787,53 @@ mod repaint_tests {
                     }
                     continue;
                 }
-                let cw = c.width().unwrap_or(0);
-                if cw == 0 {
-                    if self.x > 0 {
-                        self.cells[self.y * self.w + self.x - 1].push(c);
+                run.push(c);
+            }
+            self.print(&run);
+        }
+
+        fn print(&mut self, text: &str) {
+            for g in text.graphemes(true) {
+                let w = kitty_cells(g);
+                if w == 0 {
+                    let row = self.y * self.w;
+                    let mut lead = self.x.min(self.w);
+                    while lead > 0 {
+                        lead -= 1;
+                        if !self.cells[row + lead].is_empty() {
+                            self.cells[row + lead].push_str(g);
+                            break;
+                        }
                     }
                     continue;
                 }
-                if self.x >= self.w {
+                if self.x + w > self.w {
                     self.x = 0;
                     self.y = (self.y + 1).min(self.h - 1);
                 }
-                self.cells[self.y * self.w + self.x] = c.to_string();
-                self.x += cw;
+                let row = self.y * self.w;
+                for x in self.x..self.x + w {
+                    self.break_wide(row, x);
+                }
+                self.cells[row + self.x] = g.to_owned();
+                for x in self.x + 1..self.x + w {
+                    self.cells[row + x].clear();
+                }
+                self.x += w;
+            }
+        }
+
+        fn break_wide(&mut self, row: usize, x: usize) {
+            let mut lead = x;
+            while lead > 0 && self.cells[row + lead].is_empty() {
+                lead -= 1;
+            }
+            let mut end = lead + 1;
+            while end < self.w && self.cells[row + end].is_empty() {
+                end += 1;
+            }
+            if end - lead > 1 {
+                self.cells[row + lead..row + end].fill(" ".to_owned());
             }
         }
 
@@ -8064,7 +8845,7 @@ mod repaint_tests {
             }
         }
 
-        fn stale_cells(&self, buf: &Buffer) -> Vec<(u16, u16, String)> {
+        pub(super) fn stale_cells(&self, buf: &Buffer) -> Vec<(u16, u16, String)> {
             let mut out = Vec::new();
             for y in 0..buf.area.height {
                 for x in 0..buf.area.width {
@@ -8089,7 +8870,7 @@ mod repaint_tests {
     struct Rig {
         app: App,
         rx: UnboundedReceiver<Event>,
-        term: Terminal<CrosstermBackend<Sink>>,
+        term: Terminal<Resync<CrosstermBackend<Sink>>>,
         sink: Sink,
         screen: Screen,
         layout: u64,
@@ -8192,7 +8973,7 @@ mod repaint_tests {
             let sink = Sink::default();
             let area = Rect::new(0, 0, w, h);
             let term = Terminal::with_options(
-                CrosstermBackend::new(sink.clone()),
+                Resync(CrosstermBackend::new(sink.clone())),
                 ratatui::TerminalOptions {
                     viewport: ratatui::Viewport::Fixed(area),
                 },
@@ -8303,6 +9084,224 @@ mod repaint_tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn chat_info_avatar_is_a_kitty_image_that_leaves_no_stale_cells() {
+        let mut rig = Rig::new(120, 40);
+        let photo = rig.app.histories[&10]
+            .msgs()
+            .iter()
+            .find_map(|m| m.attachments.first())
+            .map(|a| FileRef {
+                id: 900,
+                ..a.file.clone()
+            })
+            .unwrap();
+        rig.app.chats.insert(
+            10,
+            crate::model::ChatInfo {
+                id: 10,
+                title: "Alice Longname".to_owned(),
+                kind: ChatKind::Private(2),
+                unread: 0,
+                mentions: 0,
+                reactions: 0,
+                last_read_inbox: 0,
+                last_read_outbox: 0,
+                photo: Some(photo),
+                muted: false,
+                use_default_mute: false,
+                positions: Vec::new(),
+                last_message: None,
+                group_id: 0,
+                secret_id: 0,
+                forum: false,
+                auto_delete: 0,
+                perms: crate::model::Rights::default(),
+                protected: false,
+            },
+        );
+        rig.app.show_info = true;
+        rig.settle().await;
+        let x0 = 120 - 30 + 1;
+        let placed: Vec<(u16, u16)> = (0..40u16)
+            .flat_map(|y| (x0..119).map(move |x| (x, y)))
+            .filter(|&(x, y)| matches!(rig.buf[(x, y)].diff_option, CellDiffOption::ForcedWidth(_)))
+            .collect();
+        let avatar: Vec<(u16, u16)> = (3..11u16)
+            .flat_map(|y| (x0 + 6..x0 + 22).map(move |x| (x, y)))
+            .collect();
+        assert_eq!(placed, avatar, "{}", buffer_text(&rig.buf));
+        assert!(rig.screen.stale_cells(&rig.buf).is_empty());
+        let text = buffer_text(&rig.buf);
+        assert!(text.contains("Alice Longname"), "{text}");
+    }
+
+    fn kitty_reads_shm(out: &[u8]) -> Vec<String> {
+        let text = String::from_utf8_lossy(out);
+        let mut cmds = Vec::new();
+        for part in text.split("\x1b_G").skip(1) {
+            let Some(end) = part.find("\x1b\\") else {
+                continue;
+            };
+            let cmd = &part[..end];
+            if cmd.contains("t=s") {
+                let (keys, payload) = cmd.split_once(';').unwrap();
+                let name = String::from_utf8(
+                    base64::Engine::decode(&base64::engine::general_purpose::STANDARD, payload)
+                        .unwrap(),
+                )
+                .unwrap();
+                let path = format!("/dev/shm/{}", name.trim_start_matches('/'));
+                let Ok(meta) = std::fs::metadata(&path) else {
+                    cmds.push(format!("missing {keys}"));
+                    continue;
+                };
+                let len = meta.len();
+                let size: u64 = keys
+                    .split(',')
+                    .find_map(|k| k.strip_prefix("S="))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert_eq!(len, size, "{keys}");
+                rustix::shm::unlink(name.as_str()).unwrap();
+            }
+            cmds.push(cmd.split(';').next().unwrap().to_owned());
+        }
+        cmds
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn viewer_plays_video_inline_through_shared_memory_frames() {
+        if crate::video::probe().is_err() {
+            eprintln!("libmpv is not installed; skipping");
+            return;
+        }
+        let Some(path) = crate::video::tests::test_video() else {
+            return;
+        };
+        let mut rig = Rig::new(120, 45);
+        rig.app.inline.enable();
+        rig.app.inline.audio_out = Some("null".to_owned());
+        let f = FileRef {
+            id: 900,
+            size: std::fs::metadata(&path).unwrap().len() as i64,
+            path: path.clone(),
+            done: true,
+            downloaded: 1,
+            ..FileRef::default()
+        };
+        let mut a = Attachment::new(MediaKind::Video, f);
+        a.width = 640;
+        a.height = 360;
+        a.duration = 2;
+        let mut m = rig.app.histories[&10].get(39).unwrap().clone();
+        m.id = 41;
+        m.attachments = vec![a];
+        m.body = model::RichText::default();
+        rig.app.histories.get_mut(&10).unwrap().upsert(m);
+        rig.app.msg_sel = None;
+        rig.settle().await;
+        rig.app.popup = Some(Popup::Viewer {
+            chat_id: 10,
+            items: vec![(41, 0), (38, 0)],
+            pos: 0,
+        });
+        let mut cmds = Vec::new();
+        let until = std::time::Instant::now() + Duration::from_secs(10);
+        while std::time::Instant::now() < until
+            && cmds
+                .iter()
+                .filter(|c: &&String| c.starts_with("a=f,r=1"))
+                .count()
+                < 5
+        {
+            let out = rig.frame();
+            cmds.extend(kitty_reads_shm(&out));
+            let _ = tokio::time::timeout(Duration::from_millis(50), rig.rx.recv()).await;
+            while let Ok(ev) = rig.rx.try_recv() {
+                rig.app.handle(ev);
+            }
+        }
+        let first = cmds
+            .iter()
+            .find(|c| c.starts_with("a=T,U=1"))
+            .expect("placement");
+        assert!(first.contains("t=s") && first.contains("f=32"), "{first}");
+        let id = rig.app.inline.image().unwrap();
+        assert!(first.contains(&format!("i={id},")), "{first}");
+        assert!(!cmds.iter().any(|c| c.starts_with("missing")), "{cmds:?}");
+        let edits = cmds.iter().filter(|c| c.starts_with("a=f,r=1")).count();
+        assert!(edits >= 5, "{cmds:?}");
+        assert!(cmds.iter().all(|c| c.len() < 200));
+        let fg = Color::Rgb((id >> 16) as u8, (id >> 8) as u8, id as u8);
+        let video_cells = rig.buf.content.iter().filter(|c| c.fg == fg).count();
+        assert!(video_cells > 1000, "{video_cells}");
+        let text = buffer_text(&rig.buf);
+        assert!(text.contains(" ▶ 0:0"), "{text}");
+        assert!(text.contains("vol 100%"), "{text}");
+        assert!(text.contains("space play/pause"), "{text}");
+        let key = |code| {
+            Event::Input(crossterm::event::Event::Key(
+                crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
+            ))
+        };
+        rig.app.handle(key(crossterm::event::KeyCode::Char(' ')));
+        rig.app.handle(key(crossterm::event::KeyCode::Down));
+        rig.app.handle(key(crossterm::event::KeyCode::Char('m')));
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let out = rig.frame();
+            kitty_reads_shm(&out);
+            let text = buffer_text(&rig.buf);
+            if text.contains('⏸') && text.contains("muted") {
+                break;
+            }
+            assert!(std::time::Instant::now() < until, "{text}");
+            let _ = tokio::time::timeout(Duration::from_millis(50), rig.rx.recv()).await;
+            while let Ok(ev) = rig.rx.try_recv() {
+                rig.app.handle(ev);
+            }
+        }
+        rig.app.handle(key(crossterm::event::KeyCode::Char('m')));
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while rig.app.inline.status().is_none_or(|s| s.muted) {
+            assert!(std::time::Instant::now() < until);
+            let out = rig.frame();
+            kitty_reads_shm(&out);
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert_eq!(rig.app.inline.status().unwrap().volume.round(), 95.0);
+        rig.app.handle(key(crossterm::event::KeyCode::Char('j')));
+        let out = rig.frame();
+        kitty_reads_shm(&out);
+        assert!(rig.app.inline.active().is_none());
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.contains(&format!("\x1b_Ga=d,d=I,i={id},q=2\x1b\\")),
+            "{text}"
+        );
+        assert!(matches!(rig.app.popup, Some(Popup::Viewer { pos: 1, .. })));
+        rig.app.handle(key(crossterm::event::KeyCode::Char('k')));
+        rig.frame();
+        assert_eq!(rig.app.inline.requested, Some((41, 0)));
+        rig.app.handle(key(crossterm::event::KeyCode::Esc));
+        let out = rig.frame();
+        kitty_reads_shm(&out);
+        assert!(rig.app.inline.active().is_none());
+        assert_eq!(rig.app.inline.requested, None);
+        let leftover = std::fs::read_dir("/dev/shm")
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!("gramtty-video-{}-", std::process::id()))
+            })
+            .count();
+        assert_eq!(leftover, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn opening_and_closing_viewer_repaints_everything() {
         let mut rig = Rig::new(100, 30);
         rig.app.msg_sel = Some(39);
@@ -8347,6 +9346,512 @@ mod repaint_tests {
         assert!(text.contains("\x1b[2J"));
         assert!(text.starts_with("\x1b[?2026h"));
         assert!(text.ends_with("\x1b[?2026l"));
+    }
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir =
+            std::env::temp_dir().join(format!("gramtty-anim-ui-{}-{name}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn media_msg(id: i64, att: Attachment) -> Msg {
+        Msg {
+            id,
+            chat_id: 10,
+            sender: Sender::User(2 + id % 2),
+            date: 1_700_000_000 + id * 400,
+            edited: false,
+            outgoing: false,
+            state: SendState::Sent,
+            reply_to: None,
+            album: 0,
+            media: None,
+            attachments: vec![att],
+            body: RichText::default(),
+            pinned: false,
+            mention: false,
+            unread_reaction: false,
+            reactions: Vec::new(),
+            keyboard: None,
+            forward: None,
+            topic: None,
+            ttl: 0,
+            deleted: false,
+            meta: Default::default(),
+        }
+    }
+
+    fn local_file(id: i32, path: &std::path::Path) -> FileRef {
+        FileRef {
+            id,
+            size: std::fs::metadata(path).map_or(1, |m| m.len() as i64),
+            path: path.to_string_lossy().into_owned(),
+            done: true,
+            downloaded: 1,
+            ..FileRef::default()
+        }
+    }
+
+    fn tgs_sticker(id: i32, path: &std::path::Path) -> Attachment {
+        let f = local_file(id, path);
+        let visual = Visual {
+            file: f.clone(),
+            decode: Decode::Tgs,
+            width: 512,
+            height: 512,
+        };
+        let mut a = Attachment::new(MediaKind::Sticker, f);
+        a.width = 512;
+        a.height = 512;
+        a.preview = Some(visual.clone());
+        a.full = Some(visual);
+        a
+    }
+
+    fn sticker_rig(w: u16, h: u16, n: i64) -> (Rig, std::path::PathBuf) {
+        let mut rig = Rig::new(w, h);
+        let dir = scratch_dir("rig");
+        let tgs = dir.join("s.tgs");
+        std::fs::write(&tgs, crate::anim::test_lottie(30, 30)).unwrap();
+        let mut history = History::default();
+        history.reached_start = true;
+        for i in 0..n {
+            history.upsert(media_msg(i + 1, tgs_sticker(700 + i as i32, &tgs)));
+        }
+        rig.app.histories.insert(10, history);
+        rig.app.msg_sel = Some(n as usize - 1);
+        rig.app.media.anim.enable(dir.join("cache"));
+        (rig, dir)
+    }
+
+    async fn run_until(rig: &mut Rig, log: &mut Vec<u8>, done: impl Fn(&App) -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            log.extend(rig.frame());
+            if done(&rig.app) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out; live {:?}, status {:?}\n{}",
+                rig.app.media.anim.live_ids(),
+                rig.app.status,
+                buffer_text(&rig.buf)
+            );
+            if let Ok(Some(ev)) =
+                tokio::time::timeout(Duration::from_millis(100), rig.rx.recv()).await
+            {
+                rig.app.handle(ev);
+            }
+            while let Ok(ev) = rig.rx.try_recv() {
+                rig.app.handle(ev);
+            }
+        }
+    }
+
+    fn kitty_dump(name: &str, log: &[u8]) {
+        if let Some(dir) = std::env::var_os("GRAMTTY_KITTY_DUMP") {
+            std::fs::write(std::path::Path::new(&dir).join(name), log).unwrap();
+        }
+    }
+
+    fn placed_ids(buf: &Buffer, ids: &[u32]) -> Vec<usize> {
+        ids.iter()
+            .map(|id| {
+                let fg = Color::Rgb((id >> 16) as u8, (id >> 8) as u8, *id as u8);
+                buf.content
+                    .iter()
+                    .filter(|c| c.symbol().starts_with(PLACEHOLDER) && c.fg == fg)
+                    .count()
+            })
+            .collect()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn inline_animations_are_sent_once_then_kitty_plays_them_without_redraws() {
+        let (mut rig, dir) = sticker_rig(100, 60, 12);
+        let mut log = Vec::new();
+        run_until(&mut rig, &mut log, |app| {
+            app.media.anim.live_ids().len() == 4
+        })
+        .await;
+        let ids = rig.app.media.anim.live_ids();
+        kitty_dump("inline-live.bin", &log);
+        let text = String::from_utf8_lossy(&log).into_owned();
+        for id in &ids {
+            assert_eq!(
+                text.matches(&format!("\x1b_Ga=T,U=1,i={id},")).count(),
+                1,
+                "transmitted once"
+            );
+            assert!(text.matches(&format!("\x1b_Ga=f,i={id},")).count() >= 10);
+            assert!(text.contains(&crate::anim::start(*id)));
+        }
+        assert!(
+            placed_ids(&rig.buf, &ids).iter().all(|n| *n > 0),
+            "{}",
+            buffer_text(&rig.buf)
+        );
+        assert!(rig.screen.stale_cells(&rig.buf).is_empty());
+        assert_eq!(
+            rig.app.tick_interval(),
+            None,
+            "the app sleeps while kitty animates"
+        );
+        for _ in 0..3 {
+            let out = rig.frame();
+            log.extend(&out);
+            assert!(!String::from_utf8_lossy(&out).contains("\x1b_G"));
+        }
+        rig.app.msg_sel = Some(10);
+        let out = rig.frame();
+        log.extend(&out);
+        assert!(
+            !String::from_utf8_lossy(&out).contains("a=T"),
+            "still on screen"
+        );
+        rig.app
+            .handle(Event::Input(crossterm::event::Event::FocusLost));
+        let out = String::from_utf8_lossy(&rig.frame()).into_owned();
+        log.extend(out.as_bytes());
+        for id in &ids {
+            assert!(out.contains(&crate::anim::stop(*id)), "{out:?}");
+        }
+        rig.app
+            .handle(Event::Input(crossterm::event::Event::FocusGained));
+        let out = String::from_utf8_lossy(&rig.frame()).into_owned();
+        log.extend(out.as_bytes());
+        for id in &ids {
+            assert!(out.contains(&crate::anim::start(*id)));
+        }
+        rig.app.popup = Some(Popup::Viewer {
+            chat_id: 10,
+            items: vec![(11, 0)],
+            pos: 0,
+        });
+        let out = String::from_utf8_lossy(&rig.frame()).into_owned();
+        log.extend(out.as_bytes());
+        assert!(ids.iter().all(|id| out.contains(&crate::anim::stop(*id))));
+        rig.app.popup = None;
+        let out = String::from_utf8_lossy(&rig.frame()).into_owned();
+        log.extend(out.as_bytes());
+        assert!(ids.iter().all(|id| out.contains(&crate::anim::start(*id))));
+        assert_eq!(rig.app.media.anim.live_ids(), ids);
+        rig.app.msg_sel = Some(0);
+        run_until(&mut rig, &mut log, |app| {
+            let live = app.media.anim.live_ids();
+            live.len() == 4 && live.iter().all(|id| !ids.contains(id))
+        })
+        .await;
+        let text = String::from_utf8_lossy(&log).into_owned();
+        for id in &ids {
+            assert_eq!(text.matches(&crate::anim::delete(*id)).count(), 1);
+        }
+        assert!(rig.screen.stale_cells(&rig.buf).is_empty());
+        rig.app.media.reset();
+        let out = String::from_utf8_lossy(&rig.frame()).into_owned();
+        log.extend(out.as_bytes());
+        assert_eq!(out.matches("a=d,d=I").count(), 4);
+        kitty_dump("inline.bin", &log);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn animation_settings_choose_how_many_and_which_stickers_play() {
+        let (mut rig, dir) = sticker_rig(100, 60, 12);
+        let mut log = Vec::new();
+        rig.app.settings.media.max_animations = 2;
+        run_until(&mut rig, &mut log, |app| {
+            app.media.anim.live_ids().len() == 2
+        })
+        .await;
+        for _ in 0..5 {
+            log.extend(rig.frame());
+            assert_eq!(rig.app.media.anim.live_ids().len(), 2);
+        }
+        let bottom = rig.app.media.anim.live_ids();
+        rig.app.settings.media.animations = crate::config::Animations::Selected;
+        rig.app.msg_sel = Some(10);
+        run_until(&mut rig, &mut log, |app| {
+            app.media.anim.live_ids().len() == 1
+        })
+        .await;
+        let sel = rig.app.media.anim.live_ids()[0];
+        assert_eq!(rig.app.media.anim.live_files(), vec![710]);
+        assert!(placed_ids(&rig.buf, &[sel])[0] > 0);
+        assert_eq!(bottom.len(), 2);
+        rig.app.settings.media.animations = crate::config::Animations::Off;
+        let out = String::from_utf8_lossy(&rig.frame()).into_owned();
+        assert!(out.contains(&crate::anim::delete(sel)));
+        assert!(rig.app.media.anim.live_ids().is_empty());
+        rig.settle().await;
+        assert!(rig.images_on_screen() > 0, "stickers stay as still images");
+        assert!(rig.screen.stale_cells(&rig.buf).is_empty());
+        rig.app.settings.media.animations = crate::config::Animations::All;
+        rig.app.settings.media.pause_unfocused = false;
+        rig.app
+            .handle(Event::Input(crossterm::event::Event::FocusLost));
+        run_until(&mut rig, &mut log, |app| {
+            app.media.anim.live_ids().len() == 2
+        })
+        .await;
+        let text = String::from_utf8_lossy(&log).into_owned();
+        let ids = rig.app.media.anim.live_ids();
+        assert!(ids.iter().all(|id| text.contains(&crate::anim::start(*id))));
+        assert!(!ids.iter().any(|id| text.contains(&crate::anim::stop(*id))));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gifs_play_inline_from_their_downloaded_file() {
+        let dir = scratch_dir("gif");
+        let mp4 = dir.join("g.mp4");
+        let made = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=160x120:rate=10:duration=2",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&mp4)
+            .status();
+        match made {
+            Ok(s) => assert!(s.success()),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && std::env::var_os("GRAMTTY_REQUIRE_FIXTURES").is_none() =>
+            {
+                return;
+            }
+            Err(e) => panic!("ffmpeg: {e}"),
+        }
+        let mut rig = Rig::new(100, 40);
+        let mut history = History::default();
+        history.reached_start = true;
+        let thumb = dir.join("t.png");
+        image::RgbaImage::from_pixel(160, 120, image::Rgba([20, 90, 200, 255]))
+            .save(&thumb)
+            .unwrap();
+        let mut gif = Attachment::new(MediaKind::Animation, local_file(800, &mp4));
+        gif.width = 160;
+        gif.height = 120;
+        gif.duration = 2;
+        gif.preview = Some(Visual {
+            file: local_file(802, &thumb),
+            decode: Decode::Raster,
+            width: 160,
+            height: 120,
+        });
+        gif.full = gif.preview.clone();
+        history.upsert(media_msg(1, gif.clone()));
+        let mut pending = gif.clone();
+        pending.file = FileRef {
+            id: 801,
+            size: 1000,
+            ..FileRef::default()
+        };
+        history.upsert(media_msg(2, pending));
+        rig.app.histories.insert(10, history);
+        rig.app.msg_sel = Some(1);
+        rig.app.media.anim.enable(dir.join("cache"));
+        let mut log = Vec::new();
+        run_until(&mut rig, &mut log, |app| {
+            app.media.anim.live_ids().len() == 1
+        })
+        .await;
+        let id = rig.app.media.anim.live_ids()[0];
+        let text = String::from_utf8_lossy(&log).into_owned();
+        let frames = text.matches(&format!("\x1b_Ga=f,i={id},")).count() + 1;
+        assert!((10..=21).contains(&frames), "{frames}");
+        assert!(placed_ids(&rig.buf, &[id])[0] > 0);
+        assert!(
+            rig.app.media.download_wanted(801),
+            "the GIF that is not on disk yet is fetched"
+        );
+        kitty_dump("gif.bin", &log);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn proc_stats() -> (u64, u64, u64) {
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let kb = |key: &str| {
+            status
+                .lines()
+                .find_map(|l| l.strip_prefix(key))
+                .and_then(|v| v.split_whitespace().next())
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap()
+        };
+        let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+        let fields: Vec<&str> = stat
+            .rsplit_once(')')
+            .unwrap()
+            .1
+            .split_whitespace()
+            .collect();
+        let ticks: u64 = fields[11..15]
+            .iter()
+            .map(|f| f.parse::<u64>().unwrap())
+            .sum();
+        (kb("VmRSS:"), kb("VmHWM:"), ticks * 10)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn inline_animation_budget() {
+        let dir = scratch_dir("budget");
+        let ff = |name: &str, lavfi: &str, codec: &[&str]| {
+            let out = dir.join(name);
+            let ok = std::process::Command::new("ffmpeg")
+                .args(["-v", "error", "-y", "-f", "lavfi", "-i", lavfi])
+                .args(codec)
+                .arg(&out)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "{name}");
+            out
+        };
+        let mut atts = Vec::new();
+        for i in 0..6 {
+            let p = dir.join(format!("s{i}.tgs"));
+            std::fs::write(&p, crate::anim::test_lottie(60, 180 - i * 10)).unwrap();
+            atts.push(tgs_sticker(900 + i as i32, &p));
+        }
+        for i in 0..3 {
+            let p = ff(
+                &format!("w{i}.webm"),
+                &format!(
+                    "color=c=green@0.0:s=512x512:d=3:r=30,format=yuva420p[bg];color=c=yellow:s=160x160:d=3:r=30,format=yuva420p[b];[bg][b]overlay=x='t*100+{i}':y=170"
+                ),
+                &[
+                    "-c:v",
+                    "libvpx-vp9",
+                    "-pix_fmt",
+                    "yuva420p",
+                    "-auto-alt-ref",
+                    "0",
+                ],
+            );
+            let f = local_file(920 + i, &p);
+            let v = Visual {
+                file: f.clone(),
+                decode: Decode::Video,
+                width: 512,
+                height: 512,
+            };
+            let mut a = Attachment::new(MediaKind::Sticker, f);
+            a.width = 512;
+            a.height = 512;
+            a.preview = Some(v.clone());
+            a.full = Some(v);
+            atts.push(a);
+        }
+        for i in 0..3 {
+            let p = ff(
+                &format!("g{i}.mp4"),
+                &format!("testsrc2=size=480x270:rate=30:duration={}", 3 + i * 2),
+                &["-pix_fmt", "yuv420p"],
+            );
+            let f = local_file(940 + i, &p);
+            let v = Visual {
+                file: f.clone(),
+                decode: Decode::Video,
+                width: 480,
+                height: 270,
+            };
+            let mut a = Attachment::new(MediaKind::Animation, f);
+            a.width = 480;
+            a.height = 270;
+            a.duration = 3 + i * 2;
+            a.preview = Some(v.clone());
+            a.full = Some(v);
+            atts.push(a);
+        }
+        let mut rig = Rig::new(160, 50);
+        rig.app.show_folders = false;
+        rig.app.show_chats = false;
+        let mut history = History::default();
+        history.reached_start = true;
+        let n = atts.len();
+        for (i, a) in atts.into_iter().enumerate() {
+            history.upsert(media_msg(i as i64 + 1, a));
+        }
+        rig.app.histories.insert(10, history);
+        rig.app.media.anim.enable(dir.join("cache"));
+        let keep = std::env::var_os("GRAMTTY_KITTY_DUMP").is_some();
+        let (rss0, _, cpu0) = proc_stats();
+        let started = std::time::Instant::now();
+        let mut log = Vec::new();
+        let mut transmitted = 0usize;
+        let mut sent = 0usize;
+        for sel in (0..n).rev() {
+            rig.app.msg_sel = Some(sel);
+            loop {
+                let out = rig.frame();
+                transmitted += out.len();
+                sent += String::from_utf8_lossy(&out)
+                    .matches("\x1b_Ga=T,U=1,i=")
+                    .count();
+                if keep {
+                    log.extend(out);
+                }
+                match tokio::time::timeout(Duration::from_millis(1500), rig.rx.recv()).await {
+                    Ok(Some(ev)) => rig.app.handle(ev),
+                    _ => break,
+                }
+                while let Ok(ev) = rig.rx.try_recv() {
+                    rig.app.handle(ev);
+                }
+            }
+        }
+        let (rss1, hwm, cpu1) = proc_stats();
+        let (entries, still_bytes) = rig.app.media.stats();
+        let cache: u64 = std::fs::read_dir(dir.join("cache"))
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .sum();
+        eprintln!(
+            "{n} animations decoded in {:?} wall, {} ms CPU with ffmpeg; {sent} transmissions, {} KB written to the terminal; disk cache {} KB; rss {} -> {} MB, peak {} MB; still-image cache {entries} entries {} KB; live now {}",
+            started.elapsed(),
+            cpu1 - cpu0,
+            transmitted / 1024,
+            cache / 1024,
+            rss0 / 1024,
+            rss1 / 1024,
+            hwm / 1024,
+            still_bytes / 1024,
+            rig.app.media.anim.live_ids().len()
+        );
+        assert_eq!(rig.app.tick_interval(), None);
+        let (_, _, idle0) = proc_stats();
+        let idle_start = std::time::Instant::now();
+        let mut idle_bytes = 0;
+        while idle_start.elapsed() < Duration::from_secs(3) {
+            if let Ok(Some(ev)) =
+                tokio::time::timeout(Duration::from_millis(500), rig.rx.recv()).await
+            {
+                rig.app.handle(ev);
+                idle_bytes += rig.frame().len();
+            }
+        }
+        let (_, _, idle1) = proc_stats();
+        eprintln!(
+            "3 s idle with {} live animations: {} ms CPU, {idle_bytes} bytes written",
+            rig.app.media.anim.live_ids().len(),
+            idle1 - idle0
+        );
+        kitty_dump("budget.bin", &log);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     fn buffer_text(buf: &Buffer) -> String {
