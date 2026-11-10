@@ -1,24 +1,24 @@
 class Gramtty < Formula
   desc "Terminal Telegram client"
   homepage "https://github.com/methamphetaminelab/gramtty"
-  version "1.1.0"
+  version "1.2.0"
   license "GPL-3.0-or-later"
 
   on_macos do
     on_arm do
       url "https://github.com/methamphetaminelab/gramtty/releases/download/v#{version}/gramtty-#{version}-aarch64-macos.tar.gz"
-      sha256 "abe6ea86f9d09ea427f23d912e216c110a88645bed1b49510e1bba0a1c834bb5"
+      sha256 "d51c153ce5848c8fe1c59d2e2d9e25b8201e394ab50900fb58264bc06c0642a0"
     end
     on_intel do
       url "https://github.com/methamphetaminelab/gramtty/releases/download/v#{version}/gramtty-#{version}-x86_64-macos.tar.gz"
-      sha256 "bed4d8e78e47585713ae7d6ea31c3cf0ac2ec48bd90aac0a3373d6954d028785"
+      sha256 "f147edca1393fc278cd6e70e93d369538e1e18aedc0ef776b9064855e411bdea"
     end
   end
 
   on_linux do
     on_intel do
       url "https://github.com/methamphetaminelab/gramtty/releases/download/v#{version}/gramtty-#{version}-x86_64-linux.tar.gz"
-      sha256 "9b4f50d7cca6d895a3458a28af50b8e04e45d7d79edcee82cb5bf7abd8e00a2e"
+      sha256 "27b68c837fadfed6ff3c3f0cfa36f04c58446bb72db93161a8c963edd7a8e71b"
     end
   end
 
