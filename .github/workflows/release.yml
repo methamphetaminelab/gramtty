@@ -108,3 +108,97 @@ jobs:
             gh release create "$TAG" --verify-tag --title "$TAG" --generate-notes
           fi
           gh release upload "$TAG" dist/*.tar.gz dist/*.sha256 --clobber
+
+  formula:
+    needs: release
+    if: ${{ github.ref_type == 'tag' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+
+      - name: Update Homebrew formula
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          sh scripts/update-formula.sh "$version"
+          if git diff --quiet -- Formula/gramtty.rb; then
+            echo "Formula already at $version"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Update Homebrew formula to $version" -- Formula/gramtty.rb
+          git push origin HEAD:main
+
+  aur:
+    needs: release
+    if: ${{ github.ref_type == 'tag' }}
+    runs-on: ubuntu-latest
+    container: archlinux:base-devel
+    strategy:
+      fail-fast: false
+      matrix:
+        pkg: [gramtty-bin, gramtty]
+    env:
+      PKG: ${{ matrix.pkg }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Check AUR key
+        id: key
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          if [ -z "$AUR_SSH_PRIVATE_KEY" ]; then
+            echo "::notice::AUR_SSH_PRIVATE_KEY is not set, AUR update of $PKG skipped"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install tools
+        if: steps.key.outputs.ready == 'true'
+        run: pacman -Syu --noconfirm --needed git openssh pacman-contrib
+
+      - uses: actions/checkout@v7
+        if: steps.key.outputs.ready == 'true'
+
+      - name: Set up SSH
+        if: steps.key.outputs.ready == 'true'
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          install -d -m 700 /aur-ssh
+          (umask 077 && printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > /aur-ssh/key)
+          chmod 600 /aur-ssh/key
+          cat > /aur-ssh/known_hosts <<'EOF'
+          aur.archlinux.org ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIEuBKrPzbawxA/k2g6NcyV5jmqwJ2s+zpgZGZ7tpLIcN
+          aur.archlinux.org ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBLMiLrP8pVi5BFX2i3vepSUnpedeiewE5XptnUnau+ZoeUOPkpoCgZZuYfpaIQfhhJJI5qgnjJmr4hyJbe/zxow=
+          EOF
+          echo "GIT_SSH_COMMAND=ssh -i /aur-ssh/key -o IdentitiesOnly=yes -o UserKnownHostsFile=/aur-ssh/known_hosts -o StrictHostKeyChecking=yes" >> "$GITHUB_ENV"
+
+      - name: Update AUR package
+        if: steps.key.outputs.ready == 'true'
+        env:
+          AUR_GIT_NAME: ${{ vars.AUR_GIT_NAME || 'github-actions[bot]' }}
+          AUR_GIT_EMAIL: ${{ vars.AUR_GIT_EMAIL || '41898282+github-actions[bot]@users.noreply.github.com' }}
+        run: |
+          version="${TAG#v}"
+          useradd -m builder
+          install -m 755 scripts/update-aur.sh /usr/local/bin/update-aur.sh
+          git config --global --add safe.directory /home/builder/aur
+          git clone "ssh://aur@aur.archlinux.org/$PKG.git" /home/builder/aur
+          chown -R builder:builder /home/builder/aur
+          runuser -u builder -- update-aur.sh "$version" /home/builder/aur
+          cd /home/builder/aur
+          if git diff --quiet -- PKGBUILD .SRCINFO; then
+            echo "$PKG already at $version"
+            exit 0
+          fi
+          git add PKGBUILD .SRCINFO
+          git -c user.name="$AUR_GIT_NAME" -c user.email="$AUR_GIT_EMAIL" commit -m "Update to $version"
+          git push origin HEAD:master
