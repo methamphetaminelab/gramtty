@@ -4,6 +4,17 @@
 
 Терминальный клиент Telegram на Rust и TDLib.
 
+## Содержание
+
+- [Возможности](#возможности)
+- [Установка](#установка)
+- [Утилиты времени выполнения](#утилиты-времени-выполнения)
+- [Ключи Telegram API](#ключи-telegram-api)
+- [Первый вход](#первый-вход)
+- [Клавиши](#клавиши)
+- [Настройка](#настройка)
+- [Лицензия](#лицензия)
+
 ## Возможности
 
 - Вход по QR-коду, номеру телефона, коду из Telegram, коду с почты и паролю 2FA
@@ -20,32 +31,34 @@
 - Темы (пресеты, в том числе следующий палитре терминала, и свой `theme.toml`), шесть раскладок сообщений, стили рамок, формы аватарок
 - Переназначаемые клавиши
 
-## Требования
+## Установка
 
-- Linux
-- Терминал; для изображений рекомендуется kitty
-- Rust 1.99 или новее (`rust-version` в `Cargo.toml`)
-- Статические `libc++.a` и `libc++abi.a` (TDLib линкуется статически):
-  - Arch: `pacman -S libc++ libc++abi`
-  - Debian/Ubuntu: `apt install libc++-dev libc++abi-dev`
-  - Fedora: `dnf install libcxx-static libcxxabi-static`
-  - Другое расположение: `LIBCXX_DIR` указывает на каталог с обоими файлами
+Готовые бинарники публикуются для:
 
-Утилиты времени выполнения, ищутся в `PATH`:
+| Платформа | Что нужно |
+|---|---|
+| Linux x86_64 | glibc 2.39 или новее (Ubuntu 24.04, Debian 13, Fedora 40, Arch) |
+| macOS на Apple Silicon | macOS 15 или новее |
+| macOS на Intel | macOS 26 или новее |
 
-| Утилита | Для чего | Обязательна |
-|---|---|---|
-| `libmpv` (пакет `mpv`) | воспроизведение со звуком прямо в просмотрщике (только kitty; libmpv.so.2 загружается динамически, не через `PATH`) | нет |
-| `mpv` | воспроизведение в отдельном окне (`x`) | нет |
-| `ffmpeg` | превью видео и стикеров, WebM-стикеры и GIF в чате, миниатюры при отправке | для превью |
-| `ffprobe` | анализ медиа перед отправкой | нет |
-| `pw-record` (PipeWire) и `opusenc` или `ffmpeg` с libopus | запись голосовых | нет |
-| `notify-send` (libnotify) | уведомления на рабочем столе | нет |
-| `pw-play` или `canberra-gtk-play` | звук уведомления | нет |
-| `wl-copy`, `wl-paste` (wl-clipboard) | копирование и вставка `Ctrl+V`; только Wayland | нет |
-| `xdg-open` | открытие файлов и ссылок во внешней программе | нет |
+Windows пока не поддерживается. Подойдёт любой терминал; для изображений, анимаций и видео в просмотрщике рекомендуется kitty.
 
-## Установка из AUR (Arch Linux)
+### Скрипт установки (Linux, macOS)
+
+```
+curl -fsSL https://raw.githubusercontent.com/methamphetaminelab/gramtty/main/scripts/install.sh | sh
+```
+
+Скачивает последний релиз, сверяет контрольную сумму SHA-256 и кладёт `gramtty` в `~/.local/bin`. Другой каталог задаётся через `GRAMTTY_INSTALL_DIR`, конкретная версия через `GRAMTTY_VERSION` (например `1.1.0`).
+
+### Homebrew (macOS, Linux)
+
+```
+brew tap methamphetaminelab/gramtty https://github.com/methamphetaminelab/gramtty
+brew install gramtty
+```
+
+### AUR (Arch Linux)
 
 ```
 yay -S gramtty-bin   # готовый бинарник
@@ -54,12 +67,39 @@ yay -S gramtty       # сборка из исходников
 
 Подойдёт любой AUR-помощник (`paru -S ...`) или вручную: `git clone https://aur.archlinux.org/gramtty-bin.git && cd gramtty-bin && makepkg -si`.
 
-## Сборка и запуск
+### Скачать вручную
+
+Возьмите архив для своей платформы на [странице релизов](https://github.com/methamphetaminelab/gramtty/releases/latest), распакуйте и положите `gramtty` в каталог из `PATH`.
+
+### Сборка из исходников
 
 ```
 cargo build --release
 ./target/release/gramtty
 ```
+
+Нужен Rust 1.99 или новее (`rust-version` в `Cargo.toml`). На Linux также нужны статические `libc++.a` и `libc++abi.a` (TDLib линкуется статически):
+
+- Arch: `pacman -S libc++ libc++abi`
+- Debian/Ubuntu: `apt install libc++-dev libc++abi-dev libclang-dev`
+- Fedora: `dnf install libcxx-static libcxxabi-static`
+- Другое расположение: `LIBCXX_DIR` указывает на каталог с обоими файлами
+
+## Утилиты времени выполнения
+
+Все необязательны и ищутся в `PATH`; без утилиты не работает только её функция.
+
+| Для чего | Linux | macOS |
+|---|---|---|
+| Воспроизведение со звуком прямо в просмотрщике (только kitty) | `libmpv` (пакет `mpv`), загружается динамически | `libmpv` (`brew install mpv`) |
+| Воспроизведение в отдельном окне (`x`) | `mpv` | `mpv` |
+| Превью видео и стикеров, WebM-стикеры и GIF в чате, миниатюры при отправке | `ffmpeg` | `ffmpeg` |
+| Анализ медиа перед отправкой | `ffprobe` | `ffprobe` |
+| Запись голосовых | `pw-record` (PipeWire) и `opusenc` или `ffmpeg` с libopus | `ffmpeg` (терминалу нужен доступ к микрофону) |
+| Уведомления на рабочем столе | `notify-send` (libnotify) | `osascript` (встроен) |
+| Звук уведомления | `pw-play` или `canberra-gtk-play` | `afplay` (встроен) |
+| Копирование и вставка `Ctrl+V` | `wl-copy`, `wl-paste` (wl-clipboard); только Wayland | `pbcopy`, `pbpaste` (встроены); только текст |
+| Открытие файлов и ссылок во внешней программе | `xdg-open` | `open` (встроен) |
 
 ## Ключи Telegram API
 

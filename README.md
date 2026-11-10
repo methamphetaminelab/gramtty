@@ -4,6 +4,17 @@
 
 Terminal Telegram client in Rust on TDLib.
 
+## Contents
+
+- [Features](#features)
+- [Installation](#installation)
+- [Runtime tools](#runtime-tools)
+- [Telegram API credentials](#telegram-api-credentials)
+- [First login](#first-login)
+- [Key bindings](#key-bindings)
+- [Configuration](#configuration)
+- [License](#license)
+
 ## Features
 
 - Login by QR code, phone number, login code, email code and 2FA password
@@ -20,32 +31,34 @@ Terminal Telegram client in Rust on TDLib.
 - Themes (presets, including one that follows the terminal palette, and a custom `theme.toml`), six message layouts, border styles, avatar shapes
 - Remappable keys
 
-## Requirements
+## Installation
 
-- Linux
-- A terminal; kitty is recommended for images
-- Rust 1.99 or newer (`rust-version` in `Cargo.toml`)
-- Static `libc++.a` and `libc++abi.a` (TDLib is linked statically):
-  - Arch: `pacman -S libc++ libc++abi`
-  - Debian/Ubuntu: `apt install libc++-dev libc++abi-dev`
-  - Fedora: `dnf install libcxx-static libcxxabi-static`
-  - Other location: set `LIBCXX_DIR` to a directory containing both files
+Prebuilt binaries are published for:
 
-Runtime tools, looked up on `PATH`:
+| Platform | Needs |
+|---|---|
+| Linux x86_64 | glibc 2.39 or newer (Ubuntu 24.04, Debian 13, Fedora 40, Arch) |
+| macOS Apple Silicon | macOS 15 or newer |
+| macOS Intel | macOS 26 or newer |
 
-| Tool | Used for | Required |
-|---|---|---|
-| `libmpv` (`mpv` package) | playing media with sound inside the viewer (kitty only; libmpv.so.2 is loaded dynamically, not from `PATH`) | optional |
-| `mpv` | playing media in a separate window (`x`) | optional |
-| `ffmpeg` | video and sticker previews, inline WebM stickers and GIFs, upload thumbnails | for previews |
-| `ffprobe` | probing media before upload | optional |
-| `pw-record` (PipeWire) and `opusenc` or `ffmpeg` with libopus | recording voice messages | optional |
-| `notify-send` (libnotify) | desktop notifications | optional |
-| `pw-play` or `canberra-gtk-play` | notification sound | optional |
-| `wl-copy`, `wl-paste` (wl-clipboard) | clipboard copy and `Ctrl+V` paste; Wayland only | optional |
-| `xdg-open` | opening files and links externally | optional |
+Windows is not supported yet. Any terminal works; kitty is recommended for images, animations and in-viewer video.
 
-## Install from AUR (Arch Linux)
+### Install script (Linux, macOS)
+
+```
+curl -fsSL https://raw.githubusercontent.com/methamphetaminelab/gramtty/main/scripts/install.sh | sh
+```
+
+Downloads the latest release, verifies its SHA-256 checksum and puts `gramtty` into `~/.local/bin`. Set `GRAMTTY_INSTALL_DIR` for another directory or `GRAMTTY_VERSION` (for example `1.1.0`) for a specific release.
+
+### Homebrew (macOS, Linux)
+
+```
+brew tap methamphetaminelab/gramtty https://github.com/methamphetaminelab/gramtty
+brew install gramtty
+```
+
+### AUR (Arch Linux)
 
 ```
 yay -S gramtty-bin   # prebuilt binary
@@ -54,12 +67,39 @@ yay -S gramtty       # build from source
 
 Any AUR helper works (`paru -S ...`), or manually: `git clone https://aur.archlinux.org/gramtty-bin.git && cd gramtty-bin && makepkg -si`.
 
-## Build and run
+### Manual download
+
+Take the archive for your platform from the [releases page](https://github.com/methamphetaminelab/gramtty/releases/latest), unpack it and put `gramtty` somewhere on `PATH`.
+
+### Build from source
 
 ```
 cargo build --release
 ./target/release/gramtty
 ```
+
+Needs Rust 1.99 or newer (`rust-version` in `Cargo.toml`). On Linux it also needs static `libc++.a` and `libc++abi.a` (TDLib is linked statically):
+
+- Arch: `pacman -S libc++ libc++abi`
+- Debian/Ubuntu: `apt install libc++-dev libc++abi-dev libclang-dev`
+- Fedora: `dnf install libcxx-static libcxxabi-static`
+- Other location: set `LIBCXX_DIR` to a directory containing both files
+
+## Runtime tools
+
+All optional, looked up on `PATH`; a missing one only disables its feature.
+
+| Used for | Linux | macOS |
+|---|---|---|
+| Playing media with sound inside the viewer (kitty only) | `libmpv` (`mpv` package), loaded dynamically | `libmpv` (`brew install mpv`) |
+| Playing media in a separate window (`x`) | `mpv` | `mpv` |
+| Video and sticker previews, inline WebM stickers and GIFs, upload thumbnails | `ffmpeg` | `ffmpeg` |
+| Probing media before upload | `ffprobe` | `ffprobe` |
+| Recording voice messages | `pw-record` (PipeWire) and `opusenc` or `ffmpeg` with libopus | `ffmpeg` (the terminal needs microphone permission) |
+| Desktop notifications | `notify-send` (libnotify) | `osascript` (built in) |
+| Notification sound | `pw-play` or `canberra-gtk-play` | `afplay` (built in) |
+| Clipboard copy and `Ctrl+V` paste | `wl-copy`, `wl-paste` (wl-clipboard); Wayland only | `pbcopy`, `pbpaste` (built in); text only |
+| Opening files and links externally | `xdg-open` | `open` (built in) |
 
 ## Telegram API credentials
 
