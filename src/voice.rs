@@ -97,13 +97,23 @@ pub fn pick_encoder(has: impl Fn(&str) -> bool) -> Result<Encoder, String> {
     }
 }
 
+#[cfg(target_os = "linux")]
+const RECORDER: &str = "pw-record";
+#[cfg(target_os = "linux")]
+const RECORDER_MISSING: &str = "voice messages need pw-record (PipeWire)";
+#[cfg(target_os = "macos")]
+const RECORDER: &str = "ffmpeg";
+#[cfg(target_os = "macos")]
+const RECORDER_MISSING: &str = "voice messages need ffmpeg (brew install ffmpeg)";
+
 pub fn check_tools() -> Result<Encoder, String> {
-    if find_in_path("pw-record").is_none() {
-        return Err("voice messages need pw-record (PipeWire)".to_owned());
+    if find_in_path(RECORDER).is_none() {
+        return Err(RECORDER_MISSING.to_owned());
     }
     pick_encoder(|p| find_in_path(p).is_some())
 }
 
+#[cfg(target_os = "linux")]
 pub fn record_args() -> Vec<String> {
     vec![
         "--raw".into(),
@@ -116,6 +126,26 @@ pub fn record_args() -> Vec<String> {
         "--media-role".into(),
         "Communication".into(),
         "-".into(),
+    ]
+}
+
+#[cfg(target_os = "macos")]
+pub fn record_args() -> Vec<String> {
+    vec![
+        "-v".into(),
+        "error".into(),
+        "-nostdin".into(),
+        "-f".into(),
+        "avfoundation".into(),
+        "-i".into(),
+        ":0".into(),
+        "-ac".into(),
+        "1".into(),
+        "-ar".into(),
+        RATE.to_string(),
+        "-f".into(),
+        "s16le".into(),
+        "pipe:1".into(),
     ]
 }
 
@@ -233,18 +263,18 @@ pub struct Recorder {
 
 impl Recorder {
     pub fn start() -> Result<Self, String> {
-        let mut child = tokio::process::Command::new("pw-record")
+        let mut child = tokio::process::Command::new(RECORDER)
             .args(record_args())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true)
             .spawn()
-            .map_err(|e| format!("pw-record: {e}"))?;
+            .map_err(|e| format!("{RECORDER}: {e}"))?;
         let mut stdout = child
             .stdout
             .take()
-            .ok_or_else(|| "pw-record: no stdout".to_owned())?;
+            .ok_or_else(|| format!("{RECORDER}: no stdout"))?;
         let levels = Levels::default();
         let shared = levels.clone();
         let reader = tokio::spawn(async move {
@@ -283,8 +313,8 @@ impl Recorder {
         let limit = tokio::time::sleep(Duration::from_secs(MAX_SECONDS));
         let send = tokio::select! {
             status = self.child.wait() => {
-                let status = status.map_err(|e| format!("pw-record: {e}"))?;
-                return Err(format!("pw-record stopped unexpectedly ({status})"));
+                let status = status.map_err(|e| format!("{RECORDER}: {e}"))?;
+                return Err(format!("{RECORDER} stopped unexpectedly ({status})"));
             }
             s = stop => matches!(s, Ok(Stop::Send)),
             _ = limit => true,
@@ -292,12 +322,12 @@ impl Recorder {
         self.child
             .kill()
             .await
-            .map_err(|e| format!("stop pw-record: {e}"))?;
+            .map_err(|e| format!("stop {RECORDER}: {e}"))?;
         let pcm = self
             .reader
             .await
             .map_err(|e| format!("recording reader: {e}"))?
-            .map_err(|e| format!("reading pw-record output: {e}"))?;
+            .map_err(|e| format!("reading {RECORDER} output: {e}"))?;
         Ok(send.then_some(pcm))
     }
 }

@@ -806,10 +806,7 @@ fn tick_span(app: &App, last: &Msg) -> Option<Span<'static>> {
     if !last.outgoing {
         return None;
     }
-    let read = app
-        .chats
-        .get(&last.chat_id)
-        .is_some_and(|c| c.last_read_outbox >= last.id);
+    let read = app.read_outbox(last.chat_id) >= last.id;
     let (glyph, style) = theme::tick(match &last.state {
         SendState::Pending => theme::Tick::Pending,
         SendState::Failed(_) => theme::Tick::Failed,
@@ -1575,7 +1572,7 @@ fn fingerprint(
     let chat = msgs
         .get(range.start)
         .and_then(|m| app.chats.get(&m.chat_id));
-    chat.map(|c| (c.kind.clone(), c.last_read_outbox))
+    chat.map(|c| (c.kind.clone(), app.read_outbox(c.id)))
         .hash(&mut h);
     app.playing.as_ref().map(|p| p.target).hash(&mut h);
     for m in &msgs[range] {
@@ -4436,6 +4433,24 @@ mod tests {
         app
     }
 
+    #[test]
+    fn forum_ticks_follow_the_open_topic_read_state() {
+        let mut app = bubble_app();
+        let chat = app.chats.get_mut(&10).unwrap();
+        chat.forum = true;
+        chat.last_read_outbox = 0;
+        app.topics.entry(10).or_default().upsert(model::Topic {
+            id: 1,
+            last_read_outbox: 4,
+            ..Default::default()
+        });
+        app.open_topic = Some(1);
+        let rows = snapshot(&mut app, 100, 40);
+        assert!(rows[row_of(&rows, "mine read")].contains("✓✓"));
+        let unread = &rows[row_of(&rows, "mine unread")];
+        assert!(!unread.contains("✓✓"), "{unread}");
+    }
+
     fn row_of(rows: &[String], needle: &str) -> usize {
         rows.iter()
             .position(|r| r.contains(needle))
@@ -5389,8 +5404,18 @@ mod tests {
             msg_id: 40,
             items: Some(vec![(Sender::User(2), "👍".to_owned())]),
             sel: 0,
+            read: false,
         });
         assert!(render(&mut app, 120, 40).contains("Alice Longname"));
+        app.popup = Some(Popup::ReactionList {
+            chat_id: 10,
+            msg_id: 40,
+            items: Some(vec![(Sender::User(2), "10.11 12:30".to_owned())]),
+            sel: 0,
+            read: true,
+        });
+        let screen = render(&mut app, 120, 40);
+        assert!(screen.contains("Read by") && screen.contains("10.11 12:30  Alice Longname"));
         app.popup = Some(Popup::Switcher {
             input: crate::input::TextInput::default(),
             sel: 0,
@@ -5665,6 +5690,7 @@ mod tests {
         assert!(shows_image(&mut app, 100, 40));
     }
 
+    #[cfg(target_os = "linux")]
     fn rss_kb() -> u64 {
         std::fs::read_to_string("/proc/self/status")
             .unwrap()
@@ -5674,6 +5700,7 @@ mod tests {
             .unwrap()
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn fixture_scroll_memory() {
@@ -9135,6 +9162,7 @@ mod repaint_tests {
         assert!(text.contains("Alice Longname"), "{text}");
     }
 
+    #[cfg(target_os = "linux")]
     fn kitty_reads_shm(out: &[u8]) -> Vec<String> {
         let text = String::from_utf8_lossy(out);
         let mut cmds = Vec::new();
@@ -9170,6 +9198,7 @@ mod repaint_tests {
         cmds
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn viewer_plays_video_inline_through_shared_memory_frames() {
         if crate::video::probe().is_err() {
@@ -9681,6 +9710,7 @@ mod repaint_tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
     fn proc_stats() -> (u64, u64, u64) {
         let status = std::fs::read_to_string("/proc/self/status").unwrap();
         let kb = |key: &str| {
@@ -9705,6 +9735,7 @@ mod repaint_tests {
         (kb("VmRSS:"), kb("VmHWM:"), ticks * 10)
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore]
     async fn inline_animation_budget() {

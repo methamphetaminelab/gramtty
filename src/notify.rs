@@ -33,6 +33,7 @@ pub enum Icon {
     Download(i32),
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn escape_markup(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -48,6 +49,7 @@ pub fn escape_markup(text: &str) -> String {
     out
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn notify_args(title: &str, body: &str, icon: Option<&str>) -> Vec<String> {
     let mut args = vec!["--app-name".to_owned(), crate::config::APP_NAME.to_owned()];
     if let Some(icon) = icon {
@@ -58,10 +60,57 @@ pub fn notify_args(title: &str, body: &str, icon: Option<&str>) -> Vec<String> {
     args
 }
 
+#[cfg(any(target_os = "macos", test))]
+pub fn applescript_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+#[cfg(any(target_os = "macos", test))]
+pub fn osascript_args(title: &str, body: &str) -> Vec<String> {
+    vec![
+        "-e".to_owned(),
+        format!(
+            "display notification {} with title {}",
+            applescript_string(body),
+            applescript_string(title)
+        ),
+    ]
+}
+
+#[cfg(target_os = "linux")]
+const NOTIFIER: &str = "notify-send";
+#[cfg(target_os = "linux")]
+const NOTIFIER_MISSING: &str =
+    "desktop notifications need notify-send (libnotify); disable them in Space o";
+#[cfg(target_os = "macos")]
+const NOTIFIER: &str = "osascript";
+#[cfg(target_os = "macos")]
+const NOTIFIER_MISSING: &str = "desktop notifications need osascript; disable them in Space o";
+
+#[cfg(target_os = "linux")]
+fn notifier_args(title: &str, body: &str, icon: Option<&str>) -> Vec<String> {
+    notify_args(title, body, icon)
+}
+
+#[cfg(target_os = "macos")]
+fn notifier_args(title: &str, body: &str, _icon: Option<&str>) -> Vec<String> {
+    osascript_args(title, body)
+}
+
 pub fn send(title: String, body: String, icon: Option<String>, tx: UnboundedSender<Event>) {
     tokio::spawn(async move {
-        let args = notify_args(&title, &body, icon.as_deref());
-        let result = tokio::process::Command::new("notify-send")
+        let args = notifier_args(&title, &body, icon.as_deref());
+        let result = tokio::process::Command::new(NOTIFIER)
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -71,14 +120,11 @@ pub fn send(title: String, body: String, icon: Option<String>, tx: UnboundedSend
         let err = match result {
             Ok(out) if out.status.success() => return,
             Ok(out) => format!(
-                "notify-send failed: {}",
+                "{NOTIFIER} failed: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             ),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                "desktop notifications need notify-send (libnotify); disable them in Space o"
-                    .to_owned()
-            }
-            Err(e) => format!("notify-send: {e}"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => NOTIFIER_MISSING.to_owned(),
+            Err(e) => format!("{NOTIFIER}: {e}"),
         };
         let _ = tx.send(Event::NotifyFailed(err));
     });
@@ -91,6 +137,7 @@ pub const DEFAULT_SOUND_NAME: &str = "msg_incoming.ogg";
 pub struct SoundEnv {
     pub canberra: bool,
     pub pw_play: bool,
+    pub afplay: bool,
 }
 
 fn on_path(name: &str) -> bool {
@@ -107,6 +154,7 @@ impl SoundEnv {
         Self {
             canberra: on_path("canberra-gtk-play"),
             pw_play: on_path("pw-play"),
+            afplay: cfg!(target_os = "macos") && on_path("afplay"),
         }
     }
 }
@@ -151,6 +199,20 @@ fn canberra(volume: u8, file: &Path, needs_default: bool) -> SoundCommand {
     }
 }
 
+const MACOS_DEFAULT_SOUND: &str = "/System/Library/Sounds/Glass.aiff";
+
+fn afplay(volume: u8, file: &Path) -> SoundCommand {
+    SoundCommand {
+        program: "afplay".to_owned(),
+        args: vec![
+            "-v".to_owned(),
+            format!("{:.2}", f64::from(volume) / 100.0),
+            file.to_string_lossy().into_owned(),
+        ],
+        needs_default: false,
+    }
+}
+
 pub fn sound_command(
     n: &crate::config::Notifications,
     env: &SoundEnv,
@@ -171,6 +233,14 @@ pub fn sound_command(
     }
     if env.canberra {
         return Ok(Some(canberra(volume, file, builtin)));
+    }
+    if env.afplay {
+        let file = if builtin {
+            Path::new(MACOS_DEFAULT_SOUND)
+        } else {
+            file
+        };
+        return Ok(Some(afplay(volume, file)));
     }
     Err("notification sound needs pw-play or canberra-gtk-play".to_owned())
 }
@@ -318,6 +388,7 @@ mod tests {
         let all = SoundEnv {
             canberra: true,
             pw_play: true,
+            afplay: true,
         };
         n.volume = 50;
         let c = sound_command(&n, &all, def).unwrap().unwrap();
@@ -361,6 +432,46 @@ mod tests {
         assert_eq!(sound_command(&n, &all, def), Ok(None));
         n.sound = true;
         assert!(sound_command(&n, &SoundEnv::default(), def).is_err());
+    }
+
+    #[test]
+    fn afplay_is_the_last_resort_and_uses_a_system_sound_by_default() {
+        let mut n = crate::config::Notifications {
+            volume: 50,
+            ..Default::default()
+        };
+        let def = Path::new("/c/msg_incoming.ogg");
+        let mac = SoundEnv {
+            afplay: true,
+            ..SoundEnv::default()
+        };
+        let c = sound_command(&n, &mac, def).unwrap().unwrap();
+        assert_eq!(c.program, "afplay");
+        assert_eq!(c.args, ["-v", "0.50", MACOS_DEFAULT_SOUND]);
+        assert!(!c.needs_default);
+        n.sound_file = "/m/ding.aiff".to_owned();
+        let c = sound_command(&n, &mac, def).unwrap().unwrap();
+        assert_eq!(c.args, ["-v", "0.50", "/m/ding.aiff"]);
+        let both = SoundEnv {
+            pw_play: true,
+            ..mac
+        };
+        assert_eq!(
+            sound_command(&n, &both, def).unwrap().unwrap().program,
+            "pw-play"
+        );
+    }
+
+    #[test]
+    fn osascript_notification_escapes_applescript_strings() {
+        assert_eq!(
+            osascript_args("Tom \"T\"", "a\\b \" & quit"),
+            [
+                "-e",
+                "display notification \"a\\\\b \\\" & quit\" with title \"Tom \\\"T\\\"\""
+            ]
+        );
+        assert_eq!(applescript_string("plain"), "\"plain\"");
     }
 
     #[test]

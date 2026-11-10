@@ -131,6 +131,7 @@ pub fn plan(items: &[Pending]) -> Vec<Vec<usize>> {
     out
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug, PartialEq, Eq)]
 pub enum ClipKind {
     Files(String),
@@ -139,6 +140,7 @@ pub enum ClipKind {
     Empty,
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn clip_kinds(types: &str) -> Vec<ClipKind> {
     let types: Vec<&str> = types
         .lines()
@@ -182,6 +184,7 @@ pub fn clip_kinds(types: &str) -> Vec<ClipKind> {
     out
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn percent_decode(s: &str) -> Vec<u8> {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
@@ -203,6 +206,7 @@ fn percent_decode(s: &str) -> Vec<u8> {
     out
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn parse_uri_list(text: &str) -> Vec<PathBuf> {
     use std::os::unix::ffi::OsStringExt;
     text.lines()
@@ -222,6 +226,7 @@ pub fn parse_uri_list(text: &str) -> Vec<PathBuf> {
         .collect()
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn image_extension(mime: &str) -> &'static str {
     match mime {
         "image/jpeg" => "jpg",
@@ -232,6 +237,7 @@ pub fn image_extension(mime: &str) -> &'static str {
     }
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 #[derive(Debug)]
 pub enum Clip {
     Files(Vec<PathBuf>),
@@ -239,6 +245,7 @@ pub enum Clip {
     Text(String),
 }
 
+#[cfg(target_os = "linux")]
 async fn wl_paste(args: &[&str]) -> Result<Vec<u8>, String> {
     let child = tokio::process::Command::new("wl-paste")
         .args(args)
@@ -297,6 +304,7 @@ pub fn ensure_dir(dir: &Path) -> Result<(), String> {
         .map_err(|e| format!("cannot create {}: {e}", dir.display()))
 }
 
+#[cfg(target_os = "linux")]
 pub async fn read_clipboard(uploads: PathBuf) -> Result<Clip, String> {
     if std::env::var_os("WAYLAND_DISPLAY").is_none_or(|v| v.is_empty()) {
         return Err(
@@ -339,10 +347,12 @@ pub async fn read_clipboard(uploads: PathBuf) -> Result<Clip, String> {
     Err("clipboard has nothing to paste".to_owned())
 }
 
+#[cfg(target_os = "linux")]
 pub async fn copy_text(text: String) -> Result<(), String> {
     wl_copy(text.into_bytes(), None).await
 }
 
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn to_png(path: &Path) -> Result<Vec<u8>, String> {
     let img = image::ImageReader::open(path)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?
@@ -356,6 +366,7 @@ pub fn to_png(path: &Path) -> Result<Vec<u8>, String> {
     Ok(out.into_inner())
 }
 
+#[cfg(target_os = "linux")]
 pub async fn copy_image(path: PathBuf) -> Result<(), String> {
     let png = tokio::task::spawn_blocking(move || to_png(&path))
         .await
@@ -363,6 +374,7 @@ pub async fn copy_image(path: PathBuf) -> Result<(), String> {
     wl_copy(png, Some("image/png")).await
 }
 
+#[cfg(target_os = "linux")]
 async fn wl_copy(data: Vec<u8>, mime: Option<&str>) -> Result<(), String> {
     use tokio::io::AsyncWriteExt;
     if std::env::var_os("WAYLAND_DISPLAY").is_none_or(|v| v.is_empty()) {
@@ -403,6 +415,71 @@ async fn wl_copy(data: Vec<u8>, mime: Option<&str>) -> Result<(), String> {
     } else {
         Err(format!("wl-copy failed ({status})"))
     }
+}
+
+#[cfg(target_os = "macos")]
+pub async fn read_clipboard(_uploads: PathBuf) -> Result<Clip, String> {
+    let child = tokio::process::Command::new("pbpaste")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("pbpaste: {e}"))?;
+    let out = tokio::time::timeout(CLIPBOARD_TIMEOUT, child.wait_with_output())
+        .await
+        .map_err(|_| "pbpaste did not answer within 5 s".to_owned())?
+        .map_err(|e| format!("pbpaste: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "pbpaste failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    if out.stdout.is_empty() {
+        return Err(
+            "clipboard has no text; pasting images and files from the clipboard is not supported on macOS yet"
+                .to_owned(),
+        );
+    }
+    Ok(Clip::Text(
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+pub async fn copy_text(text: String) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt;
+    let mut child = tokio::process::Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("pbcopy: {e}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "pbcopy: no stdin".to_owned())?;
+    stdin
+        .write_all(text.as_bytes())
+        .await
+        .map_err(|e| format!("pbcopy: {e}"))?;
+    drop(stdin);
+    let status = tokio::time::timeout(CLIPBOARD_TIMEOUT, child.wait())
+        .await
+        .map_err(|_| "pbcopy did not finish within 5 s".to_owned())?
+        .map_err(|e| format!("pbcopy: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("pbcopy failed ({status})"))
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub async fn copy_image(_path: PathBuf) -> Result<(), String> {
+    Err("copying images to the clipboard is not supported on macOS yet".to_owned())
 }
 
 pub fn prune_uploads(dir: &Path) -> Result<(), String> {

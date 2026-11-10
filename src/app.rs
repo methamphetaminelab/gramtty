@@ -93,6 +93,7 @@ pub enum MenuAction {
     GoToReply,
     SenderProfile,
     ReactionList,
+    Viewers,
     Buttons,
     ChatProfile,
     ShowPinned,
@@ -193,6 +194,7 @@ pub enum Popup {
         msg_id: i64,
         items: Option<Vec<(Sender, String)>>,
         sel: usize,
+        read: bool,
     },
     Search(SearchView),
     Buttons(ButtonsView),
@@ -1045,7 +1047,7 @@ impl App {
                         Ok(list) => *items = Some(list),
                         Err(e) => {
                             self.popup = None;
-                            self.set_status(format!("reactions: {e}"), true);
+                            self.set_status(format!("who reacted or read: {e}"), true);
                         }
                     }
                 }
@@ -2485,6 +2487,14 @@ impl App {
 
     pub fn topic(&self, chat_id: i64, topic: i32) -> Option<&model::Topic> {
         self.topics.get(&chat_id).and_then(|l| l.get(topic))
+    }
+
+    pub fn read_outbox(&self, chat_id: i64) -> i64 {
+        self.open_topic_info()
+            .filter(|_| self.open_chat == Some(chat_id))
+            .map(|t| t.last_read_outbox)
+            .or_else(|| self.chats.get(&chat_id).map(|c| c.last_read_outbox))
+            .unwrap_or(0)
     }
 
     pub fn open_topic_info(&self) -> Option<&model::Topic> {
@@ -4255,9 +4265,20 @@ impl App {
                         msg_id: msg.id,
                         items: None,
                         sel: 0,
+                        read: false,
                     });
                     self.td.load_reaction_list(msg.chat_id, msg.id);
                 }
+            }
+            MenuAction::Viewers => {
+                self.popup = Some(Popup::ReactionList {
+                    chat_id: msg.chat_id,
+                    msg_id: msg.id,
+                    items: None,
+                    sel: 0,
+                    read: true,
+                });
+                self.td.load_viewers(msg.chat_id, msg.id);
             }
             MenuAction::Buttons => self.open_buttons(),
             MenuAction::Details => self.open_details(msg.chat_id, msg.id),
@@ -4417,6 +4438,13 @@ impl App {
         let pinned = sel.is_some_and(|m| m.pinned);
         let reply = sel.is_some_and(|m| m.reply_to.is_some());
         let reacted = sel.is_some_and(|m| !m.reactions.is_empty());
+        let viewers = sel.is_some_and(|m| {
+            m.outgoing
+                && m.state == model::SendState::Sent
+                && self.chats.get(&m.chat_id).is_some_and(|c| {
+                    matches!(c.kind, model::ChatKind::Group | model::ChatKind::Supergroup)
+                })
+        });
         let buttons = self
             .selected_group()
             .iter()
@@ -4500,6 +4528,13 @@ impl App {
                         key: 'u',
                         label: "Who reacted",
                         action: MenuAction::ReactionList,
+                    });
+                }
+                if viewers {
+                    items.push(MenuItem {
+                        key: 'w',
+                        label: "Who read",
+                        action: MenuAction::Viewers,
                     });
                 }
                 if buttons {
@@ -5093,6 +5128,7 @@ impl App {
             | MenuAction::GoToReply
             | MenuAction::SenderProfile
             | MenuAction::ReactionList
+            | MenuAction::Viewers
             | MenuAction::Buttons
             | MenuAction::Details
             | MenuAction::EditHistory
@@ -7169,6 +7205,7 @@ mod tests {
         app.sound_env = Some(notify::SoundEnv {
             canberra: true,
             pw_play: false,
+            afplay: false,
         });
         (app, log)
     }
@@ -7503,6 +7540,7 @@ mod tests {
                     .collect(),
             ),
             sel: 0,
+            read: false,
         });
         press(&mut app, K::PageDown, M::NONE);
         press(&mut app, K::PageDown, M::NONE);

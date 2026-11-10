@@ -13,7 +13,15 @@ pub const SEEK_SECONDS: i32 = 5;
 pub const VOLUME_STEP: i32 = 5;
 const POLL: Duration = Duration::from_millis(100);
 const STUCK: Duration = Duration::from_secs(3);
-const LIBRARIES: [&str; 2] = ["libmpv.so.2", "libmpv.so"];
+#[cfg(target_os = "linux")]
+const LIBRARIES: &[&str] = &["libmpv.so.2", "libmpv.so"];
+#[cfg(target_os = "macos")]
+const LIBRARIES: &[&str] = &[
+    "libmpv.2.dylib",
+    "libmpv.dylib",
+    "/opt/homebrew/lib/libmpv.2.dylib",
+    "/opt/homebrew/lib/libmpv.dylib",
+];
 
 const RENDER_API_TYPE: c_int = 1;
 const RENDER_SKIP: c_int = 13;
@@ -113,7 +121,7 @@ fn bind(lib: libloading::Library) -> Result<Lib, libloading::Error> {
 
 fn library() -> Result<&'static Lib, String> {
     static LIB: OnceLock<Result<Lib, String>> = OnceLock::new();
-    LIB.get_or_init(|| load(&LIBRARIES))
+    LIB.get_or_init(|| load(LIBRARIES))
         .as_ref()
         .map_err(Clone::clone)
 }
@@ -939,10 +947,33 @@ fn write_shm(name: &str, data: &[u8]) -> Result<(), String> {
         Mode::RUSR | Mode::WUSR,
     )
     .map_err(|e| format!("shm_open {name}: {e}"))?;
-    let mut file = std::fs::File::from(fd);
-    if let Err(e) = file.write_all(data) {
+    if let Err(e) = fill_shm(fd, data) {
         let _ = rustix::shm::unlink(name);
         return Err(format!("write {name}: {e}"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn fill_shm(fd: rustix::fd::OwnedFd, data: &[u8]) -> std::io::Result<()> {
+    std::fs::File::from(fd).write_all(data)
+}
+
+#[cfg(target_os = "macos")]
+fn fill_shm(fd: rustix::fd::OwnedFd, data: &[u8]) -> std::io::Result<()> {
+    use rustix::mm::{MapFlags, ProtFlags};
+    rustix::fs::ftruncate(&fd, data.len() as u64)?;
+    unsafe {
+        let ptr = rustix::mm::mmap(
+            std::ptr::null_mut(),
+            data.len(),
+            ProtFlags::READ | ProtFlags::WRITE,
+            MapFlags::SHARED,
+            &fd,
+            0,
+        )?;
+        std::ptr::copy_nonoverlapping(data.as_ptr(), ptr.cast::<u8>(), data.len());
+        rustix::mm::munmap(ptr, data.len())?;
     }
     Ok(())
 }

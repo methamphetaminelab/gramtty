@@ -75,7 +75,9 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, popup: &Popup) {
     match popup {
         Popup::Profile(p) => draw_profile(frame, area, app, p),
         Popup::Reactions(r) => draw_reactions(frame, area, app, r),
-        Popup::ReactionList { items, sel, .. } => {
+        Popup::ReactionList {
+            items, sel, read, ..
+        } => {
             let rect = centered(area, 46, 20);
             let w = rect.width.saturating_sub(2) as usize;
             let rows = rect.height.saturating_sub(2) as usize;
@@ -93,7 +95,11 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, popup: &Popup) {
                         .map(|(i, (sender, emoji))| {
                             row_line(
                                 vec![
-                                    Span::raw(format!("{}  ", model::reaction_chip(Some(emoji)))),
+                                    Span::raw(if *read {
+                                        format!("{emoji}  ")
+                                    } else {
+                                        format!("{}  ", model::reaction_chip(Some(emoji)))
+                                    }),
                                     Span::raw(app.sender_name(*sender)),
                                 ],
                                 i == sel,
@@ -104,7 +110,8 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, popup: &Popup) {
                         .collect()
                 }
             };
-            framed(frame, rect, "Reactions", "Enter profile · Esc close", lines);
+            let title = if *read { "Read by" } else { "Reactions" };
+            framed(frame, rect, title, "Enter profile · Esc close", lines);
         }
         Popup::Search(sv) => draw_search(frame, area, app, sv),
         Popup::Details {

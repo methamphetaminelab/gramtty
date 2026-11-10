@@ -1284,6 +1284,35 @@ impl Td {
         });
     }
 
+    pub fn load_viewers(&self, chat_id: i64, message_id: i64) {
+        let c = self.client_id;
+        self.task("viewers", async move {
+            let result = tdlib_rs::functions::get_message_viewers(chat_id, message_id, c)
+                .await
+                .map(|enums::MessageViewers::MessageViewers(v)| {
+                    v.viewers
+                        .iter()
+                        .map(|v| {
+                            let at = chrono::DateTime::from_timestamp(i64::from(v.view_date), 0)
+                                .map(|d| {
+                                    d.with_timezone(&chrono::Local)
+                                        .format("%d.%m %H:%M")
+                                        .to_string()
+                                })
+                                .unwrap_or_default();
+                            (Sender::User(v.user_id), at)
+                        })
+                        .collect()
+                })
+                .map_err(|e| friendly_error(&e));
+            Event::ReactionList {
+                chat_id,
+                message_id,
+                result,
+            }
+        });
+    }
+
     pub fn load_reaction_list(&self, chat_id: i64, message_id: i64) {
         let c = self.client_id;
         self.task("reaction list", async move {
@@ -3314,9 +3343,17 @@ mod tests {
         }))
         .expect("messages JSON with a background-less chatBackground");
         let enums::Messages::Messages(page) = page;
-        let msgs: Vec<Msg> = page.messages.into_iter().flatten().map(convert_message).collect();
+        let msgs: Vec<Msg> = page
+            .messages
+            .into_iter()
+            .flatten()
+            .map(convert_message)
+            .collect();
         assert_eq!(msgs.len(), 2);
-        assert_eq!(msgs[0].media.as_deref(), Some("changed the chat background"));
+        assert_eq!(
+            msgs[0].media.as_deref(),
+            Some("changed the chat background")
+        );
         assert_eq!(msgs[1].body.text, "hi");
     }
 
@@ -3360,7 +3397,12 @@ mod tests {
         }))
         .expect("messages JSON with a gift that has no background");
         let enums::Messages::Messages(page) = page;
-        let msgs: Vec<Msg> = page.messages.into_iter().flatten().map(convert_message).collect();
+        let msgs: Vec<Msg> = page
+            .messages
+            .into_iter()
+            .flatten()
+            .map(convert_message)
+            .collect();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[1].body.text, "hi");
     }

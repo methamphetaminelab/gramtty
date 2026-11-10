@@ -85,13 +85,30 @@ const RUNNABLE_EXTENSIONS: [&str; 14] = [
     "jar", "command",
 ];
 
+#[cfg(target_os = "linux")]
+const PLATFORM_RUNNABLE_EXTENSIONS: &[&str] = &[];
+#[cfg(target_os = "macos")]
+const PLATFORM_RUNNABLE_EXTENSIONS: &[&str] = &[
+    "app",
+    "pkg",
+    "mpkg",
+    "dmg",
+    "scpt",
+    "applescript",
+    "workflow",
+    "terminal",
+    "tool",
+];
+
 pub fn runnable(path: &Path) -> Result<Option<&'static str>, String> {
     use std::os::unix::fs::PermissionsExt;
     let ext = path
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
         .unwrap_or_default();
-    if RUNNABLE_EXTENSIONS.contains(&ext.as_str()) {
+    if RUNNABLE_EXTENSIONS.contains(&ext.as_str())
+        || PLATFORM_RUNNABLE_EXTENSIONS.contains(&ext.as_str())
+    {
         return Ok(Some("this file type can run as a program"));
     }
     let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -101,8 +118,13 @@ pub fn runnable(path: &Path) -> Result<Option<&'static str>, String> {
     Ok(None)
 }
 
+#[cfg(target_os = "linux")]
+const OPENER: &str = "xdg-open";
+#[cfg(target_os = "macos")]
+const OPENER: &str = "open";
+
 pub fn xdg_open(target: &str) -> Result<(), String> {
-    std::process::Command::new("xdg-open")
+    std::process::Command::new(OPENER)
         .arg(target)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -111,7 +133,7 @@ pub fn xdg_open(target: &str) -> Result<(), String> {
         .map(|mut child| {
             std::thread::spawn(move || child.wait());
         })
-        .map_err(|e| format!("xdg-open: {e}"))
+        .map_err(|e| format!("{OPENER}: {e}"))
 }
 
 pub fn parse_user_dirs(content: &str, home: &Path) -> Option<PathBuf> {

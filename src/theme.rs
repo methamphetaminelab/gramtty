@@ -1465,6 +1465,7 @@ pub fn load(
     }
 }
 
+#[cfg(target_os = "linux")]
 pub fn watch(
     path: &std::path::Path,
     notify: impl Fn(Result<(), String>) + Send + 'static,
@@ -1502,6 +1503,49 @@ pub fn watch(
                     Err(rustix::io::Errno::INTR) => {}
                     Err(e) => {
                         notify(Err(format!("stopped watching {shown}: {e}")));
+                        return;
+                    }
+                }
+            }
+        })
+        .map(|_| ())
+        .map_err(|e| format!("cannot start theme watcher: {e}"))
+}
+
+#[cfg(target_os = "macos")]
+pub fn watch(
+    path: &std::path::Path,
+    notify: impl Fn(Result<(), String>) + Send + 'static,
+) -> Result<(), String> {
+    let Some(dir) = path.parent() else {
+        return Err(format!("cannot watch {}", path.display()));
+    };
+    std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+    let path = path.to_path_buf();
+    let stamp = |p: &std::path::Path| -> Result<Option<(std::time::SystemTime, u64)>, String> {
+        match std::fs::metadata(p) {
+            Ok(m) => m
+                .modified()
+                .map(|t| Some((t, m.len())))
+                .map_err(|e| format!("stopped watching {}: {e}", p.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("stopped watching {}: {e}", p.display())),
+        }
+    };
+    let mut last = stamp(&path)?;
+    std::thread::Builder::new()
+        .name("theme-watch".to_owned())
+        .spawn(move || {
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                match stamp(&path) {
+                    Ok(now) if now != last => {
+                        last = now;
+                        notify(Ok(()));
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        notify(Err(e));
                         return;
                     }
                 }
