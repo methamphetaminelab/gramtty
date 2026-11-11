@@ -147,6 +147,7 @@ pub struct Picker {
     pub scroll: usize,
     pub cols: usize,
     pub rows: usize,
+    pub preview: bool,
 }
 
 impl Picker {
@@ -161,6 +162,7 @@ impl Picker {
             scroll: 0,
             cols: 1,
             rows: 1,
+            preview: false,
         }
     }
 
@@ -178,6 +180,9 @@ impl Picker {
             } else {
                 &[]
             };
+            if self.current_tab(lib) == Tab::Gifs {
+                return remote.to_vec();
+            }
             return search_results(lib, q, remote);
         }
         lib.items(self.current_tab(lib))
@@ -188,6 +193,7 @@ impl Picker {
     pub fn switch_tab(&mut self, lib: &Library, delta: isize) {
         let n = lib.tabs().len() as isize;
         self.tab = (self.tab as isize + delta).rem_euclid(n) as usize;
+        self.remote_for.clear();
         self.sel = 0;
         self.scroll = 0;
     }

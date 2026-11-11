@@ -457,21 +457,22 @@ fn draw_chats(frame: &mut Frame, area: Rect, app: &App) {
                 badge = format!(" {}", g.mention_dot);
                 badge_style = theme::mention_badge();
             }
-            if c.unread > 0 {
+            let unread = app.chat_unread(c.id);
+            if unread > 0 {
                 if g.unread_dot.is_empty() {
-                    badge.push_str(&format!(" {}", app.count(i64::from(c.unread))));
+                    badge.push_str(&format!(" {}", app.count(i64::from(unread))));
                 } else {
                     badge.push_str(&format!(
                         " {} {}",
                         g.unread_dot,
-                        app.count(i64::from(c.unread))
+                        app.count(i64::from(unread))
                     ));
                 }
                 if c.mentions == 0 && !muted {
                     badge_style = theme::unread_badge();
                 }
             }
-            let mut title_style = if c.unread > 0 && !muted {
+            let mut title_style = if unread > 0 && !muted {
                 theme::unread()
             } else if muted {
                 theme::muted()
@@ -1422,7 +1423,23 @@ fn draw_messages(frame: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn draw_command_suggestions(frame: &mut Frame, area: Rect, app: &App) {
-    let list = app.command_suggestions();
+    let mentions = app.mention_suggestions();
+    let list: Vec<(String, String)> = if mentions.is_empty() {
+        app.command_suggestions()
+            .into_iter()
+            .map(|c| (format!("/{} ", c.name), c.description.clone()))
+            .collect()
+    } else {
+        mentions
+            .into_iter()
+            .map(|(username, name)| (format!("@{username} "), name))
+            .collect()
+    };
+    let title = if list.first().is_some_and(|(k, _)| k.starts_with('@')) {
+        " Mention "
+    } else {
+        " Commands "
+    };
     if list.is_empty() || area.height < 3 {
         return;
     }
@@ -1436,11 +1453,11 @@ fn draw_command_suggestions(frame: &mut Frame, area: Rect, app: &App) {
         .enumerate()
         .skip(start)
         .take(rows)
-        .map(|(i, c)| {
+        .map(|(i, (key, desc))| {
             row_line(
                 vec![
-                    Span::styled(format!("/{} ", c.name), theme::active_field()),
-                    Span::styled(c.description.clone(), theme::muted()),
+                    Span::styled(key.clone(), theme::active_field()),
+                    Span::styled(format::sanitize(desc), theme::muted()),
                 ],
                 i == sel,
                 true,
@@ -1457,7 +1474,7 @@ fn draw_command_suggestions(frame: &mut Frame, area: Rect, app: &App) {
     };
     frame.render_widget(Clear, rect);
     let block = theme::popup_block()
-        .title(Span::styled(" Commands ", theme::popup_title()))
+        .title(Span::styled(title, theme::popup_title()))
         .title_bottom(Span::styled(" Tab complete · ↑↓ select ", theme::muted()));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
@@ -2307,6 +2324,26 @@ fn draw_message_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut shown: Vec<Line<'static>> = vec![Line::from(""); pad];
     shown.extend(lines);
     frame.render_widget(Paragraph::new(shown), area);
+    if !app.marked.is_empty() && area.width > 0 {
+        let buf = frame.buffer_mut();
+        for (i, &(top, g)) in starts.iter().enumerate() {
+            if !msgs[groups[g].clone()]
+                .iter()
+                .any(|m| app.marked.contains(&m.id))
+            {
+                continue;
+            }
+            let bottom = starts.get(i + 1).map_or(end, |n| n.0).min(end);
+            for line in top.max(first_line)..bottom {
+                let y = area.y + (pad + line - first_line) as u16;
+                if y < area.bottom() {
+                    buf[(area.x, y)]
+                        .set_symbol("▌")
+                        .set_style(theme::active_field());
+                }
+            }
+        }
+    }
     if full.width > area.width {
         let view_end = first_line + height;
         let top_group = starts
@@ -3175,7 +3212,7 @@ fn info_lines(app: &App, chat: &model::ChatInfo, width: usize) -> Vec<Line<'stat
         }
         field("Topic", format!("{} · {}", t.name, state.join(", ")));
     }
-    field("Unread", app.count(i64::from(chat.unread)));
+    field("Unread", app.count(i64::from(app.chat_unread(chat.id))));
     field(
         "Muted",
         if app.is_muted(chat.id) { "yes" } else { "no" }.to_owned(),
@@ -3292,6 +3329,8 @@ fn draw_popup(frame: &mut Frame, area: Rect, app: &App) {
         | Popup::EditHistory { .. }
         | Popup::ConfirmClearDeleted
         | Popup::QuotePick { .. }
+        | Popup::TextSelect { .. }
+        | Popup::SharedMedia { .. }
         | Popup::Translate { .. }
         | Popup::Members(_)
         | Popup::EventLog(_)
@@ -3444,22 +3483,33 @@ fn draw_popup(frame: &mut Frame, area: Rect, app: &App) {
                     .take(rows)
                     .filter_map(|(i, id)| {
                         let c = app.chats.get(id)?;
-                        let mut spans = vec![Span::raw(c.title.clone())];
-                        if c.unread > 0 {
+                        let mut spans = Vec::new();
+                        if forward.as_ref().is_some_and(|f| f.targets.contains(id)) {
+                            spans.push(Span::styled("✓ ", theme::active_field()));
+                        }
+                        spans.push(Span::raw(c.title.clone()));
+                        let unread = app.chat_unread(*id);
+                        if unread > 0 {
                             spans.push(Span::styled(
-                                format!(" {}", app.count(i64::from(c.unread))),
+                                format!(" {}", app.count(i64::from(unread))),
                                 theme::muted(),
                             ));
                         }
                         Some(row_line(spans, i == sel, true, inner_w))
                     }),
             );
-            let title = if forward.is_some() {
-                "Forward to"
-            } else {
-                "Find chat"
+            let title = match forward {
+                Some(f) => format!(
+                    "Forward to{} · Tab mark · C-t sender name: {}",
+                    match f.targets.len() {
+                        0 => String::new(),
+                        n => format!(" {n} chats"),
+                    },
+                    if f.hide_sender { "hidden" } else { "shown" }
+                ),
+                None => "Find chat".to_owned(),
             };
-            let inner = modal(frame, rect, title, lines);
+            let inner = modal(frame, rect, &title, lines);
             let (_, col) = input.cursor_position(0);
             frame.set_cursor_position(Position {
                 x: (inner.x + 2 + col as u16).min(inner.right().saturating_sub(1)),
@@ -3537,6 +3587,7 @@ fn draw_file_picker(frame: &mut Frame, area: Rect, app: &App, fp: &crate::app::F
 }
 
 const STICKER_CELL_COLS: u16 = 10;
+const PICKER_ANIMATION_FACTOR: usize = 4;
 
 fn draw_stickers(frame: &mut Frame, area: Rect, app: &mut App) {
     let Some(Popup::Stickers(mut sp)) = app.popup.take() else {
@@ -3557,7 +3608,7 @@ fn draw_stickers(frame: &mut Frame, area: Rect, app: &mut App) {
     let block = theme::popup_block()
         .title(Span::styled(title, theme::popup_title()))
         .title_bottom(Span::styled(
-            " Tab/S-Tab section · arrows move · Enter send · type emoji to search · Esc close ",
+            " Tab/S-Tab section · arrows move · Enter send · C-o big preview · type words or emoji to search · Esc ",
             theme::muted(),
         ));
     let inner = block.inner(rect);
@@ -3647,6 +3698,47 @@ fn draw_stickers(frame: &mut Frame, area: Rect, app: &mut App) {
         };
         frame.render_widget(Paragraph::new(Span::styled(text, theme::muted())), grid);
     }
+    let animated = app.media.anim.enabled()
+        && app.settings.media.animations != crate::config::Animations::Off;
+    if sp.preview
+        && let Some(item) = items.get(sp.sel)
+    {
+        frame.render_widget(Clear, grid);
+        let (w, h) = (item.width.max(1), item.height.max(1));
+        let (c, r) = fit_cells(
+            w,
+            h,
+            font,
+            grid.width.saturating_sub(2).max(1),
+            grid.height.saturating_sub(1).max(1),
+        );
+        let t = ImageTarget {
+            area: grid,
+            x: (grid.width.saturating_sub(c)) / 2,
+            y: (grid.height.saturating_sub(r) / 2) as isize,
+            cols: c,
+            rows: r,
+        };
+        if !(animated && draw_animation(frame, t, &mut app.media, &item.att)) {
+            draw_attachment(
+                frame,
+                t,
+                &mut app.media,
+                &item.att,
+                (0, i64::from(item.file_id), 0),
+                false,
+                true,
+                Duration::ZERO,
+            );
+        }
+        app.popup = Some(Popup::Stickers(sp));
+        return;
+    }
+    let mut moving: Vec<usize> = (sp.scroll * cols..items.len().min((sp.scroll + rows) * cols))
+        .filter(|i| animated && crate::anim::source(&items[*i].att).is_some())
+        .collect();
+    moving.sort_by_key(|i| i.abs_diff(sp.sel));
+    moving.truncate(app.settings.media.max_animations() * PICKER_ANIMATION_FACTOR);
     for (i, item) in items
         .iter()
         .enumerate()
@@ -3685,6 +3777,9 @@ fn draw_stickers(frame: &mut Frame, area: Rect, app: &mut App) {
             cols: c,
             rows: r,
         };
+        if moving.contains(&i) && draw_animation(frame, t, &mut app.media, &item.att) {
+            continue;
+        }
         draw_attachment(
             frame,
             t,
@@ -4246,6 +4341,27 @@ mod tests {
         press(&mut app, K::Char('g'), M::CONTROL);
         let screen = render(&mut app, 120, 40);
         assert!(screen.contains("GIFs"));
+        press(&mut app, K::BackTab, M::NONE);
+        press(&mut app, K::BackTab, M::NONE);
+        press(&mut app, K::Char('o'), M::CONTROL);
+        assert!(matches!(&app.popup, Some(Popup::Stickers(sp)) if sp.preview));
+        render(&mut app, 120, 40);
+        press(&mut app, K::Esc, M::NONE);
+        assert!(matches!(&app.popup, Some(Popup::Stickers(sp)) if !sp.preview));
+        app.popup = Some(Popup::TextSelect {
+            input: crate::input::TextInput::with_text("первая строка\nвторая строка"),
+            anchor: Some(3),
+        });
+        let screen = render(&mut app, 120, 40);
+        assert!(screen.contains("Select text") && screen.contains("вторая строка"));
+        app.popup = Some(Popup::SharedMedia { chat_id: 10, sel: 1 });
+        app.media_counts.insert(
+            10,
+            vec![(crate::model::MediaFilter::Photos, Some(63))],
+        );
+        let screen = render(&mut app, 120, 40);
+        assert!(screen.contains("Shared media") && screen.contains("63"), "{screen}");
+        assert!(screen.contains("Voice messages"));
     }
 
     #[test]
@@ -4924,12 +5040,17 @@ mod tests {
             "Notifications",
             "Privacy",
             "Appearance",
-            "Chats",
-            "Behaviour",
+            "Chat list",
+            "Animations",
+            "Messages",
+            "Navigation",
         ] {
             assert!(text.contains(head), "{head}\n{text}");
         }
         for (i, (label, _)) in crate::app::OPTIONS.iter().enumerate() {
+            app.popup = Some(Popup::Options { sel: i });
+            let rows = snapshot(&mut app, 70, 44);
+            let text = rows.join("\n");
             let line = format!("{} ", crate::app::option_key(i));
             assert!(
                 rows.iter()
@@ -4965,8 +5086,7 @@ mod tests {
                 let bottom = row_of(&rows, "j/k move");
                 let left = col_of(&rows[top], "╭ Options");
                 let right = rows[top].chars().count() - 1;
-                let label = crate::app::OPTIONS[0].0.split(':').next().unwrap();
-                let entry = (h >= 40).then(|| row_of(&rows, label));
+                let entry = (h >= 40).then(|| row_of(&rows, "Notifications"));
                 let (label, _) = crate::app::OPTIONS[sel];
                 assert!(
                     rows[top..bottom].iter().any(|r| r.contains(label)),
@@ -5320,10 +5440,12 @@ mod tests {
         ] {
             assert!(screen.contains(want), "{want}: {screen}");
         }
-        app.popup = Some(Popup::Options { sel: 2 });
+        app.popup = Some(Popup::Options { sel: 0 });
         app.settings.privacy.ghost_mode = true;
         let screen = render(&mut app, 120, 40);
         assert!(screen.contains("[x] Desktop notifications"));
+        app.popup = Some(Popup::Options { sel: 2 });
+        let screen = render(&mut app, 120, 40);
         assert!(screen.contains("[ ] Don't mark as read"));
         assert!(screen.contains("[x] Ghost mode"));
         assert!(screen.contains("never online, no typing status"));
@@ -5336,6 +5458,7 @@ mod tests {
             chat_id: None,
             pinned: false,
             sender: None,
+            media: None,
             input: crate::input::TextInput::with_text("needle"),
             searched_for: Some("needle".to_owned()),
             results: vec![found(1), found(2)],
@@ -5419,7 +5542,12 @@ mod tests {
         app.popup = Some(Popup::Switcher {
             input: crate::input::TextInput::default(),
             sel: 0,
-            forward: Some((10, vec![40])),
+            forward: Some(crate::app::Forward {
+                from: 10,
+                ids: vec![40],
+                targets: Vec::new(),
+                hide_sender: false,
+            }),
         });
         assert!(render(&mut app, 120, 40).contains("Forward to"));
         for (w, h) in [(40, 12), (80, 24), (200, 60)] {
@@ -8474,7 +8602,7 @@ mod tests {
                         ("🇺🇸", "7"),
                         ("▸▸▸", "2"),
                         ("⚡⚡⚡", "3K"),
-                        ("Очень", "3"),
+                        ("Очень", "9"),
                         ("Тема", "9"),
                     ] {
                         if text.contains(needle) {

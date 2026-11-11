@@ -52,6 +52,17 @@ impl Chord {
     }
 }
 
+const LAYOUT_RU: &str = "йцукенгшщзхъфывапролджэячсмитьбюё";
+const LAYOUT_EN: &str = "qwertyuiop[]asdfghjkl;'zxcvbnm,.`";
+const LAYOUT_RU_SHIFT: &str = "ЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮЁ";
+const LAYOUT_EN_SHIFT: &str = "QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>~";
+
+pub fn latin_key(c: char) -> Option<char> {
+    [(LAYOUT_RU, LAYOUT_EN), (LAYOUT_RU_SHIFT, LAYOUT_EN_SHIFT)]
+        .into_iter()
+        .find_map(|(ru, en)| en.chars().nth(ru.chars().position(|r| r == c)?))
+}
+
 fn normalize(code: KeyCode, mods: KeyModifiers) -> Chord {
     let mut mods = mods & (KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SHIFT);
     let code = match code {
@@ -135,6 +146,9 @@ pub enum Action {
     CopyQuote,
     TranslateMessage,
     SaveMessage,
+    MarkMessage,
+    SelectText,
+    OpenSharedMedia,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -225,6 +239,9 @@ impl Action {
             Action::CopyQuote => (Group::Message, 13),
             Action::TranslateMessage => (Group::Message, 14),
             Action::SaveMessage => (Group::Message, 15),
+            Action::MarkMessage => (Group::Message, 16),
+            Action::SelectText => (Group::Message, 17),
+            Action::OpenSharedMedia => (Group::Navigate, 29),
         }
     }
 
@@ -232,7 +249,7 @@ impl Action {
         matches!(self, Action::LogOut | Action::DeleteMessage)
     }
 
-    pub const ALL: [Action; 57] = [
+    pub const ALL: [Action; 60] = [
         Action::StartComposer,
         Action::OpenPaneFilter,
         Action::ClosePopup,
@@ -290,6 +307,9 @@ impl Action {
         Action::CopyQuote,
         Action::TranslateMessage,
         Action::SaveMessage,
+        Action::MarkMessage,
+        Action::SelectText,
+        Action::OpenSharedMedia,
     ];
 
     pub fn name(self) -> &'static str {
@@ -351,6 +371,9 @@ impl Action {
             Action::CopyQuote => "CopyQuote",
             Action::TranslateMessage => "TranslateMessage",
             Action::SaveMessage => "SaveMessage",
+            Action::MarkMessage => "MarkMessage",
+            Action::SelectText => "SelectMessageText",
+            Action::OpenSharedMedia => "OpenSharedMedia",
         }
     }
 
@@ -417,6 +440,9 @@ impl Action {
             Action::CopyQuote => "copy as quote",
             Action::TranslateMessage => "translate message",
             Action::SaveMessage => "save to Saved Messages",
+            Action::MarkMessage => "mark / unmark message",
+            Action::SelectText => "select text to copy",
+            Action::OpenSharedMedia => "shared media",
         }
     }
 
@@ -477,6 +503,9 @@ impl Action {
             Action::JumpToNextMention => &["]m"],
             Action::JumpToNextReaction => &["]r"],
             Action::CopyQuote | Action::TranslateMessage | Action::SaveMessage => &[],
+            Action::MarkMessage => &["m"],
+            Action::SelectText => &["V"],
+            Action::OpenSharedMedia => &["<leader>g"],
         }
     }
 }
@@ -686,6 +715,18 @@ impl Keymap {
             }
         }
         if prefix { Feed::Pending } else { Feed::Unbound }
+    }
+
+    pub fn layout_fallback(&self, pending: &[Chord], chord: Chord) -> Chord {
+        let KeyCode::Char(c) = chord.code else {
+            return chord;
+        };
+        match latin_key(c) {
+            Some(l) if self.feed(pending, chord) == Feed::Unbound => {
+                Chord::new(KeyCode::Char(l), chord.mods)
+            }
+            _ => chord,
+        }
     }
 
     pub fn actions_for(&self, chord: Chord) -> Vec<Action> {
@@ -953,7 +994,7 @@ Bogus = "x"
         assert_eq!(
             keys,
             [
-                vec!["Space", "a", "p", "P", "/", "n", "m"],
+                vec!["Space", "a", "p", "P", "/", "n", "m", "g"],
                 vec!["u", "v", "s", "k"],
                 vec!["1", "2", "4", "r"],
                 vec!["o", "L"]

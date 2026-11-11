@@ -30,7 +30,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use crossterm::event::{
-    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange, EventStream,
+    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
+    EventStream, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use futures::StreamExt;
@@ -148,7 +150,12 @@ async fn run() -> Result<(), String> {
             return Err(format!("terminal: {e}"));
         }
     };
-    let _ = execute!(std::io::stdout(), EnableBracketedPaste, EnableFocusChange);
+    let _ = execute!(
+        std::io::stdout(),
+        EnableBracketedPaste,
+        EnableFocusChange,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
     let tmux = probe.image.as_ref().is_some_and(|i| i.tmux);
     let (picker, picker_warning) = image_picker(probe);
     let native_animation = picker.protocol_type() == ProtocolType::Kitty
@@ -197,7 +204,12 @@ async fn run() -> Result<(), String> {
         .and_then(|()| app.media.anim.shutdown(&mut out))
         .and_then(|()| std::io::Write::flush(&mut out))
         .map_err(|e| format!("terminal: {e}"));
-    let _ = execute!(std::io::stdout(), DisableBracketedPaste, DisableFocusChange);
+    let _ = execute!(
+        std::io::stdout(),
+        PopKeyboardEnhancementFlags,
+        DisableBracketedPaste,
+        DisableFocusChange
+    );
     ratatui::restore();
     result.and(settled).and(cleared)
 }
@@ -374,8 +386,19 @@ async fn event_loop(
         tokio::select! {
             ev = input.next() => match ev {
                 Some(Ok(ev)) => {
-                    if !late.swallow(&ev, std::time::Instant::now()) {
-                        app.handle(Event::Input(ev));
+                    let mut next = Some(ev);
+                    while let Some(ev) = next {
+                        if !late.swallow(&ev, std::time::Instant::now()) {
+                            app.handle(Event::Input(ev));
+                        }
+                        next = match crossterm::event::poll(Duration::ZERO) {
+                            Ok(true) => Some(
+                                crossterm::event::read()
+                                    .map_err(|e| format!("terminal input: {e}"))?,
+                            ),
+                            Ok(false) => None,
+                            Err(e) => return Err(format!("terminal input: {e}")),
+                        };
                     }
                 }
                 Some(Err(e)) => return Err(format!("terminal input: {e}")),

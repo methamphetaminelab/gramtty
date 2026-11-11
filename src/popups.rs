@@ -26,6 +26,7 @@ fn framed(
         format!(" {} ", format::sanitize(title)),
         theme::popup_title(),
     ));
+    let hint = fit_hint(hint, rect.width.saturating_sub(4) as usize);
     if !hint.is_empty() {
         block = block.title_bottom(Span::styled(format!(" {hint} "), theme::muted()));
     }
@@ -33,6 +34,14 @@ fn framed(
     frame.render_widget(block, rect);
     frame.render_widget(Paragraph::new(lines), inner);
     inner
+}
+
+fn fit_hint(hint: &str, max: usize) -> String {
+    let mut parts: Vec<&str> = hint.split(" · ").collect();
+    while parts.len() > 1 && parts.join(" · ").width() > max {
+        parts.remove(0);
+    }
+    format::truncate(&parts.join(" · "), max)
 }
 
 fn scrolled(frame: &mut Frame, rect: Rect, title: &str, lines: Vec<Line<'static>>, scroll: u16) {
@@ -242,14 +251,37 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, popup: &Popup) {
             let width = 72u16.min(area.width.saturating_sub(2)).max(1);
             let w = width.saturating_sub(2) as usize;
             let sel = (*sel).min(OPTIONS.len() - 1);
+            let current = crate::app::option_group(sel);
+            let items = OPTION_GROUPS[current].1;
+            let left_w = OPTION_GROUPS
+                .iter()
+                .map(|(name, _)| name.width())
+                .max()
+                .unwrap_or(0)
+                + 1;
+            let sep = if w >= 62 { " │ " } else { "│" };
+            let right_w = w.saturating_sub(left_w + sep.width());
             let mut list = Vec::new();
             let mut sel_row = 0;
-            for (group, items) in OPTION_GROUPS {
-                list.push(Line::from(Span::styled(
-                    format!(" {group}"),
-                    theme::popup_title(),
-                )));
-                for &i in items {
+            let tallest_group = OPTION_GROUPS
+                .iter()
+                .map(|(_, items)| items.len())
+                .max()
+                .unwrap_or(0);
+            for r in 0..OPTION_GROUPS.len().max(tallest_group) {
+                let mut spans = vec![match OPTION_GROUPS.get(r) {
+                    Some((name, _)) => Span::styled(
+                        format!(" {name:<width$}", width = left_w - 1),
+                        if r == current {
+                            theme::picker_selection()
+                        } else {
+                            theme::muted()
+                        },
+                    ),
+                    None => Span::raw(" ".repeat(left_w)),
+                }];
+                spans.push(Span::styled(sep, theme::border()));
+                if let Some(&i) = items.get(r) {
                     let (label, _) = OPTIONS[i];
                     let value = app.option_value(i);
                     let text = if value.starts_with('[') {
@@ -260,16 +292,20 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, popup: &Popup) {
                     if i == sel {
                         sel_row = list.len();
                     }
-                    list.push(row_line(
-                        vec![
-                            Span::styled(format!("{} ", option_key(i)), theme::active_field()),
-                            Span::raw(text),
-                        ],
-                        i == sel,
-                        true,
-                        w,
-                    ));
+                    spans.extend(
+                        row_line(
+                            vec![
+                                Span::styled(format!("{} ", option_key(i)), theme::active_field()),
+                                Span::raw(text),
+                            ],
+                            i == sel,
+                            true,
+                            right_w,
+                        )
+                        .spans,
+                    );
                 }
+                list.push(Line::from(spans));
             }
             let desc_w = w.saturating_sub(2);
             let desc_rows = wrap_words(OPTIONS[sel].1, desc_w);
@@ -315,7 +351,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, popup: &Popup) {
                 frame,
                 centered(area, width, h),
                 "Options",
-                "j/k move · h/l change · saved to config.toml",
+                "Tab category · j/k move · h/l change · saved to config.toml",
                 lines,
             );
         }
@@ -367,6 +403,33 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, popup: &Popup) {
             );
         }
         Popup::QuotePick { input, .. } => draw_quote_pick(frame, area, input),
+        Popup::TextSelect { input, anchor } => draw_text_select(frame, area, app, input, *anchor),
+        Popup::SharedMedia { chat_id, sel } => {
+            let rect = centered(area, 40.min(area.width), 9.min(area.height));
+            let w = rect.width.saturating_sub(2) as usize;
+            let counts = app.media_counts.get(chat_id);
+            let lines = model::MediaFilter::ALL
+                .iter()
+                .enumerate()
+                .map(|(i, f)| {
+                    let count = match counts.and_then(|c| c.iter().find(|(k, _)| k == f)) {
+                        Some((_, Some(n))) => app.count(i64::from(*n)),
+                        Some((_, None)) => "?".to_owned(),
+                        None => "...".to_owned(),
+                    };
+                    row_line(
+                        vec![
+                            Span::raw(format!("{:<16}", f.label())),
+                            Span::styled(count, theme::muted()),
+                        ],
+                        i == *sel,
+                        true,
+                        w,
+                    )
+                })
+                .collect();
+            framed(frame, rect, "Shared media", "Enter open · Esc close", lines);
+        }
         Popup::Translate {
             lang,
             result,
@@ -443,6 +506,73 @@ fn draw_quote_pick(frame: &mut Frame, area: Rect, input: &crate::input::TextInpu
         x: (inner.x + 1 + cur_col as u16).min(inner.right().saturating_sub(1)),
         y: (inner.y + 2 + (cur_row - start) as u16).min(inner.bottom().saturating_sub(1)),
     });
+}
+
+fn draw_text_select(
+    frame: &mut Frame,
+    area: Rect,
+    app: &App,
+    input: &crate::input::TextInput,
+    anchor: Option<usize>,
+) {
+    let rect = centered(area, 90.min(area.width), 24.min(area.height));
+    let width = rect.width.saturating_sub(4).max(1) as usize;
+    app.popup_cols.set(width);
+    let cursor = input.cursor();
+    let selected = anchor.map(|a| (a.min(cursor), a.max(cursor)));
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    let mut row: Vec<Span<'static>> = vec![Span::raw(" ")];
+    let mut used = 0;
+    let mut cursor_row = 0;
+    let mut count = 0;
+    for (i, ch) in input.text().chars().enumerate() {
+        count = i + 1;
+        let style = if i == cursor {
+            theme::picker_selection()
+        } else if selected.is_some_and(|(a, b)| i >= a && i <= b) {
+            theme::selection()
+        } else {
+            theme::normal()
+        };
+        if i == cursor {
+            cursor_row = lines.len();
+        }
+        if ch == '\n' {
+            row.push(Span::styled(" ", style));
+            lines.push(Line::from(std::mem::replace(&mut row, vec![Span::raw(" ")])));
+            used = 0;
+            continue;
+        }
+        let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + cw > width {
+            lines.push(Line::from(std::mem::replace(&mut row, vec![Span::raw(" ")])));
+            used = 0;
+            if i == cursor {
+                cursor_row = lines.len();
+            }
+        }
+        row.push(Span::styled(ch.to_string(), style));
+        used += cw;
+    }
+    if cursor >= count {
+        cursor_row = lines.len();
+        row.push(Span::styled(" ", theme::picker_selection()));
+    }
+    lines.push(Line::from(row));
+    let visible = rect.height.saturating_sub(2) as usize;
+    let skip = (cursor_row + 1).saturating_sub(visible);
+    let hint = if anchor.is_some() {
+        "←↑↓→ w b extend · y copy selection · v cancel selection · Esc"
+    } else {
+        "←↑↓→ w b move · v start selection · y copy all · Esc"
+    };
+    framed(
+        frame,
+        rect,
+        "Select text",
+        hint,
+        lines.into_iter().skip(skip).collect(),
+    );
 }
 
 fn draw_members(frame: &mut Frame, area: Rect, app: &App, mv: &MembersView) {
@@ -724,10 +854,8 @@ fn draw_profile(frame: &mut Frame, area: Rect, app: &App, p: &ProfileView) {
         .and_then(|d| d.user_id)
         .is_some_and(|u| app.can_start_secret(u));
     let hint = match (max_scroll > 0, secret) {
-        (true, true) => {
-            "j/k scroll · a their messages here · S secret chat (this device only) · Esc"
-        }
-        (false, true) => "a their messages here · S secret chat (this device only) · Esc close",
+        (true, true) => "j/k scroll · a their messages here · S secret chat · Esc close",
+        (false, true) => "a their messages here · S secret chat · Esc close",
         (true, false) => "j/k scroll · a their messages here · Esc close",
         (false, false) => "a their messages here · Esc close",
     };
@@ -792,6 +920,7 @@ fn draw_search(frame: &mut Frame, area: Rect, app: &App, sv: &SearchView) {
             "Messages from {}",
             format::truncate(&app.sender_name(s), 40)
         ),
+        (None, _, _) if sv.media.is_some() => sv.media.map_or("", |m| m.label()).to_owned(),
         (None, true, _) => "Pinned messages".to_owned(),
         (None, false, Some(id)) => format!(
             "Search in {}",

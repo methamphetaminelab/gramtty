@@ -119,6 +119,18 @@ pub enum MenuAction {
     CopyImage,
     Members,
     EventLog,
+    Mark,
+    SelectText,
+    Retry,
+    SharedMedia,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Forward {
+    pub from: i64,
+    pub ids: Vec<i64>,
+    pub targets: Vec<i64>,
+    pub hide_sender: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,7 +194,7 @@ pub enum Popup {
     Switcher {
         input: TextInput,
         sel: usize,
-        forward: Option<(i64, Vec<i64>)>,
+        forward: Option<Forward>,
     },
     ConfirmLogout,
     FilePicker(FilePicker),
@@ -236,6 +248,14 @@ pub enum Popup {
         msg_id: i64,
         input: TextInput,
     },
+    TextSelect {
+        input: TextInput,
+        anchor: Option<usize>,
+    },
+    SharedMedia {
+        chat_id: i64,
+        sel: usize,
+    },
     Translate {
         chat_id: i64,
         msg_id: i64,
@@ -286,6 +306,7 @@ pub struct SearchView {
     pub chat_id: Option<i64>,
     pub pinned: bool,
     pub sender: Option<Sender>,
+    pub media: Option<model::MediaFilter>,
     pub input: TextInput,
     pub searched_for: Option<String>,
     pub results: Vec<Msg>,
@@ -297,7 +318,7 @@ pub struct SearchView {
 
 impl SearchView {
     pub fn listing(&self) -> bool {
-        self.pinned || self.sender.is_some()
+        self.pinned || self.sender.is_some() || self.media.is_some()
     }
 }
 
@@ -427,7 +448,7 @@ pub const OPTIONS: [(&str, &str); 29] = [
     ),
 ];
 
-pub const OPTION_GROUPS: [(&str, &[usize]); 5] = [
+pub const OPTION_GROUPS: [(&str, &[usize]); 7] = [
     ("Notifications", &[0, SOUND_OPTION, VOLUME_OPTION]),
     (
         "Privacy",
@@ -452,26 +473,37 @@ pub const OPTION_GROUPS: [(&str, &[usize]); 5] = [
             SECONDS_OPTION,
             SHOW_IDS_OPTION,
             EXACT_OPTION,
+        ],
+    ),
+    (
+        "Chat list",
+        &[
             FOLDER_COUNTER_OPTION,
             FOLDER_UNMUTED_OPTION,
             HIDE_ALL_CHATS_OPTION,
-            ANIMATIONS_OPTION,
-            MAX_ANIMATIONS_OPTION,
         ],
     ),
     (
-        "Chats",
-        &[TRANSLATE_OPTION, PHOTOS_AS_FILES_OPTION, SAVE_TARGET_OPTION],
-    ),
-    (
-        "Behaviour",
+        "Animations",
         &[
-            OPEN_FOCUS_OPTION,
-            AFTER_SEND_OPTION,
+            ANIMATIONS_OPTION,
+            MAX_ANIMATIONS_OPTION,
             PAUSE_ANIMATIONS_OPTION,
         ],
     ),
+    (
+        "Messages",
+        &[TRANSLATE_OPTION, PHOTOS_AS_FILES_OPTION, SAVE_TARGET_OPTION],
+    ),
+    ("Navigation", &[OPEN_FOCUS_OPTION, AFTER_SEND_OPTION]),
 ];
+
+pub fn option_group(index: usize) -> usize {
+    OPTION_GROUPS
+        .iter()
+        .position(|(_, items)| items.contains(&index))
+        .unwrap_or(0)
+}
 
 pub fn option_order() -> impl Iterator<Item = usize> {
     OPTION_GROUPS
@@ -631,6 +663,9 @@ pub struct App {
     pub folder_rows: Cell<usize>,
     pub chat_rows: Cell<usize>,
     pub popup_rows: Cell<usize>,
+    pub popup_cols: Cell<usize>,
+    pub marked: std::collections::BTreeSet<i64>,
+    pub media_counts: HashMap<i64, Vec<(model::MediaFilter, Option<i32>)>>,
     pub msg_view_width: usize,
     pub want_older: bool,
     pub custom_emoji: HashMap<i64, String>,
@@ -685,6 +720,7 @@ pub struct App {
     pub lang: format::Lang,
     pending_open: Option<PendingOpen>,
     pub groups: HashMap<i64, model::GroupMeta>,
+    pub group_usernames: HashMap<i64, Vec<String>>,
     pub secret_chats: HashMap<i32, model::SecretChat>,
     pub topics: HashMap<i64, model::TopicList>,
     pub expanded: Option<i64>,
@@ -752,6 +788,9 @@ impl App {
             folder_rows: Cell::new(10),
             chat_rows: Cell::new(10),
             popup_rows: Cell::new(10),
+            popup_cols: Cell::new(40),
+            marked: std::collections::BTreeSet::new(),
+            media_counts: HashMap::new(),
             msg_view_width: 80,
             want_older: false,
             custom_emoji: HashMap::new(),
@@ -810,6 +849,7 @@ impl App {
             },
             pending_open: None,
             groups: HashMap::new(),
+            group_usernames: HashMap::new(),
             secret_chats: HashMap::new(),
             topics: HashMap::new(),
             expanded: None,
@@ -1094,6 +1134,9 @@ impl App {
                     }
                 }
             }
+            Event::MediaCounts { chat_id, counts } => {
+                self.media_counts.insert(chat_id, counts);
+            }
             Event::Mention { chat_id, result } => match result {
                 Ok(Some((id, topic))) => {
                     self.status = None;
@@ -1361,6 +1404,12 @@ impl App {
             if !sv.listing() {
                 sv.input.insert_str(&format::one_line(text));
             }
+        } else if self.popup.is_none()
+            && self.recording.is_none()
+            && self.open_chat.is_some()
+            && let Some(paths) = upload::dropped_paths(text)
+        {
+            self.attach_paths(paths);
         } else if self.composer.active && self.recording.is_none() {
             self.composer.input.insert_str(text);
         } else if let Some(f) = self.filter.as_mut().filter(|f| f.active) {
@@ -1485,6 +1534,13 @@ impl App {
                 };
                 let id = u.supergroup.id;
                 self.groups.insert(id, meta);
+                let names = u
+                    .supergroup
+                    .usernames
+                    .as_ref()
+                    .map(|n| n.active_usernames.clone())
+                    .unwrap_or_default();
+                self.group_usernames.insert(id, names);
                 for c in self.chats.values_mut().filter(|c| c.group_id == id) {
                     c.forum = meta.forum;
                 }
@@ -1594,6 +1650,7 @@ impl App {
                 if let Some(c) = self.chats.get_mut(&u.chat_id) {
                     c.mentions = u.unread_mention_count;
                 }
+                self.sync_topic_mentions(u.chat_id, None, u.unread_mention_count);
             }
             Update::ChatUnreadReactionCount(u) => {
                 if let Some(c) = self.chats.get_mut(&u.chat_id) {
@@ -1623,6 +1680,11 @@ impl App {
                 if let Some(c) = self.chats.get_mut(&u.chat_id) {
                     c.mentions = u.unread_mention_count;
                 }
+                let topic = self
+                    .histories
+                    .get(&u.chat_id)
+                    .and_then(|h| h.get(u.message_id).map(|m| m.topic.or(h.topic)));
+                self.sync_topic_mentions(u.chat_id, topic.flatten(), u.unread_mention_count);
             }
             Update::ChatNotificationSettings(u) => {
                 if let Some(c) = self.chats.get_mut(&u.chat_id) {
@@ -1704,10 +1766,41 @@ impl App {
             Update::MessageSendFailed(u) => {
                 let msg = td::convert_message(u.message);
                 let reason = td::friendly_error(&u.error);
-                if let Some(h) = self.histories.get_mut(&msg.chat_id) {
+                let (chat_id, id) = (msg.chat_id, msg.id);
+                let refused_photo = u.error.message.starts_with("PHOTO_INVALID_DIMENSIONS");
+                let as_file = msg
+                    .attachments
+                    .iter()
+                    .find(|a| refused_photo && a.kind == MediaKind::Photo && !a.file.path.is_empty())
+                    .and_then(|a| Pending::from_path(std::path::Path::new(&a.file.path)).ok())
+                    .map(|mut item| {
+                        item.as_file = true;
+                        (item, msg.body.text.clone(), msg.reply_to, msg.topic)
+                    });
+                if let Some(h) = self.histories.get_mut(&chat_id) {
                     h.replace_id(u.old_message_id, msg);
                 }
-                self.set_status(format!("send failed: {reason}"), true);
+                match as_file {
+                    Some((item, text, reply_to, topic)) => {
+                        self.td.delete_messages(chat_id, vec![id], true);
+                        self.td.send_uploads(
+                            chat_id,
+                            vec![item],
+                            text,
+                            reply_to,
+                            self.uploads_dir.clone(),
+                            topic,
+                        );
+                        self.set_status(
+                            "Telegram refused the photo dimensions; sending it as a file",
+                            false,
+                        );
+                    }
+                    None => self.set_status(
+                        format!("send failed: {reason} · select the message and press Enter to retry"),
+                        true,
+                    ),
+                }
             }
             Update::MessageContent(u) => {
                 let story = matches!(
@@ -1931,6 +2024,9 @@ impl App {
         self.layout_cache = crate::ui::LayoutCache::default();
         self.pending_open = None;
         self.groups.clear();
+        self.marked.clear();
+        self.media_counts.clear();
+        self.group_usernames.clear();
         self.secret_chats.clear();
         self.topics.clear();
         self.expanded = None;
@@ -1992,6 +2088,9 @@ impl App {
             ("layout_cache", self.layout_cache.len() == 0),
             ("pending_open", self.pending_open.is_none()),
             ("groups", self.groups.is_empty()),
+            ("marked", self.marked.is_empty()),
+            ("media_counts", self.media_counts.is_empty()),
+            ("group_usernames", self.group_usernames.is_empty()),
             ("secret_chats", self.secret_chats.is_empty()),
             ("topics", self.topics.is_empty()),
             ("expanded", self.expanded.is_none()),
@@ -2120,7 +2219,15 @@ impl App {
         }
     }
 
-    fn handle_key(&mut self, key: KeyEvent) {
+    fn handle_key(&mut self, mut key: KeyEvent) {
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && let KeyCode::Char(c) = key.code
+            && let Some(l) = crate::keymap::latin_key(c)
+        {
+            key.code = KeyCode::Char(l);
+        }
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.request_quit();
             return;
@@ -2150,13 +2257,19 @@ impl App {
             return;
         }
         self.status = None;
-        let chord = Chord::from_event(&key);
+        let chord = self
+            .keymap
+            .layout_fallback(&self.pending, Chord::from_event(&key));
         if !self.pending.is_empty() && key.code == KeyCode::Esc {
             self.pending.clear();
             return;
         }
         if self.pending.is_empty() {
             match key.code {
+                KeyCode::Esc if !self.marked.is_empty() => {
+                    self.marked.clear();
+                    return;
+                }
                 KeyCode::Esc => {
                     if self.filter.take().is_none() {
                         self.msg_sel = None;
@@ -2284,6 +2397,12 @@ impl App {
             Action::CopyQuote => self.message_action(MenuAction::CopyQuote),
             Action::TranslateMessage => self.message_action(MenuAction::Translate),
             Action::SaveMessage => self.message_action(MenuAction::SaveMessage),
+            Action::MarkMessage => self.message_action(MenuAction::Mark),
+            Action::SelectText => self.message_action(MenuAction::SelectText),
+            Action::OpenSharedMedia => match self.focused_chat() {
+                Some(chat) => self.open_shared_media(chat),
+                None => self.set_status("open a chat first", false),
+            },
             Action::OpenProfile => match self.focused_chat() {
                 Some(chat) => self.open_profile(ProfileTarget::Chat(chat)),
                 None => self.set_status("open a chat first", false),
@@ -2386,10 +2505,39 @@ impl App {
     fn local_unread(&self, list: ListId, unmuted: bool, messages: bool) -> i32 {
         self.chats
             .values()
-            .filter(|c| c.position_in(list).is_some() && c.unread > 0)
+            .filter(|c| c.position_in(list).is_some() && self.chat_unread(c.id) > 0)
             .filter(|c| !unmuted || !self.is_muted(c.id))
-            .map(|c| if messages { c.unread } else { 1 })
+            .map(|c| if messages { self.chat_unread(c.id) } else { 1 })
             .sum()
+    }
+
+    fn sync_topic_mentions(&mut self, chat_id: i64, read_in: Option<i32>, left: i32) {
+        let Some(list) = self.topics.get_mut(&chat_id) else {
+            return;
+        };
+        let stale: Vec<i32> = list
+            .topics()
+            .iter()
+            .filter(|t| t.mentions > 0 && (left <= 0 || read_in == Some(t.id)))
+            .map(|t| t.id)
+            .collect();
+        for id in stale {
+            if let Some(t) = list.get_mut(id) {
+                t.mentions = if left <= 0 { 0 } else { t.mentions - 1 };
+            }
+            if left > 0 {
+                self.td.refresh_topic(chat_id, id);
+            }
+        }
+    }
+
+    pub fn chat_unread(&self, chat_id: i64) -> i32 {
+        match self.topics.get(&chat_id) {
+            Some(l) if l.loaded && l.next.is_none() && self.is_forum(chat_id) => {
+                l.topics().iter().map(|t| t.unread.max(0)).sum()
+            }
+            _ => self.chats.get(&chat_id).map_or(0, |c| c.unread),
+        }
     }
 
     fn reselect_folder(&mut self, list: ListId) {
@@ -3128,6 +3276,9 @@ impl App {
 
     pub fn open_view(&mut self, chat_id: i64, topic: Option<i32>) {
         let same_chat = self.open_chat == Some(chat_id);
+        if !same_chat || self.open_topic != topic {
+            self.marked.clear();
+        }
         if same_chat && self.open_topic != topic {
             let epoch = self.histories.get(&chat_id).map_or(0, |h| h.epoch + 1);
             self.reset_history(chat_id, topic, epoch);
@@ -3275,7 +3426,7 @@ impl App {
         }
         let order = self.chat_order();
         let skip_muted = self.settings.navigation.skip_muted;
-        let unread = |id: i64| self.chats.get(&id).is_some_and(|c| c.unread > 0);
+        let unread = |id: i64| self.chat_unread(id) > 0;
         let found = next_matching(&order, self.open_chat, false, |id| {
             unread(id) && !(skip_muted && self.is_muted(id))
         });
@@ -3400,9 +3551,14 @@ impl App {
             return;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let suggestions = self.command_suggestions().len();
+        let mentions = self.mention_suggestions().len();
+        let suggestions = self.command_suggestions().len().max(mentions);
         if suggestions > 0 {
             match key.code {
+                KeyCode::Tab if mentions > 0 => {
+                    self.complete_mention();
+                    return;
+                }
                 KeyCode::Tab => {
                     self.complete_command();
                     return;
@@ -3795,7 +3951,8 @@ impl App {
         let q = sp.query.text().trim().to_owned();
         if !q.is_empty() && q != sp.remote_for {
             sp.searching = true;
-            self.td.search_stickers(q, chat);
+            let gifs = sp.current_tab(&self.stickers) == Tab::Gifs;
+            self.td.search_stickers(q, chat, gifs);
         }
     }
 
@@ -3807,14 +3964,14 @@ impl App {
         let items = sp.visible(&self.stickers);
         let cols = sp.cols.max(1) as isize;
         match key.code {
+            KeyCode::Esc if sp.preview => sp.preview = false,
             KeyCode::Esc => self.popup = None,
-            KeyCode::Tab => {
-                sp.switch_tab(&self.stickers, 1);
+            KeyCode::Char(' ' | 'o') if ctrl => sp.preview = !sp.preview,
+            KeyCode::Tab | KeyCode::BackTab => {
+                let delta = if key.code == KeyCode::Tab { 1 } else { -1 };
+                sp.switch_tab(&self.stickers, delta);
                 self.ensure_tab_loaded();
-            }
-            KeyCode::BackTab => {
-                sp.switch_tab(&self.stickers, -1);
-                self.ensure_tab_loaded();
+                self.sticker_query_changed();
             }
             KeyCode::Right => sp.move_sel(1, items.len()),
             KeyCode::Char('n') if ctrl => sp.move_sel(1, items.len()),
@@ -4158,8 +4315,58 @@ impl App {
                         .fetch_edit_text(msg.chat_id, msg.id, msg.body.clone());
                 }
             }
+            MenuAction::Mark => {
+                let ids: Vec<i64> = self.selected_group().iter().map(|m| m.id).collect();
+                if ids.iter().all(|id| self.marked.contains(id)) {
+                    for id in ids {
+                        self.marked.remove(&id);
+                    }
+                } else {
+                    self.marked.extend(ids);
+                }
+                if !self.marked.is_empty() {
+                    self.set_status(
+                        format!(
+                            "{} marked · f forward · y copy · d delete · Esc clear",
+                            self.marked.len()
+                        ),
+                        false,
+                    );
+                }
+            }
+            MenuAction::SelectText => {
+                let text = self.group_text();
+                if text.is_empty() {
+                    self.set_status("no text to select", false);
+                } else {
+                    let mut input = TextInput::with_text(&text);
+                    input.handle_key(
+                        &KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL),
+                        true,
+                    );
+                    self.popup = Some(Popup::TextSelect {
+                        input,
+                        anchor: None,
+                    });
+                }
+            }
+            MenuAction::Retry => {
+                let ids: Vec<i64> = self
+                    .action_msgs()
+                    .iter()
+                    .filter(|m| matches!(m.state, model::SendState::Failed(_)))
+                    .map(|m| m.id)
+                    .collect();
+                if ids.is_empty() {
+                    self.set_status("this message did not fail to send", false);
+                } else {
+                    self.td.resend(msg.chat_id, ids);
+                    self.set_status("sending again...", false);
+                }
+            }
             MenuAction::Delete => {
-                let message_ids = self.selected_group().iter().map(|m| m.id).collect();
+                let message_ids = self.action_ids();
+                self.marked.clear();
                 self.popup = Some(Popup::ConfirmDelete {
                     chat_id: msg.chat_id,
                     message_ids,
@@ -4216,6 +4423,7 @@ impl App {
                     self.set_status("no text to copy", false);
                 } else {
                     self.copy_text(text);
+                    self.marked.clear();
                 }
             }
             MenuAction::React => {
@@ -4230,11 +4438,15 @@ impl App {
                 self.td.load_available_reactions(msg.chat_id, msg.id);
             }
             MenuAction::Forward => {
-                let ids = self.selected_group().iter().map(|m| m.id).collect();
                 self.popup = Some(Popup::Switcher {
                     input: TextInput::default(),
                     sel: 0,
-                    forward: Some((msg.chat_id, ids)),
+                    forward: Some(Forward {
+                        from: msg.chat_id,
+                        ids: self.action_ids(),
+                        targets: Vec::new(),
+                        hide_sender: false,
+                    }),
                 });
             }
             MenuAction::Pin => {
@@ -4325,8 +4537,9 @@ impl App {
                     self.set_status("not logged in yet", true);
                     return;
                 };
-                let ids = self.selected_group().iter().map(|m| m.id).collect();
-                self.td.forward(target, msg.chat_id, ids);
+                let ids = self.action_ids();
+                self.marked.clear();
+                self.td.forward(target, msg.chat_id, ids, false);
                 let name = self.save_target_name();
                 self.set_status(format!("saved to {name}"), false);
             }
@@ -4347,8 +4560,76 @@ impl App {
         }
     }
 
+    fn action_msgs(&self) -> Vec<&Msg> {
+        let marked: Vec<&Msg> = self
+            .open_chat
+            .and_then(|c| self.histories.get(&c))
+            .map(|h| self.marked.iter().filter_map(|id| h.get(*id)).collect())
+            .unwrap_or_default();
+        if marked.is_empty() {
+            self.selected_group()
+        } else {
+            marked
+        }
+    }
+
+    fn action_ids(&self) -> Vec<i64> {
+        self.action_msgs().iter().map(|m| m.id).collect()
+    }
+
+    fn on_select_key(&mut self, key: KeyEvent) {
+        let width = self.popup_cols.get();
+        let Some(Popup::TextSelect { input, anchor }) = &mut self.popup else {
+            return;
+        };
+        let ctrl = KeyModifiers::CONTROL;
+        let none = KeyModifiers::NONE;
+        let motion = match key.code {
+            KeyCode::Char('h') => Some((KeyCode::Left, none)),
+            KeyCode::Char('l') => Some((KeyCode::Right, none)),
+            KeyCode::Char('w') => Some((KeyCode::Right, ctrl)),
+            KeyCode::Char('b') => Some((KeyCode::Left, ctrl)),
+            KeyCode::Char('0') => Some((KeyCode::Home, none)),
+            KeyCode::Char('$') => Some((KeyCode::End, none)),
+            KeyCode::Char('g') => Some((KeyCode::Home, ctrl)),
+            KeyCode::Char('G') => Some((KeyCode::End, ctrl)),
+            KeyCode::Left | KeyCode::Right | KeyCode::Home | KeyCode::End => {
+                Some((key.code, key.modifiers))
+            }
+            _ => None,
+        };
+        if let Some((code, mods)) = motion {
+            input.handle_key(&KeyEvent::new(code, mods), true);
+            return;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.popup = None,
+            KeyCode::Char('j') | KeyCode::Down => input.move_visual(true, width),
+            KeyCode::Char('k') | KeyCode::Up => input.move_visual(false, width),
+            KeyCode::Char('v') | KeyCode::Char(' ') => {
+                *anchor = match anchor {
+                    Some(_) => None,
+                    None => Some(input.cursor()),
+                }
+            }
+            KeyCode::Char('y') | KeyCode::Enter => {
+                let text = match *anchor {
+                    Some(a) => {
+                        let (from, to) = (a.min(input.cursor()), a.max(input.cursor()));
+                        input.slice(from, to + 1)
+                    }
+                    None => input.text().to_owned(),
+                };
+                self.popup = None;
+                self.marked.clear();
+                self.copy_text(text);
+            }
+            _ => {}
+        }
+    }
+
     fn group_text(&self) -> String {
-        self.selected_group()
+        self.action_msgs()
             .iter()
             .map(|m| m.body.text.as_str())
             .filter(|t| !t.is_empty())
@@ -4434,6 +4715,10 @@ impl App {
             .selected_group()
             .iter()
             .any(|m| m.state == model::SendState::Pending);
+        let failed = self
+            .selected_group()
+            .iter()
+            .any(|m| matches!(m.state, model::SendState::Failed(_)));
         let sel = self.selected_message();
         let pinned = sel.is_some_and(|m| m.pinned);
         let reply = sel.is_some_and(|m| m.reply_to.is_some());
@@ -4479,6 +4764,16 @@ impl App {
                         action: MenuAction::OpenUrl,
                     },
                 ];
+                if failed {
+                    items.insert(
+                        0,
+                        MenuItem {
+                            key: 'T',
+                            label: "Try sending again",
+                            action: MenuAction::Retry,
+                        },
+                    );
+                }
                 if sending {
                     items.insert(
                         0,
@@ -4499,6 +4794,16 @@ impl App {
                         key: 'r',
                         label: "React",
                         action: MenuAction::React,
+                    },
+                    MenuItem {
+                        key: 'V',
+                        label: "Select text to copy",
+                        action: MenuAction::SelectText,
+                    },
+                    MenuItem {
+                        key: 'm',
+                        label: "Mark / unmark (select several)",
+                        action: MenuAction::Mark,
                     },
                     MenuItem {
                         key: 'f',
@@ -4908,6 +5213,11 @@ impl App {
                 },
             ]);
         }
+        items.push(MenuItem {
+            key: 'g',
+            label: "Shared media",
+            action: MenuAction::SharedMedia,
+        });
         let (mentions, reactions) = self.unread_counts(chat, None);
         if mentions > 0 || reactions > 0 {
             items.push(MenuItem {
@@ -5073,6 +5383,11 @@ impl App {
             | MenuAction::TopicClose
             | MenuAction::TopicHideGeneral
             | MenuAction::TopicLink => self.topic_action(action),
+            MenuAction::SharedMedia => {
+                if let Some(chat) = self.focused_chat() {
+                    self.open_shared_media(chat);
+                }
+            }
             MenuAction::NewTopic => {
                 if let Some(chat) = self.focused_chat() {
                     self.popup = Some(Popup::NewTopic {
@@ -5133,6 +5448,9 @@ impl App {
             | MenuAction::Details
             | MenuAction::EditHistory
             | MenuAction::FromSender
+            | MenuAction::Mark
+            | MenuAction::SelectText
+            | MenuAction::Retry
             | MenuAction::CopyQuote
             | MenuAction::ReplyQuote
             | MenuAction::Translate
@@ -5178,14 +5496,92 @@ impl App {
         }
     }
 
+    pub fn chat_usernames(&self, chat_id: i64) -> &[String] {
+        let Some(c) = self.chats.get(&chat_id) else {
+            return &[];
+        };
+        match c.kind {
+            ChatKind::Private(u) | ChatKind::Secret(u) => {
+                self.user_meta.get(&u).map_or(&[], |m| &m.usernames[..])
+            }
+            _ => self
+                .group_usernames
+                .get(&c.group_id)
+                .map_or(&[], |n| &n[..]),
+        }
+    }
+
+    pub fn mention_suggestions(&self) -> Vec<(String, String)> {
+        let c = &self.composer;
+        if !c.active {
+            return Vec::new();
+        }
+        let Some(prefix) = c.input.mention_prefix() else {
+            return Vec::new();
+        };
+        let prefix = prefix.to_lowercase();
+        let Some(chat_id) = self.open_chat else {
+            return Vec::new();
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        let senders = self
+            .histories
+            .get(&chat_id)
+            .into_iter()
+            .flat_map(|h| h.msgs().iter().rev().map(|m| m.sender));
+        let peer = match self.chats.get(&chat_id).map(|c| &c.kind) {
+            Some(ChatKind::Private(u)) => Some(Sender::User(*u)),
+            _ => None,
+        };
+        for sender in senders.chain(peer) {
+            let Sender::User(id) = sender else {
+                continue;
+            };
+            if Some(id) == self.my_id || !seen.insert(id) {
+                continue;
+            }
+            let Some(username) = self.user_meta.get(&id).and_then(|m| m.usernames.first()) else {
+                continue;
+            };
+            let name = self.users.get(&id).cloned().unwrap_or_default();
+            if username.to_lowercase().starts_with(&prefix)
+                || name
+                    .to_lowercase()
+                    .split_whitespace()
+                    .any(|w| w.starts_with(&prefix))
+            {
+                out.push((username.clone(), name));
+            }
+        }
+        out
+    }
+
+    fn complete_mention(&mut self) {
+        let list = self.mention_suggestions();
+        let Some((username, _)) = list.get(self.cmd_sel.min(list.len().saturating_sub(1))) else {
+            return;
+        };
+        self.composer.input.complete_mention(username);
+        self.cmd_sel = 0;
+    }
+
     pub fn switcher_results(&self, query: &str) -> Vec<i64> {
+        let name_query = query.trim_start_matches('@');
+        let query = if query.starts_with('@') { name_query } else { query };
         let mut scored: Vec<(i32, i64, i64)> = self
             .chats
             .values()
             .filter(|c| !c.positions.is_empty())
             .filter_map(|c| {
                 let order = c.position_in(ListId::Main).map_or(0, |p| p.order);
-                model::fuzzy_score(query, &c.title).map(|s| (s, order, c.id))
+                let by_name = self
+                    .chat_usernames(c.id)
+                    .iter()
+                    .filter_map(|u| model::fuzzy_score(name_query, u))
+                    .max();
+                let by_title = model::fuzzy_score(query, &c.title);
+                by_title.max(by_name).map(|s| (s, order, c.id))
             })
             .collect();
         scored.sort_unstable_by(|a, b| b.cmp(a));
@@ -5405,6 +5801,20 @@ impl App {
             Popup::Members(_) => self.on_members_key(key),
             Popup::EventLog(_) => self.on_event_log_key(key),
             Popup::QuotePick { .. } => self.on_quote_key(key),
+            Popup::TextSelect { .. } => self.on_select_key(key),
+            Popup::SharedMedia { chat_id, sel } => {
+                let n = model::MediaFilter::ALL.len();
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => self.popup = None,
+                    KeyCode::Char('j') | KeyCode::Down => *sel = (*sel + 1).min(n - 1),
+                    KeyCode::Char('k') | KeyCode::Up => *sel = sel.saturating_sub(1),
+                    KeyCode::Enter | KeyCode::Char('l') => {
+                        let (chat, media) = (*chat_id, model::MediaFilter::ALL[(*sel).min(n - 1)]);
+                        self.open_media_list(chat, media);
+                    }
+                    _ => {}
+                }
+            }
             Popup::Translate { scroll, result, .. } => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => self.popup = None,
                 KeyCode::Char('j') | KeyCode::Down => *scroll = scroll.saturating_add(1),
@@ -5491,6 +5901,31 @@ impl App {
                 KeyCode::Char('n') if ctrl => *sel += 1,
                 KeyCode::Up => *sel = sel.saturating_sub(1),
                 KeyCode::Char('p') if ctrl => *sel = sel.saturating_sub(1),
+                KeyCode::Char('t') if ctrl && forward.is_some() => {
+                    if let Some(f) = forward {
+                        f.hide_sender = !f.hide_sender;
+                    }
+                }
+                KeyCode::Tab if forward.is_some() => {
+                    let query = input.text().to_owned();
+                    let at = *sel;
+                    let results = self.switcher_results(&query);
+                    if let Some(id) = results.get(at.min(results.len().saturating_sub(1)))
+                        && let Some(Popup::Switcher {
+                            forward: Some(f),
+                            sel,
+                            ..
+                        }) = &mut self.popup
+                    {
+                        match f.targets.iter().position(|t| t == id) {
+                            Some(i) => {
+                                f.targets.remove(i);
+                            }
+                            None => f.targets.push(*id),
+                        }
+                        *sel = at + 1;
+                    }
+                }
                 KeyCode::Enter => {
                     let query = input.text().to_owned();
                     let sel = *sel;
@@ -5499,10 +5934,21 @@ impl App {
                     self.popup = None;
                     if let Some(id) = results.get(sel.min(results.len().saturating_sub(1))) {
                         match forward {
-                            Some((from, ids)) => {
-                                self.td.forward(*id, from, ids);
-                                let title = self.sender_name(Sender::Chat(*id));
-                                self.set_status(format!("forwarded to {title}"), false);
+                            Some(f) => {
+                                let targets = if f.targets.is_empty() {
+                                    vec![*id]
+                                } else {
+                                    f.targets
+                                };
+                                for to in &targets {
+                                    self.td.forward(*to, f.from, f.ids.clone(), f.hide_sender);
+                                }
+                                self.marked.clear();
+                                let to = match targets[..] {
+                                    [one] => self.sender_name(Sender::Chat(one)),
+                                    _ => format!("{} chats", targets.len()),
+                                };
+                                self.set_status(format!("forwarded to {to}"), false);
                             }
                             None => {
                                 let id = *id;
@@ -6100,11 +6546,25 @@ impl App {
         self.td.load_profile(target);
     }
 
+    fn open_shared_media(&mut self, chat_id: i64) {
+        self.td.media_counts(chat_id);
+        self.popup = Some(Popup::SharedMedia { chat_id, sel: 0 });
+    }
+
+    fn open_media_list(&mut self, chat_id: i64, media: model::MediaFilter) {
+        self.open_search(Some(chat_id), false);
+        if let Some(Popup::Search(sv)) = &mut self.popup {
+            sv.media = Some(media);
+        }
+        self.run_search();
+    }
+
     fn open_search(&mut self, chat_id: Option<i64>, pinned: bool) {
         self.popup = Some(Popup::Search(SearchView {
             chat_id,
             pinned,
             sender: None,
+            media: None,
             input: TextInput::default(),
             searched_for: None,
             results: Vec::new(),
@@ -6132,7 +6592,7 @@ impl App {
         sv.loading = true;
         sv.searched_for = Some(query.clone());
         self.td
-            .search(token, sv.chat_id, query, sv.pinned, sv.sender);
+            .search(token, sv.chat_id, query, sv.pinned, sv.sender, sv.media);
     }
 
     pub fn jump_to_in(&mut self, chat_id: i64, msg_id: i64, topic: Option<i32>) {
@@ -6734,6 +7194,11 @@ impl App {
             },
             Popup::Options { sel } => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => self.popup = None,
+                KeyCode::Tab | KeyCode::BackTab => {
+                    let n = OPTION_GROUPS.len();
+                    let step = if key.code == KeyCode::Tab { 1 } else { n - 1 };
+                    *sel = OPTION_GROUPS[(option_group(*sel) + step) % n].1[0];
+                }
                 KeyCode::Char('j') | KeyCode::Down => *sel = shift_option(*sel, 1),
                 KeyCode::Char('k') | KeyCode::Up => *sel = shift_option(*sel, -1),
                 KeyCode::Enter | KeyCode::Char(' ') => {
@@ -7018,6 +7483,7 @@ impl App {
             chat_id: Some(chat_id),
             pinned: false,
             sender: Some(sender),
+            media: None,
             input: TextInput::default(),
             searched_for: None,
             results: Vec::new(),
@@ -8285,6 +8751,110 @@ mod tests {
     }
 
     #[test]
+    fn mentions_complete_from_usernames_and_switcher_finds_chats_by_username() {
+        let (mut app, _log) = fake_app(Settings::default());
+        open_with_history(&mut app, 20);
+        app.user_meta.entry(2).or_default().usernames = vec!["alice_s".to_owned()];
+        press(&mut app, K::Char('i'), M::NONE);
+        for c in "hi @sm".chars() {
+            press(&mut app, K::Char(c), M::NONE);
+        }
+        assert_eq!(
+            app.mention_suggestions(),
+            vec![("alice_s".to_owned(), "Alice Smith".to_owned())]
+        );
+        press(&mut app, K::Tab, M::NONE);
+        assert_eq!(app.composer.input.text(), "hi @alice_s ");
+        assert!(app.mention_suggestions().is_empty());
+        assert_eq!(app.switcher_results("@alice").first(), Some(&20));
+        assert_eq!(app.switcher_results("alice_s").first(), Some(&20));
+        assert!(app.switcher_results("@nobody").is_empty());
+    }
+
+    #[test]
+    fn russian_layout_reaches_normal_mode_bindings_and_control_chords() {
+        let (mut app, _log) = fake_app(Settings::default());
+        open_with_history(&mut app, 20);
+        app.composer.active = false;
+        press(&mut app, K::Char('ш'), M::NONE);
+        assert!(app.composer.active);
+        press(&mut app, K::Char('ш'), M::NONE);
+        assert_eq!(app.composer.input.text(), "ш");
+        press(&mut app, K::Char('ц'), M::CONTROL);
+        assert_eq!(app.composer.input.text(), "");
+    }
+
+    #[test]
+    fn dropped_file_paths_become_attachments_and_other_text_is_typed() {
+        let (mut app, _log) = fake_app(Settings::default());
+        open_with_history(&mut app, 20);
+        let dir = std::env::temp_dir().join(format!("gramtty-drop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("my note.txt");
+        std::fs::write(&file, "x").unwrap();
+        app.handle(Event::Input(TermEvent::Paste(file.display().to_string())));
+        assert_eq!(app.composer.attachments.len(), 1);
+        let uri = format!("file://{}", file.display().to_string().replace(' ', "%20"));
+        app.handle(Event::Input(TermEvent::Paste(uri)));
+        assert_eq!(app.composer.attachments.len(), 2);
+        app.handle(Event::Input(TermEvent::Paste("/no/such/file".to_owned())));
+        assert_eq!(app.composer.attachments.len(), 2);
+        assert_eq!(app.composer.input.text(), "/no/such/file");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn marked_messages_forward_together_to_several_chats_without_the_sender() {
+        let (mut app, log) = fake_app(Settings::default());
+        open_with_history(&mut app, 20);
+        app.focus = Pane::Messages;
+        press(&mut app, K::Char('k'), M::NONE);
+        press(&mut app, K::Char('m'), M::NONE);
+        press(&mut app, K::Char('k'), M::NONE);
+        press(&mut app, K::Char('m'), M::NONE);
+        let ids: Vec<i64> = app.marked.iter().copied().collect();
+        assert_eq!(ids.len(), 2);
+        press(&mut app, K::Char('f'), M::NONE);
+        press(&mut app, K::Tab, M::NONE);
+        press(&mut app, K::Tab, M::NONE);
+        press(&mut app, K::Char('t'), M::CONTROL);
+        press(&mut app, K::Enter, M::NONE);
+        let sent = logged(&log, "forward");
+        assert_eq!(sent.len(), 2, "{sent:?}");
+        assert!(
+            sent.iter()
+                .all(|l| l.starts_with(&format!("forward 20 {ids:?} -> ")) && l.ends_with(" copy")),
+            "{sent:?}"
+        );
+        assert!(app.marked.is_empty());
+        press(&mut app, K::Char('m'), M::NONE);
+        assert_eq!(app.marked.len(), 1);
+        press(&mut app, K::Esc, M::NONE);
+        assert!(app.marked.is_empty());
+    }
+
+    #[test]
+    fn text_selection_copies_only_the_chosen_fragment() {
+        let (mut app, _log) = fake_app(Settings::default());
+        open_with_history(&mut app, 20);
+        app.focus = Pane::Messages;
+        press(&mut app, K::Char('k'), M::NONE);
+        let full = app.selected_message().unwrap().body.text.clone();
+        press(&mut app, K::Char('V'), M::NONE);
+        press(&mut app, K::Char('w'), M::NONE);
+        press(&mut app, K::Char('l'), M::NONE);
+        press(&mut app, K::Char('v'), M::NONE);
+        press(&mut app, K::Char('$'), M::NONE);
+        let Some(Popup::TextSelect { input, anchor }) = &app.popup else {
+            panic!("no selection popup");
+        };
+        let word = full.split(' ').next().unwrap().chars().count();
+        assert_eq!((*anchor, input.cursor()), (Some(word + 1), full.chars().count()));
+        press(&mut app, K::Char('y'), M::NONE);
+        assert!(app.popup.is_none());
+    }
+
+    #[test]
     fn presence_and_typing_feed_subtitles() {
         let (mut app, _log) = fake_app(Settings::default());
         app.user_meta.insert(
@@ -8739,7 +9309,13 @@ mod tests {
         press(&mut app, K::Char('l'), M::NONE);
         assert_eq!(app.settings.media.max_animations(), 4);
         press(&mut app, K::Char('j'), M::NONE);
+        assert!(
+            matches!(app.popup, Some(Popup::Options { sel }) if sel == PAUSE_ANIMATIONS_OPTION)
+        );
+        press(&mut app, K::Tab, M::NONE);
         assert!(matches!(app.popup, Some(Popup::Options { sel }) if sel == TRANSLATE_OPTION));
+        press(&mut app, K::BackTab, M::NONE);
+        assert!(matches!(app.popup, Some(Popup::Options { sel }) if sel == ANIMATIONS_OPTION));
         press(&mut app, K::Char('w'), M::NONE);
         assert!(!app.settings.media.pause_unfocused);
         assert_eq!(app.option_value(PAUSE_ANIMATIONS_OPTION), "[ ]");
@@ -9305,7 +9881,7 @@ mod tests {
             Some(Popup::Menu { items, .. }) => items.iter().map(|i| i.key).collect(),
             _ => String::new(),
         };
-        assert_eq!(keys, "ompP/RtxD");
+        assert_eq!(keys, "ompP/gRtxD");
         press(&mut app, K::Char('t'), M::NONE);
         assert!(
             matches!(app.popup, Some(Popup::Ttl { sel: 2, .. })),
@@ -9335,7 +9911,7 @@ mod tests {
             Some(Popup::Menu { items, .. }) => items.iter().map(|i| i.key).collect(),
             _ => String::new(),
         };
-        assert_eq!(keys, "ompP/RtD", "closed chats can only be deleted");
+        assert_eq!(keys, "ompP/gRtD", "closed chats can only be deleted");
         press(&mut app, K::Char('D'), M::NONE);
         press(&mut app, K::Char('y'), M::NONE);
         assert_eq!(

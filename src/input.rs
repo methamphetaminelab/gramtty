@@ -25,6 +25,36 @@ impl TextInput {
         &self.text
     }
 
+    pub fn cursor(&self) -> usize {
+        self.cursor
+    }
+
+    pub fn slice(&self, from: usize, to: usize) -> String {
+        self.text
+            .chars()
+            .skip(from)
+            .take(to.saturating_sub(from))
+            .collect()
+    }
+
+    pub fn move_visual(&mut self, down: bool, width: usize) {
+        let (start, end) = (self.line_start(), self.line_end());
+        let w = width.max(1);
+        if down {
+            if self.cursor + w <= end {
+                self.cursor += w;
+            } else if (self.cursor - start) / w < (end - start) / w {
+                self.cursor = end;
+            } else {
+                self.move_line(true);
+            }
+        } else if self.cursor - start >= w {
+            self.cursor -= w;
+        } else {
+            self.move_line(false);
+        }
+    }
+
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;
@@ -100,6 +130,115 @@ impl TextInput {
         true
     }
 
+    fn word_left(&self) -> usize {
+        let chars: Vec<char> = self.text.chars().collect();
+        let mut i = self.cursor;
+        while i > 0 && !chars[i - 1].is_alphanumeric() {
+            i -= 1;
+        }
+        while i > 0 && chars[i - 1].is_alphanumeric() {
+            i -= 1;
+        }
+        i
+    }
+
+    fn word_right(&self) -> usize {
+        let chars: Vec<char> = self.text.chars().collect();
+        let mut i = self.cursor;
+        while i < chars.len() && !chars[i].is_alphanumeric() {
+            i += 1;
+        }
+        while i < chars.len() && chars[i].is_alphanumeric() {
+            i += 1;
+        }
+        i
+    }
+
+    fn line_start(&self) -> usize {
+        let chars: Vec<char> = self.text.chars().collect();
+        let mut i = self.cursor;
+        while i > 0 && chars[i - 1] != '\n' {
+            i -= 1;
+        }
+        i
+    }
+
+    fn line_end(&self) -> usize {
+        let chars: Vec<char> = self.text.chars().collect();
+        let mut i = self.cursor;
+        while i < chars.len() && chars[i] != '\n' {
+            i += 1;
+        }
+        i
+    }
+
+    fn remove_range(&mut self, from: usize, to: usize) -> bool {
+        if from >= to {
+            return false;
+        }
+        let (a, b) = (self.byte_at(from), self.byte_at(to));
+        self.text.replace_range(a..b, "");
+        self.cursor = from;
+        true
+    }
+
+    fn move_to(&mut self, to: usize) -> Edit {
+        if to == self.cursor {
+            return Edit::Ignored;
+        }
+        self.cursor = to;
+        Edit::Moved
+    }
+
+    fn move_line(&mut self, down: bool) -> Edit {
+        let start = self.line_start();
+        let col = self.cursor - start;
+        let target = if down {
+            let end = self.line_end();
+            if end >= self.len() {
+                return Edit::Ignored;
+            }
+            end + 1
+        } else {
+            if start == 0 {
+                return Edit::Ignored;
+            }
+            self.cursor = start - 1;
+            self.line_start()
+        };
+        self.cursor = target;
+        self.cursor = (target + col).min(self.line_end());
+        Edit::Moved
+    }
+
+    fn mention_start(&self) -> Option<usize> {
+        let chars: Vec<char> = self.text.chars().take(self.cursor).collect();
+        let start = chars
+            .iter()
+            .rposition(|c| c.is_whitespace())
+            .map_or(0, |i| i + 1);
+        (chars.get(start) == Some(&'@')).then_some(start)
+    }
+
+    pub fn mention_prefix(&self) -> Option<String> {
+        let start = self.mention_start()?;
+        Some(
+            self.text
+                .chars()
+                .skip(start + 1)
+                .take(self.cursor - start - 1)
+                .collect(),
+        )
+    }
+
+    pub fn complete_mention(&mut self, username: &str) {
+        let Some(start) = self.mention_start() else {
+            return;
+        };
+        self.remove_range(start, self.cursor);
+        self.insert_str(&format!("@{username} "));
+    }
+
     pub fn handle_key(&mut self, key: &KeyEvent, allow_newline: bool) -> Edit {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -118,21 +257,24 @@ impl TextInput {
                 Edit::Changed
             }
             KeyCode::Char('w') if ctrl => bool_edit(self.delete_word()),
-            KeyCode::Backspace if alt => bool_edit(self.delete_word()),
-            KeyCode::Char('u') if ctrl => {
-                let b = self.byte_at(self.cursor);
-                self.text.replace_range(..b, "");
-                self.cursor = 0;
-                Edit::Changed
+            KeyCode::Char('h') if ctrl => bool_edit(self.remove_range(self.word_left(), self.cursor)),
+            KeyCode::Backspace if alt || ctrl => {
+                bool_edit(self.remove_range(self.word_left(), self.cursor))
             }
-            KeyCode::Char('a') if ctrl => {
-                self.cursor = 0;
-                Edit::Moved
+            KeyCode::Delete if alt || ctrl => {
+                bool_edit(self.remove_range(self.cursor, self.word_right()))
             }
-            KeyCode::Char('e') if ctrl => {
-                self.cursor = self.len();
-                Edit::Moved
-            }
+            KeyCode::Char('d') if alt => bool_edit(self.remove_range(self.cursor, self.word_right())),
+            KeyCode::Char('u') if ctrl => bool_edit(self.remove_range(self.line_start(), self.cursor)),
+            KeyCode::Char('a') if ctrl => self.move_to(self.line_start()),
+            KeyCode::Char('e') if ctrl => self.move_to(self.line_end()),
+            KeyCode::Left if ctrl || alt => self.move_to(self.word_left()),
+            KeyCode::Right if ctrl || alt => self.move_to(self.word_right()),
+            KeyCode::Char('b') if alt => self.move_to(self.word_left()),
+            KeyCode::Char('f') if alt => self.move_to(self.word_right()),
+            KeyCode::Home if ctrl => self.move_to(0),
+            KeyCode::End if ctrl => self.move_to(self.len()),
+            KeyCode::Char(_) if alt => Edit::Ignored,
             KeyCode::Char(c) if !ctrl => {
                 self.insert(c);
                 Edit::Changed
@@ -147,14 +289,10 @@ impl TextInput {
                 self.cursor = (self.cursor + 1).min(self.len());
                 Edit::Moved
             }
-            KeyCode::Home => {
-                self.cursor = 0;
-                Edit::Moved
-            }
-            KeyCode::End => {
-                self.cursor = self.len();
-                Edit::Moved
-            }
+            KeyCode::Home => self.move_to(self.line_start()),
+            KeyCode::End => self.move_to(self.line_end()),
+            KeyCode::Up => self.move_line(false),
+            KeyCode::Down => self.move_line(true),
             _ => Edit::Ignored,
         }
     }
@@ -240,6 +378,39 @@ mod tests {
         t.handle_key(&key(KeyCode::Char('j'), KeyModifiers::CONTROL), false);
         assert_eq!(t.text(), "hello big \n");
         assert_eq!(t.cursor_position(80), (1, 0));
+    }
+
+    #[test]
+    fn word_and_line_motions() {
+        let ctrl = KeyModifiers::CONTROL;
+        let mut t = TextInput::with_text("привет, мир\nвторая строка");
+        t.handle_key(&key(KeyCode::Left, ctrl), true);
+        t.handle_key(&key(KeyCode::Left, ctrl), true);
+        t.insert('X');
+        assert_eq!(t.text(), "привет, мир\nXвторая строка");
+        t.handle_key(&key(KeyCode::Up, KeyModifiers::NONE), true);
+        t.handle_key(&key(KeyCode::End, KeyModifiers::NONE), true);
+        t.handle_key(&key(KeyCode::Backspace, ctrl), true);
+        assert_eq!(t.text(), "привет, \nXвторая строка");
+        t.handle_key(&key(KeyCode::Home, KeyModifiers::NONE), true);
+        t.handle_key(&key(KeyCode::Delete, ctrl), true);
+        assert_eq!(t.text(), ", \nXвторая строка");
+        t.handle_key(&key(KeyCode::Down, KeyModifiers::NONE), true);
+        t.handle_key(&key(KeyCode::Right, ctrl), true);
+        t.handle_key(&key(KeyCode::Char('u'), ctrl), true);
+        assert_eq!(t.text(), ", \n строка");
+        t.handle_key(&key(KeyCode::Enter, KeyModifiers::SHIFT), true);
+        assert_eq!(t.text(), ", \n\n строка");
+    }
+
+    #[test]
+    fn mention_prefix_is_the_word_under_the_cursor_and_completes_in_place() {
+        let mut t = TextInput::with_text("привет @tr");
+        assert_eq!(t.mention_prefix().as_deref(), Some("tr"));
+        t.complete_mention("trito");
+        assert_eq!(t.text(), "привет @trito ");
+        assert_eq!(t.mention_prefix(), None);
+        assert_eq!(TextInput::with_text("mail a@b").mention_prefix(), None);
     }
 
     #[test]

@@ -153,6 +153,41 @@ pub struct Profile {
     pub commands: Vec<crate::bots::Command>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MediaFilter {
+    Photos,
+    Videos,
+    Files,
+    Links,
+    Voice,
+    Gifs,
+    Music,
+}
+
+impl MediaFilter {
+    pub const ALL: [MediaFilter; 7] = [
+        MediaFilter::Photos,
+        MediaFilter::Videos,
+        MediaFilter::Files,
+        MediaFilter::Links,
+        MediaFilter::Voice,
+        MediaFilter::Gifs,
+        MediaFilter::Music,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            MediaFilter::Photos => "Photos",
+            MediaFilter::Videos => "Videos",
+            MediaFilter::Files => "Files",
+            MediaFilter::Links => "Links",
+            MediaFilter::Voice => "Voice messages",
+            MediaFilter::Gifs => "GIFs",
+            MediaFilter::Music => "Music",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct UserMeta {
     pub status: crate::presence::Status,

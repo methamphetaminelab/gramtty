@@ -99,6 +99,10 @@ pub enum Event {
         token: u64,
         result: Result<Vec<Msg>, String>,
     },
+    MediaCounts {
+        chat_id: i64,
+        counts: Vec<(crate::model::MediaFilter, Option<i32>)>,
+    },
     Fetched(Msg),
     Properties {
         chat_id: i64,
@@ -861,6 +865,62 @@ pub fn animation_item(a: &types::Animation) -> Item {
     }
 }
 
+const STICKER_SEARCH_EMOJIS: usize = 24;
+const KEYWORD_MIN_CHARS: usize = 3;
+
+async fn keyword_emojis(word: &str, langs: &[String], c: i32) -> Vec<String> {
+    let chars: Vec<char> = word.chars().collect();
+    let mut len = chars.len();
+    while len >= KEYWORD_MIN_CHARS.min(chars.len()) && len > 0 {
+        let prefix: String = chars[..len].iter().collect();
+        if let Ok(enums::EmojiKeywords::EmojiKeywords(k)) =
+            tdlib_rs::functions::search_emojis(prefix, langs.to_vec(), c).await
+            && !k.emoji_keywords.is_empty()
+        {
+            let mut out: Vec<String> = Vec::new();
+            for e in k.emoji_keywords {
+                if !out.contains(&e.emoji) {
+                    out.push(e.emoji);
+                }
+            }
+            return out;
+        }
+        len -= 1;
+    }
+    Vec::new()
+}
+
+async fn search_gifs(query: String, chat_id: i64, c: i32) -> Result<Vec<Item>, types::Error> {
+    let bot = match tdlib_rs::functions::get_option("animation_search_bot_username".to_owned(), c)
+        .await?
+    {
+        enums::OptionValue::String(s) => s.value,
+        _ => "gif".to_owned(),
+    };
+    let enums::Chat::Chat(chat) = tdlib_rs::functions::search_public_chat(bot, c).await?;
+    let enums::ChatType::Private(p) = chat.r#type else {
+        return Ok(Vec::new());
+    };
+    let enums::InlineQueryResults::InlineQueryResults(found) =
+        tdlib_rs::functions::get_inline_query_results(
+            p.user_id,
+            chat_id,
+            None,
+            query,
+            String::new(),
+            c,
+        )
+        .await?;
+    Ok(found
+        .results
+        .iter()
+        .filter_map(|r| match r {
+            enums::InlineQueryResult::Animation(a) => Some(animation_item(&a.animation)),
+            _ => None,
+        })
+        .collect())
+}
+
 fn stickers_of(s: enums::Stickers) -> Vec<Item> {
     let enums::Stickers::Stickers(s) = s;
     s.stickers.iter().map(sticker_item).collect()
@@ -1094,18 +1154,65 @@ impl Td {
         });
     }
 
-    pub fn search_stickers(&self, query: String, chat_id: i64) {
+    pub fn search_stickers(&self, query: String, chat_id: i64, gifs: bool) {
         let c = self.client_id;
         self.sticker_task(async move {
-            let found = tdlib_rs::functions::get_stickers(
-                enums::StickerType::Regular,
-                query.clone(),
-                100,
-                chat_id,
-                c,
-            )
-            .await?;
-            Ok(StickerData::Search(query, stickers_of(found)))
+            if gifs {
+                return Ok(StickerData::Search(
+                    query.clone(),
+                    search_gifs(query, chat_id, c).await?,
+                ));
+            }
+            let langs = vec!["ru".to_owned(), "en".to_owned()];
+            let mut emojis: Vec<String> = Vec::new();
+            for word in query.split_whitespace() {
+                for e in keyword_emojis(word, &langs, c).await {
+                    if !emojis.contains(&e) {
+                        emojis.push(e);
+                    }
+                }
+            }
+            let mut items = stickers_of(
+                tdlib_rs::functions::get_stickers(
+                    enums::StickerType::Regular,
+                    query.clone(),
+                    100,
+                    chat_id,
+                    c,
+                )
+                .await?,
+            );
+            if !emojis.is_empty() {
+                emojis.truncate(STICKER_SEARCH_EMOJIS);
+                let joined = emojis.join(" ");
+                if let Ok(found) = tdlib_rs::functions::get_stickers(
+                    enums::StickerType::Regular,
+                    joined.clone(),
+                    200,
+                    chat_id,
+                    c,
+                )
+                .await
+                {
+                    items.extend(stickers_of(found));
+                }
+                if let Ok(found) = tdlib_rs::functions::search_stickers(
+                    enums::StickerType::Regular,
+                    joined,
+                    query.clone(),
+                    langs,
+                    0,
+                    100,
+                    c,
+                )
+                .await
+                {
+                    items.extend(stickers_of(found));
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            items.retain(|i| seen.insert(i.file_id));
+            Ok(StickerData::Search(query, items))
         });
     }
 }
@@ -1360,8 +1467,21 @@ impl Td {
         });
     }
 
-    pub fn forward(&self, to: i64, from: i64, message_ids: Vec<i64>) {
-        self.note(format!("forward {from} {message_ids:?} -> {to}"));
+    pub fn resend(&self, chat_id: i64, message_ids: Vec<i64>) {
+        self.note(format!("resend {chat_id} {message_ids:?}"));
+        let c = self.client_id;
+        self.spawn("resend", false, async move {
+            tdlib_rs::functions::resend_messages(chat_id, message_ids, None, 0, c)
+                .await
+                .map(|_| ())
+        });
+    }
+
+    pub fn forward(&self, to: i64, from: i64, message_ids: Vec<i64>, copy: bool) {
+        self.note(format!(
+            "forward {from} {message_ids:?} -> {to}{}",
+            if copy { " copy" } else { "" }
+        ));
         let c = self.client_id;
         self.spawn("forward", false, async move {
             tdlib_rs::functions::forward_messages(
@@ -1370,7 +1490,7 @@ impl Td {
                 from,
                 message_ids,
                 None,
-                false,
+                copy,
                 false,
                 c,
             )
@@ -1386,13 +1506,16 @@ impl Td {
         query: String,
         pinned: bool,
         sender: Option<Sender>,
+        media: Option<crate::model::MediaFilter>,
     ) {
         self.note(format!("search {chat_id:?} sender {sender:?}"));
         let c = self.client_id;
         self.task("search", async move {
             let result = match chat_id {
                 Some(chat_id) => {
-                    let filter = pinned.then_some(enums::SearchMessagesFilter::Pinned);
+                    let filter = media
+                        .map(media_filter)
+                        .or(pinned.then_some(enums::SearchMessagesFilter::Pinned));
                     let sender_id = sender.map(input_sender);
                     tdlib_rs::functions::search_chat_messages(
                         chat_id, None, query, sender_id, 0, 0, 100, filter, c,
@@ -1420,6 +1543,28 @@ impl Td {
                     .map(|m| m.into_iter().map(convert_message).collect())
                     .map_err(|e| friendly_error(&e)),
             }
+        });
+    }
+
+    pub fn media_counts(&self, chat_id: i64) {
+        self.note(format!("media counts {chat_id}"));
+        let c = self.client_id;
+        self.task("media counts", async move {
+            let mut counts = Vec::new();
+            for f in crate::model::MediaFilter::ALL {
+                let n = tdlib_rs::functions::get_chat_message_count(
+                    chat_id,
+                    None,
+                    media_filter(f),
+                    false,
+                    c,
+                )
+                .await
+                .ok()
+                .map(|enums::Count::Count(n)| n.count);
+                counts.push((f, n));
+            }
+            Event::MediaCounts { chat_id, counts }
         });
     }
 
@@ -2889,6 +3034,19 @@ pub fn user_meta(u: &types::User) -> crate::model::UserMeta {
             .map(|n| n.active_usernames.clone())
             .unwrap_or_default(),
         photo: u.profile_photo.as_ref().map(|p| convert_file(&p.small)),
+    }
+}
+
+fn media_filter(f: crate::model::MediaFilter) -> enums::SearchMessagesFilter {
+    use crate::model::MediaFilter as M;
+    match f {
+        M::Photos => enums::SearchMessagesFilter::Photo,
+        M::Videos => enums::SearchMessagesFilter::Video,
+        M::Files => enums::SearchMessagesFilter::Document,
+        M::Links => enums::SearchMessagesFilter::Url,
+        M::Voice => enums::SearchMessagesFilter::VoiceNote,
+        M::Gifs => enums::SearchMessagesFilter::Animation,
+        M::Music => enums::SearchMessagesFilter::Audio,
     }
 }
 

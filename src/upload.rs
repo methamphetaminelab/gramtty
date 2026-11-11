@@ -733,6 +733,23 @@ pub fn filter_entries(entries: &[DirEntry], filter: &str) -> Vec<usize> {
     scored.into_iter().map(|(_, i)| i).collect()
 }
 
+pub fn dropped_paths(text: &str) -> Option<Vec<PathBuf>> {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    let paths: Vec<PathBuf> = if lines.iter().all(|l| l.starts_with("file://")) {
+        parse_uri_list(text)
+    } else {
+        lines
+            .iter()
+            .map(|l| PathBuf::from(l.trim_matches(['\'', '"']).replace("\\ ", " ")))
+            .collect()
+    };
+    (!paths.is_empty() && paths.iter().all(|p| p.is_absolute() && p.is_file())).then_some(paths)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
