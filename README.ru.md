@@ -120,14 +120,14 @@ cargo build --release
 
 ## Ключи Telegram API
 
-Получите `api_id` и `api_hash` на https://my.telegram.org и положите в `~/.config/gramtty/api.toml` (на Windows `%APPDATA%\gramtty\api.toml`):
+В готовых сборках (скрипты установки, установщик, Homebrew, `gramtty-bin`) ключи уже встроены, ничего делать не нужно: просто войдите. В сборках из исходников (включая AUR-пакет `gramtty`) встроенных ключей нет; для них, или чтобы пользоваться своими ключами, получите `api_id` и `api_hash` на https://my.telegram.org и положите в `~/.config/gramtty/api.toml` (на Windows `%APPDATA%\gramtty\api.toml`):
 
 ```toml
 api_id = 12345
 api_hash = "0123456789abcdef0123456789abcdef"
 ```
 
-Либо задайте обе переменные `GRAMTTY_API_ID` и `GRAMTTY_API_HASH` (они приоритетнее файла).
+Либо задайте обе переменные `GRAMTTY_API_ID` и `GRAMTTY_API_HASH` (они приоритетнее файла, файл приоритетнее встроенных ключей). Чтобы собрать свой бинарник со встроенными ключами, задайте `GRAMTTY_BUILTIN_API_ID` и `GRAMTTY_BUILTIN_API_HASH` при `cargo build`.
 
 ## Первый вход
 

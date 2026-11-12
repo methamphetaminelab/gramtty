@@ -120,14 +120,14 @@ All optional, looked up on `PATH`; a missing one only disables its feature.
 
 ## Telegram API credentials
 
-Get `api_id` and `api_hash` at https://my.telegram.org and put them in `~/.config/gramtty/api.toml` (on Windows `%APPDATA%\gramtty\api.toml`):
+Prebuilt releases (install scripts, installer, Homebrew, `gramtty-bin`) come with built-in keys, so nothing is needed: just log in. Builds from source (including the `gramtty` AUR package) have no built-in keys; for them, or to use your own keys, get `api_id` and `api_hash` at https://my.telegram.org and put them in `~/.config/gramtty/api.toml` (on Windows `%APPDATA%\gramtty\api.toml`):
 
 ```toml
 api_id = 12345
 api_hash = "0123456789abcdef0123456789abcdef"
 ```
 
-Or set both `GRAMTTY_API_ID` and `GRAMTTY_API_HASH` (they take priority over the file).
+Or set both `GRAMTTY_API_ID` and `GRAMTTY_API_HASH` (they take priority over the file, the file over built-in keys). To build your own binary with built-in keys, set `GRAMTTY_BUILTIN_API_ID` and `GRAMTTY_BUILTIN_API_HASH` while running `cargo build`.
 
 ## First login
 

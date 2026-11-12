@@ -66,7 +66,17 @@ jobs:
       - name: Build
         env:
           MACOSX_DEPLOYMENT_TARGET: ${{ matrix.macos }}
-        run: cargo build --release --locked --target "${{ matrix.target }}"
+          GRAMTTY_BUILTIN_API_ID: ${{ secrets.GRAMTTY_API_ID }}
+          GRAMTTY_BUILTIN_API_HASH: ${{ secrets.GRAMTTY_API_HASH }}
+        run: |
+          if [ -z "$GRAMTTY_BUILTIN_API_ID" ] || [ -z "$GRAMTTY_BUILTIN_API_HASH" ]; then
+            if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+              echo "::error::release builds need the GRAMTTY_API_ID and GRAMTTY_API_HASH repository secrets"
+              exit 1
+            fi
+            echo "::warning::GRAMTTY_API_ID/GRAMTTY_API_HASH secrets are not set; building without built-in API keys"
+          fi
+          cargo build --release --locked --target "${{ matrix.target }}"
 
       - name: Package
         env:

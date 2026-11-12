@@ -131,12 +131,20 @@ pub fn load_credentials() -> Result<ApiCredentials, String> {
         return Ok(creds);
     }
     let path = config_dir()?.join("api.toml");
-    let raw = std::fs::read_to_string(&path).map_err(|e| {
-        format!(
-            "cannot read {}: {e}; create it with api_id and api_hash or set {id_var}/{hash_var}",
-            path.display()
-        )
-    })?;
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return builtin_credentials()?.ok_or_else(|| {
+                format!(
+                    "no Telegram API keys. Get api_id and api_hash at https://my.telegram.org \
+                     (API development tools) and put them into {} as\n\n    api_id = 12345\n    \
+                     api_hash = \"0123456789abcdef0123456789abcdef\"\n\nor set {id_var} and {hash_var}",
+                    path.display()
+                )
+            });
+        }
+        Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
+    };
     let file: ApiFile = toml::from_str(&raw)
         .map_err(|e| format!("{} is invalid: {}", path.display(), e.message()))?;
     if file.api_hash.trim().is_empty() {
@@ -146,6 +154,20 @@ pub fn load_credentials() -> Result<ApiCredentials, String> {
         api_id: file.api_id,
         api_hash: file.api_hash.trim().to_owned(),
     })
+}
+
+fn builtin_credentials() -> Result<Option<ApiCredentials>, String> {
+    let set = |v: Option<&str>| v.filter(|v| !v.trim().is_empty()).map(str::to_owned);
+    env_credentials(
+        (
+            "GRAMTTY_BUILTIN_API_ID",
+            set(option_env!("GRAMTTY_BUILTIN_API_ID")),
+        ),
+        (
+            "GRAMTTY_BUILTIN_API_HASH",
+            set(option_env!("GRAMTTY_BUILTIN_API_HASH")),
+        ),
+    )
 }
 
 fn env_credentials(
