@@ -76,17 +76,6 @@ pub enum Encoder {
     Ffmpeg,
 }
 
-pub fn find_in_path(program: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|d| d.join(program))
-        .find(|p| {
-            use std::os::unix::fs::PermissionsExt;
-            p.metadata()
-                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        })
-}
-
 pub fn pick_encoder(has: impl Fn(&str) -> bool) -> Result<Encoder, String> {
     if has("opusenc") {
         Ok(Encoder::Opusenc)
@@ -105,12 +94,16 @@ const RECORDER_MISSING: &str = "voice messages need pw-record (PipeWire)";
 const RECORDER: &str = "ffmpeg";
 #[cfg(target_os = "macos")]
 const RECORDER_MISSING: &str = "voice messages need ffmpeg (brew install ffmpeg)";
+#[cfg(windows)]
+const RECORDER: &str = "ffmpeg";
+#[cfg(windows)]
+const RECORDER_MISSING: &str = "voice messages need ffmpeg on PATH (winget install ffmpeg)";
 
 pub fn check_tools() -> Result<Encoder, String> {
-    if find_in_path(RECORDER).is_none() {
+    if crate::config::find_in_path(RECORDER).is_none() {
         return Err(RECORDER_MISSING.to_owned());
     }
-    pick_encoder(|p| find_in_path(p).is_some())
+    pick_encoder(|p| crate::config::find_in_path(p).is_some())
 }
 
 #[cfg(target_os = "linux")]
@@ -147,6 +140,85 @@ pub fn record_args() -> Vec<String> {
         "s16le".into(),
         "pipe:1".into(),
     ]
+}
+
+#[cfg(windows)]
+pub fn record_args(mic: &str) -> Vec<String> {
+    vec![
+        "-v".into(),
+        "error".into(),
+        "-nostdin".into(),
+        "-f".into(),
+        "dshow".into(),
+        "-i".into(),
+        format!("audio={mic}"),
+        "-ac".into(),
+        "1".into(),
+        "-ar".into(),
+        RATE.to_string(),
+        "-f".into(),
+        "s16le".into(),
+        "pipe:1".into(),
+    ]
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn dshow_microphone(listing: &str) -> Option<String> {
+    let mut audio_section = false;
+    let mut found: Option<String> = None;
+    for line in listing.lines() {
+        let line = line.split_once("] ").map_or(line, |(_, rest)| rest).trim();
+        if line.contains("DirectShow audio devices") {
+            audio_section = true;
+            continue;
+        }
+        if line.contains("DirectShow video devices") {
+            audio_section = false;
+            continue;
+        }
+        let quoted = line
+            .split_once('"')
+            .and_then(|(_, rest)| rest.split_once('"'))
+            .map(|(name, _)| name.to_owned());
+        let Some(name) = quoted else {
+            continue;
+        };
+        if line.starts_with("Alternative name") {
+            if found.is_some() {
+                return Some(name);
+            }
+            continue;
+        }
+        if let Some(name) = found {
+            return Some(name);
+        }
+        if line.ends_with("(audio)") || (audio_section && !line.ends_with("(video)")) {
+            found = Some(name);
+        }
+    }
+    found
+}
+
+#[cfg(windows)]
+fn default_microphone() -> Result<String, String> {
+    let out = std::process::Command::new(RECORDER)
+        .args([
+            "-hide_banner",
+            "-list_devices",
+            "true",
+            "-f",
+            "dshow",
+            "-i",
+            "dummy",
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .map_err(|e| format!("{RECORDER}: {e}"))?;
+    dshow_microphone(&String::from_utf8_lossy(&out.stderr)).ok_or_else(|| {
+        "no microphone found (ffmpeg -list_devices true -f dshow -i dummy)".to_owned()
+    })
 }
 
 pub fn encoder_command(enc: Encoder, out: &Path) -> (&'static str, Vec<String>) {
@@ -263,8 +335,12 @@ pub struct Recorder {
 
 impl Recorder {
     pub fn start() -> Result<Self, String> {
+        #[cfg(windows)]
+        let args = record_args(&default_microphone()?);
+        #[cfg(not(windows))]
+        let args = record_args();
         let mut child = tokio::process::Command::new(RECORDER)
-            .args(record_args())
+            .args(args)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
@@ -394,6 +470,18 @@ mod tests {
     use crate::model::decode_waveform;
 
     #[test]
+    fn dshow_listing_picks_first_microphone() {
+        let new = "[dshow @ 01] \"Integrated Camera\" (video)\n[dshow @ 01]   Alternative name \"@device_pnp_cam\"\n[dshow @ 01] \"Микрофон (Realtek(R) Audio)\" (audio)\n[dshow @ 01]   Alternative name \"@device_cm_{1}\\wave_{2}\"\n[dshow @ 01] \"Line In\" (audio)\ndummy: Immediate exit requested\n";
+        assert_eq!(
+            dshow_microphone(new).as_deref(),
+            Some("@device_cm_{1}\\wave_{2}")
+        );
+        let old = "[dshow @ 0x1] DirectShow video devices (some may be both video and audio devices)\n[dshow @ 0x1]  \"Cam\"\n[dshow @ 0x1] DirectShow audio devices\n[dshow @ 0x1]  \"Mic A\"\n[dshow @ 0x1]  \"Mic B\"\n";
+        assert_eq!(dshow_microphone(old).as_deref(), Some("Mic A"));
+        assert_eq!(dshow_microphone("[dshow @ 1] \"Cam\" (video)\n"), None);
+    }
+
+    #[test]
     fn waveform_packs_five_bits_and_roundtrips() {
         let values: Vec<u8> = (0..100).map(|i| (i * 7 % 32) as u8).collect();
         let packed = pack_waveform(&values);
@@ -494,7 +582,7 @@ mod tests {
 
     #[tokio::test]
     async fn encodes_synthetic_pcm() {
-        let Ok(enc) = pick_encoder(|p| find_in_path(p).is_some()) else {
+        let Ok(enc) = pick_encoder(|p| crate::config::find_in_path(p).is_some()) else {
             eprintln!("no opus encoder installed, skipping");
             return;
         };

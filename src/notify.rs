@@ -1,4 +1,3 @@
-use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -97,6 +96,63 @@ const NOTIFIER: &str = "osascript";
 #[cfg(target_os = "macos")]
 const NOTIFIER_MISSING: &str = "desktop notifications need osascript; disable them in Space o";
 
+#[cfg(windows)]
+const NOTIFIER: &str = "powershell";
+#[cfg(windows)]
+const NOTIFIER_MISSING: &str =
+    "desktop notifications need Windows PowerShell; disable them in Space o";
+
+pub fn powershell_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201a}' | '\u{201b}') {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out.push('\'');
+    out
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn toast_script(title: &str, body: &str) -> String {
+    format!(
+        "$ErrorActionPreference='Stop'\n\
+         [void][Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]\n\
+         $m=[Windows.UI.Notifications.ToastNotificationManager]\n\
+         $x=$m::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02)\n\
+         $t=$x.GetElementsByTagName('text')\n\
+         [void]$t.Item(0).AppendChild($x.CreateTextNode({}))\n\
+         [void]$t.Item(1).AppendChild($x.CreateTextNode({}))\n\
+         $a=$x.CreateElement('audio')\n\
+         $a.SetAttribute('silent','true')\n\
+         [void]$x.DocumentElement.AppendChild($a)\n\
+         $m::CreateToastNotifier('{{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}}\\WindowsPowerShell\\v1.0\\powershell.exe').Show([Windows.UI.Notifications.ToastNotification]::new($x))\n",
+        powershell_string(title),
+        powershell_string(body)
+    )
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn powershell_args(script: &str) -> Vec<String> {
+    use base64::Engine as _;
+    let utf16: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    vec![
+        "-NoProfile".to_owned(),
+        "-NonInteractive".to_owned(),
+        "-ExecutionPolicy".to_owned(),
+        "Bypass".to_owned(),
+        "-EncodedCommand".to_owned(),
+        base64::engine::general_purpose::STANDARD.encode(utf16),
+    ]
+}
+
+#[cfg(windows)]
+fn notifier_args(title: &str, body: &str, _icon: Option<&str>) -> Vec<String> {
+    powershell_args(&toast_script(title, body))
+}
+
 #[cfg(target_os = "linux")]
 fn notifier_args(title: &str, body: &str, icon: Option<&str>) -> Vec<String> {
     notify_args(title, body, icon)
@@ -110,7 +166,10 @@ fn notifier_args(title: &str, body: &str, _icon: Option<&str>) -> Vec<String> {
 pub fn send(title: String, body: String, icon: Option<String>, tx: UnboundedSender<Event>) {
     tokio::spawn(async move {
         let args = notifier_args(&title, &body, icon.as_deref());
-        let result = tokio::process::Command::new(NOTIFIER)
+        let mut cmd = tokio::process::Command::new(NOTIFIER);
+        #[cfg(windows)]
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
+        let result = cmd
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -138,15 +197,11 @@ pub struct SoundEnv {
     pub canberra: bool,
     pub pw_play: bool,
     pub afplay: bool,
+    pub mpv: bool,
 }
 
 fn on_path(name: &str) -> bool {
-    std::env::var_os("PATH").is_some_and(|paths| {
-        std::env::split_paths(&paths).any(|dir| {
-            std::fs::metadata(dir.join(name))
-                .is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
-        })
-    })
+    crate::config::find_in_path(name).is_some()
 }
 
 impl SoundEnv {
@@ -155,6 +210,7 @@ impl SoundEnv {
             canberra: on_path("canberra-gtk-play"),
             pw_play: on_path("pw-play"),
             afplay: cfg!(target_os = "macos") && on_path("afplay"),
+            mpv: on_path("mpv"),
         }
     }
 }
@@ -213,6 +269,21 @@ fn afplay(volume: u8, file: &Path) -> SoundCommand {
     }
 }
 
+fn mpv_sound(volume: u8, file: &Path, needs_default: bool) -> SoundCommand {
+    SoundCommand {
+        program: "mpv".to_owned(),
+        args: vec![
+            "--no-config".to_owned(),
+            "--no-video".to_owned(),
+            "--really-quiet".to_owned(),
+            format!("--volume={volume}"),
+            "--".to_owned(),
+            file.to_string_lossy().into_owned(),
+        ],
+        needs_default,
+    }
+}
+
 pub fn sound_command(
     n: &crate::config::Notifications,
     env: &SoundEnv,
@@ -242,7 +313,10 @@ pub fn sound_command(
         };
         return Ok(Some(afplay(volume, file)));
     }
-    Err("notification sound needs pw-play or canberra-gtk-play".to_owned())
+    if env.mpv {
+        return Ok(Some(mpv_sound(volume, file, builtin)));
+    }
+    Err("notification sound needs pw-play, canberra-gtk-play or mpv".to_owned())
 }
 
 fn write_default_sound(path: &Path) -> std::io::Result<()> {
@@ -389,6 +463,7 @@ mod tests {
             canberra: true,
             pw_play: true,
             afplay: true,
+            mpv: true,
         };
         n.volume = 50;
         let c = sound_command(&n, &all, def).unwrap().unwrap();
@@ -460,6 +535,34 @@ mod tests {
             sound_command(&n, &both, def).unwrap().unwrap().program,
             "pw-play"
         );
+    }
+
+    #[test]
+    fn toast_script_quotes_user_text_and_encodes_utf16() {
+        assert_eq!(powershell_string("it's ‘x’ $(rm)"), "'it''s ‘‘x’’ $(rm)'");
+        let script = toast_script("Ann", "hi'; calc");
+        assert!(script.contains("CreateTextNode('hi''; calc')"));
+        let args = powershell_args("é");
+        assert_eq!(args[4], "-EncodedCommand");
+        assert_eq!(args[5], "6QA=");
+    }
+
+    #[test]
+    fn mpv_plays_the_sound_when_nothing_else_is_there() {
+        let n = crate::config::Notifications {
+            volume: 40,
+            ..Default::default()
+        };
+        let env = SoundEnv {
+            mpv: true,
+            ..SoundEnv::default()
+        };
+        let c = sound_command(&n, &env, Path::new("-c.ogg"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(c.program, "mpv");
+        assert_eq!(&c.args[3..], ["--volume=40", "--", "-c.ogg"]);
+        assert!(c.needs_default);
     }
 
     #[test]

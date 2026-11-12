@@ -208,7 +208,6 @@ fn percent_decode(s: &str) -> Vec<u8> {
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub fn parse_uri_list(text: &str) -> Vec<PathBuf> {
-    use std::os::unix::ffi::OsStringExt;
     text.lines()
         .map(|l| l.trim_end_matches('\r').trim())
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
@@ -219,9 +218,15 @@ pub fn parse_uri_list(text: &str) -> Vec<PathBuf> {
             } else {
                 &rest[rest.find('/')?..]
             };
-            Some(PathBuf::from(std::ffi::OsString::from_vec(percent_decode(
-                path,
-            ))))
+            let bytes = percent_decode(path);
+            #[cfg(unix)]
+            let path = {
+                use std::os::unix::ffi::OsStringExt;
+                PathBuf::from(std::ffi::OsString::from_vec(bytes))
+            };
+            #[cfg(not(unix))]
+            let path = PathBuf::from(String::from_utf8_lossy(&bytes).into_owned());
+            Some(path)
         })
         .collect()
 }
@@ -296,12 +301,7 @@ pub fn unique_upload_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
 }
 
 pub fn ensure_dir(dir: &Path) -> Result<(), String> {
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .map_err(|e| format!("cannot create {}: {e}", dir.display()))
+    crate::config::create_private_dir(dir)
 }
 
 #[cfg(target_os = "linux")]
@@ -415,6 +415,125 @@ async fn wl_copy(data: Vec<u8>, mime: Option<&str>) -> Result<(), String> {
     } else {
         Err(format!("wl-copy failed ({status})"))
     }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn windows_clipboard_read_script(png: &Path) -> String {
+    format!(
+        "$ErrorActionPreference='Stop'\n\
+         Add-Type -AssemblyName System.Windows.Forms,System.Drawing\n\
+         $c=[System.Windows.Forms.Clipboard]\n\
+         $e={{param($s) [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($s))}}\n\
+         if($c::ContainsFileDropList()){{'FILES';foreach($f in $c::GetFileDropList()){{& $e $f}}}}\n\
+         elseif($c::ContainsImage()){{$c::GetImage().Save({},[System.Drawing.Imaging.ImageFormat]::Png);'IMAGE'}}\n\
+         elseif($c::ContainsText()){{'TEXT';& $e ($c::GetText())}}\n\
+         else{{'EMPTY'}}\n",
+        crate::notify::powershell_string(&png.to_string_lossy())
+    )
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn parse_windows_clipboard(out: &str, png: PathBuf) -> Result<Clip, String> {
+    use base64::Engine as _;
+    let decode = |l: &str| {
+        base64::engine::general_purpose::STANDARD
+            .decode(l)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .map_err(|e| format!("clipboard reply: {e}"))
+    };
+    let mut lines = out.lines().map(str::trim).filter(|l| !l.is_empty());
+    match lines.next() {
+        Some("FILES") => Ok(Clip::Files(
+            lines
+                .map(|l| decode(l).map(PathBuf::from))
+                .collect::<Result<_, _>>()?,
+        )),
+        Some("IMAGE") => Ok(Clip::Image(png)),
+        Some("TEXT") => Ok(Clip::Text(
+            lines.next().map(decode).transpose()?.unwrap_or_default(),
+        )),
+        Some("EMPTY") | None => Err("clipboard is empty".to_owned()),
+        Some(other) => Err(format!("unexpected clipboard reply: {other}")),
+    }
+}
+
+#[cfg(windows)]
+async fn powershell(script: &str, input: Option<String>) -> Result<Vec<u8>, String> {
+    use tokio::io::AsyncWriteExt;
+    let mut args = vec!["-STA".to_owned()];
+    args.extend(crate::notify::powershell_args(script));
+    let mut child = tokio::process::Command::new("powershell")
+        .args(&args)
+        .creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW)
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("powershell: {e}"))?;
+    if let (Some(data), Some(mut stdin)) = (input, child.stdin.take()) {
+        stdin
+            .write_all(data.as_bytes())
+            .await
+            .map_err(|e| format!("powershell: {e}"))?;
+    }
+    let out = tokio::time::timeout(CLIPBOARD_TIMEOUT, child.wait_with_output())
+        .await
+        .map_err(|_| "clipboard did not answer within 5 s".to_owned())?
+        .map_err(|e| format!("powershell: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "clipboard: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(out.stdout)
+}
+
+#[cfg(windows)]
+pub async fn read_clipboard(uploads: PathBuf) -> Result<Clip, String> {
+    ensure_dir(&uploads)?;
+    let png = unique_upload_path(&uploads, "clipboard", "png");
+    let out = powershell(&windows_clipboard_read_script(&png), None).await?;
+    match parse_windows_clipboard(&String::from_utf8_lossy(&out), png)? {
+        Clip::Files(paths) => {
+            let files: Vec<PathBuf> = paths.into_iter().filter(|p| p.is_file()).collect();
+            if files.is_empty() {
+                Err("clipboard has nothing to paste".to_owned())
+            } else {
+                Ok(Clip::Files(files))
+            }
+        }
+        other => Ok(other),
+    }
+}
+
+#[cfg(windows)]
+pub async fn copy_text(text: String) -> Result<(), String> {
+    use base64::Engine as _;
+    let script = "$ErrorActionPreference='Stop'\n\
+        Add-Type -AssemblyName System.Windows.Forms\n\
+        [System.Windows.Forms.Clipboard]::SetText([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd().Trim())))\n";
+    let data = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    powershell(script, Some(data)).await.map(|_| ())
+}
+
+#[cfg(windows)]
+pub async fn copy_image(path: PathBuf) -> Result<(), String> {
+    use base64::Engine as _;
+    let png = tokio::task::spawn_blocking(move || to_png(&path))
+        .await
+        .map_err(|e| format!("image conversion failed: {e}"))??;
+    let script = "$ErrorActionPreference='Stop'\n\
+        Add-Type -AssemblyName System.Windows.Forms,System.Drawing\n\
+        $b=[Convert]::FromBase64String([Console]::In.ReadToEnd().Trim())\n\
+        [System.Windows.Forms.Clipboard]::SetImage([System.Drawing.Image]::FromStream([IO.MemoryStream]::new($b)))\n";
+    let data = base64::engine::general_purpose::STANDARD.encode(png);
+    powershell(script, Some(data)).await.map(|_| ())
 }
 
 #[cfg(target_os = "macos")]
@@ -674,7 +793,10 @@ pub fn expand(input: &str, cwd: &Path, home: &Path) -> PathBuf {
     if input == "~" {
         return home.to_path_buf();
     }
-    if let Some(rest) = input.strip_prefix("~/") {
+    if let Some(rest) = input
+        .strip_prefix("~/")
+        .or_else(|| input.strip_prefix("~\\").filter(|_| cfg!(windows)))
+    {
         return home.join(rest);
     }
     let p = Path::new(input);
@@ -686,7 +808,7 @@ pub fn expand(input: &str, cwd: &Path, home: &Path) -> PathBuf {
 }
 
 pub fn split_query(input: &str, cwd: &Path, home: &Path) -> (PathBuf, String, String) {
-    match input.rfind('/') {
+    match input.rfind(|c| c == '/' || (cfg!(windows) && c == '\\')) {
         Some(i) => {
             let head = &input[..=i];
             (
@@ -864,6 +986,31 @@ mod tests {
         assert_eq!(
             parse_uri_list("file:///end%2"),
             vec![PathBuf::from("/end%2")]
+        );
+    }
+
+    #[test]
+    fn windows_clipboard_reply_is_decoded() {
+        let png = PathBuf::from("c.png");
+        let files = "FILES\r\nQzpc0KTQvtGC0L4uanBn\r\nRDpcYSBiLnR4dA==\r\n";
+        match parse_windows_clipboard(files, png.clone()) {
+            Ok(Clip::Files(f)) => assert_eq!(
+                f,
+                [PathBuf::from("C:\\Фото.jpg"), PathBuf::from("D:\\a b.txt")]
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert!(
+            matches!(parse_windows_clipboard("IMAGE\r\n", png.clone()), Ok(Clip::Image(p)) if p == png)
+        );
+        assert!(
+            matches!(parse_windows_clipboard("TEXT\r\n0L/RgNC40LLQtdGC\r\n", png.clone()), Ok(Clip::Text(t)) if t == "привет")
+        );
+        assert!(parse_windows_clipboard("EMPTY\r\n", png.clone()).is_err());
+        assert!(parse_windows_clipboard("", png).is_err());
+        assert!(
+            windows_clipboard_read_script(Path::new("C:\\u's.png"))
+                .contains("Save('C:\\u''s.png',")
         );
     }
 

@@ -87,6 +87,49 @@ const RUNNABLE_EXTENSIONS: [&str; 14] = [
 
 #[cfg(target_os = "linux")]
 const PLATFORM_RUNNABLE_EXTENSIONS: &[&str] = &[];
+#[cfg(windows)]
+const PLATFORM_RUNNABLE_EXTENSIONS: &[&str] = &[
+    "com",
+    "scr",
+    "pif",
+    "cpl",
+    "msc",
+    "msp",
+    "mst",
+    "ps1",
+    "psm1",
+    "psd1",
+    "vbs",
+    "vbe",
+    "js",
+    "jse",
+    "wsf",
+    "wsh",
+    "wsc",
+    "hta",
+    "lnk",
+    "url",
+    "reg",
+    "inf",
+    "scf",
+    "appx",
+    "appxbundle",
+    "msix",
+    "msixbundle",
+    "appref-ms",
+    "application",
+    "gadget",
+    "settingcontent-ms",
+    "library-ms",
+    "search-ms",
+    "chm",
+    "xll",
+    "iso",
+    "img",
+    "vhd",
+    "vhdx",
+    "diagcab",
+];
 #[cfg(target_os = "macos")]
 const PLATFORM_RUNNABLE_EXTENSIONS: &[&str] = &[
     "app",
@@ -101,7 +144,6 @@ const PLATFORM_RUNNABLE_EXTENSIONS: &[&str] = &[
 ];
 
 pub fn runnable(path: &Path) -> Result<Option<&'static str>, String> {
-    use std::os::unix::fs::PermissionsExt;
     let ext = path
         .extension()
         .map(|e| e.to_string_lossy().to_lowercase())
@@ -112,9 +154,15 @@ pub fn runnable(path: &Path) -> Result<Option<&'static str>, String> {
         return Ok(Some("this file type can run as a program"));
     }
     let meta = std::fs::metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if meta.permissions().mode() & 0o111 != 0 {
-        return Ok(Some("the file is executable"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o111 != 0 {
+            return Ok(Some("the file is executable"));
+        }
     }
+    #[cfg(not(unix))]
+    let _ = meta;
     Ok(None)
 }
 
@@ -123,6 +171,44 @@ const OPENER: &str = "xdg-open";
 #[cfg(target_os = "macos")]
 const OPENER: &str = "open";
 
+pub const OPENER_LABEL: &str = if cfg!(windows) {
+    "default app"
+} else {
+    "xdg-open"
+};
+
+#[cfg(windows)]
+pub fn xdg_open(target: &str) -> Result<(), String> {
+    use windows_sys::Win32::UI::Shell::ShellExecuteW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let wide = |s: &str| {
+        s.encode_utf16()
+            .chain(std::iter::once(0))
+            .collect::<Vec<u16>>()
+    };
+    let verb = wide("open");
+    let file = wide(target);
+    let code = unsafe {
+        ShellExecuteW(
+            std::ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    } as isize;
+    if code > 32 {
+        Ok(())
+    } else {
+        Err(format!(
+            "cannot open {target}: {}",
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+#[cfg(not(windows))]
 pub fn xdg_open(target: &str) -> Result<(), String> {
     std::process::Command::new(OPENER)
         .arg(target)
@@ -153,10 +239,10 @@ pub fn parse_user_dirs(content: &str, home: &Path) -> Option<PathBuf> {
 }
 
 pub fn downloads_dir() -> Result<PathBuf, String> {
-    let home = std::env::var_os("HOME")
-        .filter(|h| !h.is_empty())
-        .map(PathBuf::from)
-        .ok_or_else(|| "HOME is not set".to_owned())?;
+    let home = crate::config::home()?;
+    if cfg!(windows) {
+        return Ok(home.join("Downloads"));
+    }
     let config = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
@@ -167,23 +253,48 @@ pub fn downloads_dir() -> Result<PathBuf, String> {
     Ok(from_file.unwrap_or_else(|| home.join("Downloads")))
 }
 
+const WINDOWS_RESERVED: &str = "\\:*?\"<>|";
+
 pub fn sanitize(name: &str) -> String {
     let cleaned: String = name
         .chars()
         .map(|c| {
-            if c == '/' || c == '\0' || c.is_control() {
+            if c == '/'
+                || c == '\0'
+                || c.is_control()
+                || (cfg!(windows) && WINDOWS_RESERVED.contains(c))
+            {
                 '_'
             } else {
                 c
             }
         })
         .collect();
-    let trimmed = cleaned.trim().trim_start_matches('.').to_owned();
+    let mut trimmed = cleaned.trim().trim_start_matches('.').to_owned();
+    if cfg!(windows) {
+        trimmed = trimmed.trim_end_matches(['.', ' ']).to_owned();
+    }
+    if cfg!(windows) && windows_device_name(&trimmed) {
+        trimmed.insert(0, '_');
+    }
     if trimmed.is_empty() {
         "file".to_owned()
     } else {
         trimmed
     }
+}
+
+fn windows_device_name(name: &str) -> bool {
+    let stem = name
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .trim_end()
+        .to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit())
 }
 
 pub fn unique_target(dir: &Path, name: &str) -> PathBuf {
@@ -267,6 +378,16 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    #[test]
+    fn windows_device_names_are_recognised() {
+        assert!(windows_device_name("CON"));
+        assert!(windows_device_name("nul.txt"));
+        assert!(windows_device_name("Com7.tar.gz"));
+        assert!(!windows_device_name("console.log"));
+        assert!(!windows_device_name("COMX"));
+    }
+
+    #[cfg(unix)]
     #[test]
     fn runnable_files_are_not_handed_to_xdg_open() {
         use std::os::unix::fs::PermissionsExt;

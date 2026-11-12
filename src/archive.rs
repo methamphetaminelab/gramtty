@@ -1,5 +1,4 @@
 use std::io::Write;
-use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -135,16 +134,16 @@ pub fn restore(chat_id: i64, id: i64, s: &Snapshot) -> Msg {
 }
 
 fn write_private(path: &Path, data: &[u8], append: bool) -> Result<(), String> {
-    use std::os::unix::fs::OpenOptionsExt;
     if let Some(dir) = path.parent() {
-        std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(dir)
-            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+        crate::config::create_private_dir(dir)?;
     }
     let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).mode(0o600);
+    opts.create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
     if append {
         opts.append(true);
     } else {
@@ -343,9 +342,12 @@ mod tests {
         assert!(!a.record_deleted(&msg(10, 5, "secret plan"), 2).unwrap());
         a.record_edit(&msg(10, 7, "first"), 3).unwrap();
         a.record_edit(&msg(10, 7, "second"), 4).unwrap();
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
         let (b, corrupt) = Archive::open(path.clone(), 100).unwrap();
         assert_eq!(corrupt, 0);
         let restored = b.deleted_between(10, 0, 100);

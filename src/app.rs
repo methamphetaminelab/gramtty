@@ -332,7 +332,7 @@ pub struct ButtonsView {
 pub const OPTIONS: [(&str, &str); 29] = [
     (
         "Desktop notifications",
-        "notify-send for new messages in unmuted chats and mentions",
+        "System notifications for new messages in unmuted chats and mentions",
     ),
     (
         "Don't mark as read",
@@ -747,9 +747,7 @@ impl App {
         picker: ratatui_image::picker::Picker,
     ) -> Self {
         let media = Media::new(picker, td.sender());
-        let home = std::env::var_os("HOME")
-            .filter(|h| !h.is_empty())
-            .map_or_else(|| PathBuf::from("/"), PathBuf::from);
+        let home = crate::config::home().unwrap_or_else(|_| PathBuf::from("/"));
         let cwd = std::env::current_dir().unwrap_or_else(|_| home.clone());
         let uploads_dir = data_dir.join("uploads");
         Self {
@@ -1333,7 +1331,9 @@ impl App {
                     true,
                 ),
                 Ok(None) => match player::xdg_open(path) {
-                    Ok(()) => self.set_status("opened with xdg-open", false),
+                    Ok(()) => {
+                        self.set_status(format!("opened with {}", player::OPENER_LABEL), false)
+                    }
                     Err(e) => self.set_status(e, true),
                 },
             },
@@ -4936,7 +4936,11 @@ impl App {
                         },
                         MenuItem {
                             key: 'O',
-                            label: "Open with xdg-open",
+                            label: if cfg!(windows) {
+                                "Open with default app"
+                            } else {
+                                "Open with xdg-open"
+                            },
                             action: MenuAction::OpenExternal,
                         },
                     ]);
@@ -7672,6 +7676,7 @@ mod tests {
             canberra: true,
             pw_play: false,
             afplay: false,
+            mpv: false,
         });
         (app, log)
     }

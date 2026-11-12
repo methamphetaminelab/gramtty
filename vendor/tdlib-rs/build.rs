@@ -130,7 +130,7 @@ fn generic_build() {
         .iter()
         .filter_map(|name| {
             let path = if target_os == "windows" {
-                format!(r"{lib_dir}\{name}.lib")
+                format!("{lib_dir}/{name}.lib")
             } else {
                 format!("{lib_dir}/lib{name}.a")
             };

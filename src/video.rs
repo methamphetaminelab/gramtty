@@ -15,6 +15,8 @@ const POLL: Duration = Duration::from_millis(100);
 const STUCK: Duration = Duration::from_secs(3);
 #[cfg(target_os = "linux")]
 const LIBRARIES: &[&str] = &["libmpv.so.2", "libmpv.so"];
+#[cfg(windows)]
+const LIBRARIES: &[&str] = &["libmpv-2.dll", "mpv-2.dll", "mpv-1.dll"];
 #[cfg(target_os = "macos")]
 const LIBRARIES: &[&str] = &[
     "libmpv.2.dylib",
@@ -804,7 +806,7 @@ impl Inline {
             self.cmds.push(crate::anim::delete(a.id));
         }
         if let Some((name, _)) = a.inflight {
-            let _ = rustix::shm::unlink(name.as_str());
+            unlink_shm(&name);
         }
     }
 
@@ -938,6 +940,25 @@ impl Drop for Inline {
     }
 }
 
+#[cfg(unix)]
+fn unlink_shm(name: &str) {
+    let _ = rustix::shm::unlink(name);
+}
+
+#[cfg(not(unix))]
+fn unlink_shm(_name: &str) {}
+
+#[cfg(not(unix))]
+fn write_shm(_name: &str, _data: &[u8]) -> Result<(), String> {
+    Err("shared memory frames are not supported on this system".to_owned())
+}
+
+#[cfg(not(unix))]
+fn shm_exists(_name: &str) -> bool {
+    false
+}
+
+#[cfg(unix)]
 fn write_shm(name: &str, data: &[u8]) -> Result<(), String> {
     use rustix::fs::Mode;
     use rustix::shm::OFlags;
@@ -978,6 +999,7 @@ fn fill_shm(fd: rustix::fd::OwnedFd, data: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn shm_exists(name: &str) -> bool {
     rustix::shm::open(name, rustix::shm::OFlags::RDONLY, rustix::fs::Mode::empty()).is_ok()
 }

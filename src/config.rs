@@ -36,26 +36,36 @@ pub fn env_prefix() -> String {
     APP_NAME.to_uppercase().replace('-', "_")
 }
 
-fn home() -> Result<PathBuf, String> {
-    std::env::var_os("HOME")
+pub fn home() -> Result<PathBuf, String> {
+    let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    std::env::var_os(var)
         .filter(|h| !h.is_empty())
         .map(PathBuf::from)
-        .ok_or_else(|| "HOME is not set".to_owned())
+        .ok_or_else(|| format!("{var} is not set"))
 }
 
-fn xdg_dir(var: &str, fallback: &str) -> Result<PathBuf, String> {
-    match std::env::var_os(var).filter(|v| !v.is_empty()) {
-        Some(dir) => Ok(PathBuf::from(dir)),
-        None => Ok(home()?.join(fallback)),
+fn app_dir(xdg: &str, fallback: &str, windows: (&str, Option<&str>)) -> Result<PathBuf, String> {
+    if let Some(dir) = std::env::var_os(xdg).filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(dir).join(APP_NAME));
     }
+    if cfg!(windows) {
+        let (var, sub) = windows;
+        let base = std::env::var_os(var)
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .ok_or_else(|| format!("{var} is not set"))?;
+        let dir = base.join(APP_NAME);
+        return Ok(sub.map_or_else(|| dir.clone(), |s| dir.join(s)));
+    }
+    Ok(home()?.join(fallback).join(APP_NAME))
 }
 
 pub fn config_dir() -> Result<PathBuf, String> {
-    Ok(xdg_dir("XDG_CONFIG_HOME", ".config")?.join(APP_NAME))
+    app_dir("XDG_CONFIG_HOME", ".config", ("APPDATA", None))
 }
 
 pub fn cache_dir() -> Result<PathBuf, String> {
-    Ok(xdg_dir("XDG_CACHE_HOME", ".cache")?.join(APP_NAME))
+    app_dir("XDG_CACHE_HOME", ".cache", ("LOCALAPPDATA", Some("cache")))
 }
 
 pub fn data_dir() -> Result<PathBuf, String> {
@@ -64,7 +74,49 @@ pub fn data_dir() -> Result<PathBuf, String> {
     {
         return Ok(PathBuf::from(dir));
     }
-    Ok(xdg_dir("XDG_DATA_HOME", ".local/share")?.join(APP_NAME))
+    app_dir(
+        "XDG_DATA_HOME",
+        ".local/share",
+        ("LOCALAPPDATA", Some("data")),
+    )
+}
+
+pub fn create_private_dir(dir: &std::path::Path) -> Result<(), String> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(dir)
+        .map_err(|e| format!("cannot create {}: {e}", dir.display()))
+}
+
+pub fn is_executable(path: &std::path::Path) -> bool {
+    let Ok(meta) = path.metadata() else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        meta.is_file() && meta.permissions().mode() & 0o111 != 0
+    }
+    #[cfg(not(unix))]
+    meta.is_file()
+}
+
+pub fn find_in_path(program: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path).find_map(|d| {
+        let plain = d.join(program);
+        if is_executable(&plain) {
+            return Some(plain);
+        }
+        let exe = d.join(format!("{program}.exe"));
+        (cfg!(windows) && is_executable(&exe)).then_some(exe)
+    })
 }
 
 pub fn load_credentials() -> Result<ApiCredentials, String> {

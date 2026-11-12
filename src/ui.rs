@@ -2719,6 +2719,8 @@ fn draw_viewer(frame: &mut Frame, area: Rect, app: &mut App) {
     });
     let hint = if player {
         " space play/pause · ←/→ seek · ↑/↓ volume · m mute · j/k prev/next · x mpv · s save · Esc close "
+    } else if cfg!(windows) {
+        " j/k prev/next · x play/open · s save · o open · Esc close "
     } else {
         " j/k prev/next · x play/open · s save · o xdg-open · Esc close "
     };

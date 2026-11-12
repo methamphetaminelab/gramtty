@@ -40,8 +40,9 @@
 | Linux x86_64 | glibc 2.39 или новее (Ubuntu 24.04, Debian 13, Fedora 40, Arch) |
 | macOS на Apple Silicon | macOS 15 или новее |
 | macOS на Intel | macOS 26 или новее |
+| Windows x86_64 | Windows 10 1809 или новее; рекомендуется Windows Terminal 1.22 или новее (картинки sixel) |
 
-Windows пока не поддерживается. Подойдёт любой терминал; для изображений, анимаций и видео в просмотрщике рекомендуется kitty.
+Подойдёт любой терминал; для изображений, анимаций и видео в просмотрщике рекомендуется kitty.
 
 ### Скрипт установки (Linux, macOS)
 
@@ -69,7 +70,7 @@ yay -S gramtty       # сборка из исходников
 
 ### Скачать вручную
 
-Возьмите архив для своей платформы на [странице релизов](https://github.com/methamphetaminelab/gramtty/releases/latest), распакуйте и положите `gramtty` в каталог из `PATH`.
+Возьмите архив для своей платформы на [странице релизов](https://github.com/methamphetaminelab/gramtty/releases/latest), распакуйте и положите `gramtty` (на Windows `gramtty.exe`) в каталог из `PATH`.
 
 ### Сборка из исходников
 
@@ -85,21 +86,23 @@ cargo build --release
 - Fedora: `dnf install libcxx-static libcxxabi-static`
 - Другое расположение: `LIBCXX_DIR` указывает на каталог с обоими файлами
 
+На Windows нужны Visual Studio Build Tools (набор для C++) и LLVM ради `libclang` (`winget install LLVM.LLVM`).
+
 ## Утилиты времени выполнения
 
 Все необязательны и ищутся в `PATH`; без утилиты не работает только её функция.
 
-| Для чего | Linux | macOS |
-|---|---|---|
-| Воспроизведение со звуком прямо в просмотрщике (только kitty) | `libmpv` (пакет `mpv`), загружается динамически | `libmpv` (`brew install mpv`) |
-| Воспроизведение в отдельном окне (`x`) | `mpv` | `mpv` |
-| Превью видео и стикеров, WebM-стикеры и GIF в чате, миниатюры при отправке | `ffmpeg` | `ffmpeg` |
-| Анализ медиа перед отправкой | `ffprobe` | `ffprobe` |
-| Запись голосовых | `pw-record` (PipeWire) и `opusenc` или `ffmpeg` с libopus | `ffmpeg` (терминалу нужен доступ к микрофону) |
-| Уведомления на рабочем столе | `notify-send` (libnotify) | `osascript` (встроен) |
-| Звук уведомления | `pw-play` или `canberra-gtk-play` | `afplay` (встроен) |
-| Копирование и вставка `Ctrl+V` | `wl-copy`, `wl-paste` (wl-clipboard); только Wayland | `pbcopy`, `pbpaste` (встроены); только текст |
-| Открытие файлов и ссылок во внешней программе | `xdg-open` | `open` (встроен) |
+| Для чего | Linux | macOS | Windows |
+|---|---|---|---|
+| Воспроизведение со звуком прямо в просмотрщике (только kitty) | `libmpv` (пакет `mpv`), загружается динамически | `libmpv` (`brew install mpv`) | недоступно (нет kitty), `x` играет в mpv |
+| Воспроизведение в отдельном окне (`x`) | `mpv` | `mpv` | `mpv` (`scoop install mpv`) |
+| Превью видео и стикеров, WebM-стикеры и GIF в чате, миниатюры при отправке | `ffmpeg` | `ffmpeg` | `ffmpeg` (`winget install Gyan.FFmpeg`) |
+| Анализ медиа перед отправкой | `ffprobe` | `ffprobe` | `ffprobe` (идёт с ffmpeg) |
+| Запись голосовых | `pw-record` (PipeWire) и `opusenc` или `ffmpeg` с libopus | `ffmpeg` (терминалу нужен доступ к микрофону) | `ffmpeg` с libopus; пишет с первого микрофона DirectShow |
+| Уведомления на рабочем столе | `notify-send` (libnotify) | `osascript` (встроен) | Windows PowerShell (встроен) |
+| Звук уведомления | `pw-play` или `canberra-gtk-play` | `afplay` (встроен) | `mpv` |
+| Копирование и вставка `Ctrl+V` | `wl-copy`, `wl-paste` (wl-clipboard); только Wayland | `pbcopy`, `pbpaste` (встроены); только текст | Windows PowerShell (встроен); файлы, картинки и текст |
+| Открытие файлов и ссылок во внешней программе | `xdg-open` | `open` (встроен) | встроено |
 
 ## Ключи Telegram API
 
@@ -167,6 +170,8 @@ api_hash = "0123456789abcdef0123456789abcdef"
 - `keymap.toml`: клавиши
 
 Данные (база TDLib, логи, история удалённых сообщений, временные файлы отправки): `~/.local/share/gramtty` (`$XDG_DATA_HOME`, либо `GRAMTTY_DATA_DIR`).
+
+На Windows файлы лежат в `%APPDATA%\gramtty`, данные в `%LOCALAPPDATA%\gramtty\data`, кэш в `%LOCALAPPDATA%\gramtty\cache`.
 
 `gramtty --print-theme [terminal|default|high-contrast|light|mono|custom]` печатает тему в TOML, это основа для `theme.toml`. `Space o` > «Write theme.toml» сохраняет текущую тему туда же.
 

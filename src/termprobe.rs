@@ -1,5 +1,8 @@
 use std::io::{self, IsTerminal, Write};
+#[cfg(unix)]
 use std::os::fd::AsFd;
+#[cfg(windows)]
+use std::os::windows::io::{AsHandle, AsRawHandle};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -11,6 +14,15 @@ pub const LATE_WINDOW: Duration = Duration::from_secs(5);
 const LATE_STRING_MAX: usize = 128;
 
 static OWED: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(unix)]
+pub trait Input: AsFd {}
+#[cfg(unix)]
+impl<T: AsFd> Input for T {}
+#[cfg(windows)]
+pub trait Input: AsHandle {}
+#[cfg(windows)]
+impl<T: AsHandle> Input for T {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Reply {
@@ -286,6 +298,7 @@ pub fn feed(answers: &mut Answers, scanner: &mut Scanner, bytes: &[u8]) {
     }
 }
 
+#[cfg(unix)]
 fn wait_readable(input: &impl AsFd, left: Duration) -> io::Result<bool> {
     use rustix::event::{PollFd, PollFlags, Timespec, poll};
     let ts = Timespec {
@@ -302,6 +315,104 @@ fn wait_readable(input: &impl AsFd, left: Duration) -> io::Result<bool> {
     }
 }
 
+#[cfg(unix)]
+fn flush_input(input: &impl Input) -> io::Result<()> {
+    match rustix::termios::tcflush(input, rustix::termios::QueueSelector::IFlush) {
+        Ok(()) | Err(rustix::io::Errno::NOTTY) => Ok(()),
+        Err(e) => Err(e.into()),
+    }
+}
+
+#[cfg(windows)]
+fn flush_input(input: &impl Input) -> io::Result<()> {
+    use windows_sys::Win32::System::Console::FlushConsoleInputBuffer;
+    if unsafe { FlushConsoleInputBuffer(input.as_handle().as_raw_handle()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+struct VtInput {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+    mode: u32,
+}
+
+#[cfg(windows)]
+impl VtInput {
+    fn enable(handle: windows_sys::Win32::Foundation::HANDLE) -> io::Result<Self> {
+        use windows_sys::Win32::System::Console::{
+            ENABLE_VIRTUAL_TERMINAL_INPUT, GetConsoleMode, SetConsoleMode,
+        };
+        let mut mode = 0;
+        if unsafe { GetConsoleMode(handle, &mut mode) } == 0
+            || unsafe { SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_INPUT) } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { handle, mode })
+    }
+}
+
+#[cfg(windows)]
+impl Drop for VtInput {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::System::Console::SetConsoleMode(self.handle, self.mode) };
+    }
+}
+
+#[cfg(windows)]
+fn read_until(
+    input: &impl Input,
+    deadline: Instant,
+    mut done: impl FnMut(&[u8]) -> bool,
+) -> io::Result<bool> {
+    use windows_sys::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows_sys::Win32::System::Console::{INPUT_RECORD, KEY_EVENT, ReadConsoleInputW};
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+    let handle = input.as_handle().as_raw_handle();
+    let _vt = VtInput::enable(handle)?;
+    let mut records = [INPUT_RECORD::default(); 128];
+    let mut units = Vec::new();
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Ok(false);
+        }
+        let ms = u32::try_from(left.as_millis())
+            .unwrap_or(u32::MAX - 1)
+            .max(1);
+        match unsafe { WaitForSingleObject(handle, ms) } {
+            WAIT_OBJECT_0 => {}
+            WAIT_TIMEOUT => return Ok(false),
+            _ => return Err(io::Error::last_os_error()),
+        }
+        let mut n = 0;
+        let len = records.len() as u32;
+        if unsafe { ReadConsoleInputW(handle, records.as_mut_ptr(), len, &mut n) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        units.clear();
+        for r in &records[..n as usize] {
+            if u32::from(r.EventType) != KEY_EVENT {
+                continue;
+            }
+            let key = unsafe { r.Event.KeyEvent };
+            let unit = unsafe { key.uChar.UnicodeChar };
+            if key.bKeyDown != 0 && unit != 0 {
+                units.extend(std::iter::repeat_n(
+                    unit,
+                    usize::from(key.wRepeatCount.max(1)),
+                ));
+            }
+        }
+        if !units.is_empty() && done(String::from_utf16_lossy(&units).as_bytes()) {
+            return Ok(true);
+        }
+    }
+}
+
+#[cfg(unix)]
 fn read_until(
     input: &impl AsFd,
     deadline: Instant,
@@ -332,7 +443,7 @@ fn read_until(
 }
 
 pub fn exchange(
-    input: impl AsFd,
+    input: impl Input,
     out: &mut impl Write,
     probe: &Probe,
     timeout: Duration,
@@ -354,7 +465,7 @@ pub fn exchange(
     })
 }
 
-pub fn settle(input: impl AsFd, owed: usize, timeout: Duration) -> io::Result<usize> {
+pub fn settle(input: impl Input, owed: usize, timeout: Duration) -> io::Result<usize> {
     if owed == 0 {
         return Ok(0);
     }
@@ -364,10 +475,7 @@ pub fn settle(input: impl AsFd, owed: usize, timeout: Duration) -> io::Result<us
         feed(&mut answers, &mut scanner, bytes);
         answers.sentinels >= owed
     })?;
-    match rustix::termios::tcflush(&input, rustix::termios::QueueSelector::IFlush) {
-        Ok(()) | Err(rustix::io::Errno::NOTTY) => {}
-        Err(e) => return Err(e.into()),
-    }
+    flush_input(&input)?;
     Ok(owed.saturating_sub(answers.sentinels))
 }
 
@@ -377,7 +485,9 @@ pub fn query_stdio(probe: &Probe, timeout: Duration) -> io::Result<Option<Outcom
     if !stdin.is_terminal() || !stdout.is_terminal() {
         return Ok(None);
     }
-    let result = exchange(stdin.as_fd(), &mut stdout.lock(), probe, timeout);
+    #[cfg(windows)]
+    crossterm::ansi_support::supports_ansi();
+    let result = exchange(stdin_input(&stdin), &mut stdout.lock(), probe, timeout);
     let owed = match &result {
         Ok(o) => o.owed,
         Err(_) => probe.sentinels(),
@@ -392,13 +502,23 @@ pub fn settle_stdio() -> io::Result<()> {
         return Ok(());
     }
     let owed = OWED.swap(0, Ordering::SeqCst);
-    let left = settle(stdin.as_fd(), owed, SETTLE_TIMEOUT);
+    let left = settle(stdin_input(&stdin), owed, SETTLE_TIMEOUT);
     if let Ok(n) = left {
         OWED.fetch_add(n, Ordering::SeqCst);
     } else {
         OWED.fetch_add(owed, Ordering::SeqCst);
     }
     left.map(|_| ())
+}
+
+#[cfg(unix)]
+fn stdin_input(stdin: &io::Stdin) -> impl Input + '_ {
+    stdin.as_fd()
+}
+
+#[cfg(windows)]
+fn stdin_input(stdin: &io::Stdin) -> impl Input + '_ {
+    stdin.as_handle()
 }
 
 pub fn owed() -> usize {
@@ -465,6 +585,12 @@ impl LateReplies {
     }
 }
 
+#[cfg(not(unix))]
+pub fn font_size_from_winsize() -> Option<(u16, u16)> {
+    None
+}
+
+#[cfg(unix)]
 pub fn font_size_from_winsize() -> Option<(u16, u16)> {
     let ws = rustix::termios::tcgetwinsize(io::stdout()).ok()?;
     if ws.ws_xpixel == 0 || ws.ws_ypixel == 0 || ws.ws_col == 0 || ws.ws_row == 0 {
@@ -602,6 +728,7 @@ mod tests {
         assert_eq!(tmux.sentinels(), 2);
     }
 
+    #[cfg(unix)]
     #[test]
     fn exchange_writes_the_query_and_stops_at_the_sentinel() {
         let (reader, mut writer) = std::io::pipe().unwrap();
@@ -621,6 +748,7 @@ mod tests {
         assert_eq!(out, probe.bytes().as_bytes());
     }
 
+    #[cfg(unix)]
     #[test]
     fn tmux_exchange_waits_for_both_device_attribute_replies() {
         let (reader, mut writer) = std::io::pipe().unwrap();
@@ -651,6 +779,7 @@ mod tests {
         assert_eq!(o.answers.cell, Some((9, 18)));
     }
 
+    #[cfg(unix)]
     #[test]
     fn silent_terminal_times_out_and_returns_partial_answers() {
         let (reader, mut writer) = std::io::pipe().unwrap();
@@ -671,6 +800,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
     }
 
+    #[cfg(unix)]
     #[test]
     fn settle_waits_only_for_the_owed_late_reply() {
         let (reader, mut writer) = std::io::pipe().unwrap();
@@ -732,6 +862,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(unix)]
     #[test]
     fn late_palette_replies_after_a_timeout_never_become_keystrokes() {
         let (reader, mut writer) = std::io::pipe().unwrap();

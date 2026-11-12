@@ -25,7 +25,6 @@ mod upload;
 mod video;
 mod voice;
 
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -56,13 +55,13 @@ async fn main() -> ExitCode {
 
 fn prepare_data_dir() -> Result<std::path::PathBuf, String> {
     let dir = config::data_dir()?;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&dir)
-        .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
-    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
-        .map_err(|e| format!("cannot set permissions on {}: {e}", dir.display()))?;
+    config::create_private_dir(&dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| format!("cannot set permissions on {}: {e}", dir.display()))?;
+    }
     Ok(dir)
 }
 
@@ -206,9 +205,9 @@ async fn run() -> Result<(), String> {
         .map_err(|e| format!("terminal: {e}"));
     let _ = execute!(
         std::io::stdout(),
-        PopKeyboardEnhancementFlags,
         DisableBracketedPaste,
-        DisableFocusChange
+        DisableFocusChange,
+        PopKeyboardEnhancementFlags
     );
     ratatui::restore();
     result.and(settled).and(cleared)
@@ -344,6 +343,16 @@ fn image_picker(probe: Probed) -> (Picker, Option<String>) {
     (picker, probe.warning)
 }
 
+#[cfg(not(unix))]
+struct NoSignal;
+
+#[cfg(not(unix))]
+impl NoSignal {
+    async fn recv(&mut self) -> Option<()> {
+        std::future::pending().await
+    }
+}
+
 async fn event_loop(
     terminal: &mut ratatui::Terminal<
         ui::Resync<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
@@ -352,8 +361,11 @@ async fn event_loop(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<Event>,
 ) -> Result<(), String> {
     let mut input = EventStream::new();
+    #[cfg(unix)]
     let mut usr1 = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::user_defined1())
         .map_err(|e| format!("cannot listen for SIGUSR1: {e}"))?;
+    #[cfg(not(unix))]
+    let mut usr1 = NoSignal;
     let mut deadline: Option<tokio::time::Instant> = None;
     let mut late = termprobe::LateReplies::default();
     let mut layout = ui::image_layout(&ratatui::buffer::Buffer::empty(terminal.get_frame().area()));

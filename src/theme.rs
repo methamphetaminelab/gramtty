@@ -1512,7 +1512,7 @@ pub fn watch(
         .map_err(|e| format!("cannot start theme watcher: {e}"))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(not(target_os = "linux"))]
 pub fn watch(
     path: &std::path::Path,
     notify: impl Fn(Result<(), String>) + Send + 'static,

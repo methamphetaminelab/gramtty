@@ -42,8 +42,11 @@ fn static_only_dir(found: &Path) -> PathBuf {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => panic!("cannot replace {}: {e}", link.display()),
         }
-        std::os::unix::fs::symlink(found.join(lib), &link)
-            .unwrap_or_else(|e| panic!("cannot link {} into {}: {e}", lib, out.display()));
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(found.join(lib), &link);
+        #[cfg(not(unix))]
+        let linked = std::fs::copy(found.join(lib), &link).map(|_| ());
+        linked.unwrap_or_else(|e| panic!("cannot link {} into {}: {e}", lib, out.display()));
     }
     out
 }

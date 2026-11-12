@@ -820,12 +820,7 @@ pub fn prune(dir: &Path, cap: u64, keep: &Path) -> Result<(), String> {
 }
 
 fn ensure_dir(dir: &Path) -> Result<(), String> {
-    use std::os::unix::fs::DirBuilderExt;
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-        .map_err(|e| format!("cannot create {}: {e}", dir.display()))
+    crate::config::create_private_dir(dir)
 }
 
 pub fn decode(job: &Job, dir: &Path) -> Result<Outcome, String> {

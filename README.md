@@ -40,8 +40,9 @@ Prebuilt binaries are published for:
 | Linux x86_64 | glibc 2.39 or newer (Ubuntu 24.04, Debian 13, Fedora 40, Arch) |
 | macOS Apple Silicon | macOS 15 or newer |
 | macOS Intel | macOS 26 or newer |
+| Windows x86_64 | Windows 10 1809 or newer; Windows Terminal 1.22 or newer recommended (sixel images) |
 
-Windows is not supported yet. Any terminal works; kitty is recommended for images, animations and in-viewer video.
+Any terminal works; kitty is recommended for images, animations and in-viewer video.
 
 ### Install script (Linux, macOS)
 
@@ -69,7 +70,7 @@ Any AUR helper works (`paru -S ...`), or manually: `git clone https://aur.archli
 
 ### Manual download
 
-Take the archive for your platform from the [releases page](https://github.com/methamphetaminelab/gramtty/releases/latest), unpack it and put `gramtty` somewhere on `PATH`.
+Take the archive for your platform from the [releases page](https://github.com/methamphetaminelab/gramtty/releases/latest), unpack it and put `gramtty` (`gramtty.exe` on Windows) somewhere on `PATH`.
 
 ### Build from source
 
@@ -85,21 +86,23 @@ Needs Rust 1.99 or newer (`rust-version` in `Cargo.toml`). On Linux it also need
 - Fedora: `dnf install libcxx-static libcxxabi-static`
 - Other location: set `LIBCXX_DIR` to a directory containing both files
 
+On Windows it needs Visual Studio Build Tools (C++ workload) and LLVM for `libclang` (`winget install LLVM.LLVM`).
+
 ## Runtime tools
 
 All optional, looked up on `PATH`; a missing one only disables its feature.
 
-| Used for | Linux | macOS |
-|---|---|---|
-| Playing media with sound inside the viewer (kitty only) | `libmpv` (`mpv` package), loaded dynamically | `libmpv` (`brew install mpv`) |
-| Playing media in a separate window (`x`) | `mpv` | `mpv` |
-| Video and sticker previews, inline WebM stickers and GIFs, upload thumbnails | `ffmpeg` | `ffmpeg` |
-| Probing media before upload | `ffprobe` | `ffprobe` |
-| Recording voice messages | `pw-record` (PipeWire) and `opusenc` or `ffmpeg` with libopus | `ffmpeg` (the terminal needs microphone permission) |
-| Desktop notifications | `notify-send` (libnotify) | `osascript` (built in) |
-| Notification sound | `pw-play` or `canberra-gtk-play` | `afplay` (built in) |
-| Clipboard copy and `Ctrl+V` paste | `wl-copy`, `wl-paste` (wl-clipboard); Wayland only | `pbcopy`, `pbpaste` (built in); text only |
-| Opening files and links externally | `xdg-open` | `open` (built in) |
+| Used for | Linux | macOS | Windows |
+|---|---|---|---|
+| Playing media with sound inside the viewer (kitty only) | `libmpv` (`mpv` package), loaded dynamically | `libmpv` (`brew install mpv`) | not available (no kitty), `x` plays in mpv |
+| Playing media in a separate window (`x`) | `mpv` | `mpv` | `mpv` (`scoop install mpv`) |
+| Video and sticker previews, inline WebM stickers and GIFs, upload thumbnails | `ffmpeg` | `ffmpeg` | `ffmpeg` (`winget install Gyan.FFmpeg`) |
+| Probing media before upload | `ffprobe` | `ffprobe` | `ffprobe` (comes with ffmpeg) |
+| Recording voice messages | `pw-record` (PipeWire) and `opusenc` or `ffmpeg` with libopus | `ffmpeg` (the terminal needs microphone permission) | `ffmpeg` with libopus; records from the first DirectShow microphone |
+| Desktop notifications | `notify-send` (libnotify) | `osascript` (built in) | Windows PowerShell (built in) |
+| Notification sound | `pw-play` or `canberra-gtk-play` | `afplay` (built in) | `mpv` |
+| Clipboard copy and `Ctrl+V` paste | `wl-copy`, `wl-paste` (wl-clipboard); Wayland only | `pbcopy`, `pbpaste` (built in); text only | Windows PowerShell (built in); files, images and text |
+| Opening files and links externally | `xdg-open` | `open` (built in) | built in |
 
 ## Telegram API credentials
 
@@ -167,6 +170,8 @@ Files in `~/.config/gramtty/` (`$XDG_CONFIG_HOME` is honoured):
 - `keymap.toml`: key bindings
 
 Data (TDLib database, logs, deleted-message history, upload staging): `~/.local/share/gramtty` (`$XDG_DATA_HOME`, or `GRAMTTY_DATA_DIR` to override).
+
+On Windows the files live in `%APPDATA%\gramtty`, data in `%LOCALAPPDATA%\gramtty\data`, cache in `%LOCALAPPDATA%\gramtty\cache`.
 
 `gramtty --print-theme [terminal|default|high-contrast|light|mono|custom]` prints a theme as TOML, a starting point for `theme.toml`. `Space o` > "Write theme.toml" saves the current theme there.
 
