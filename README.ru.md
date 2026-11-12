@@ -52,6 +52,20 @@ curl -fsSL https://raw.githubusercontent.com/methamphetaminelab/gramtty/main/scr
 
 Скачивает последний релиз, сверяет контрольную сумму SHA-256 и кладёт `gramtty` в `~/.local/bin`. Другой каталог задаётся через `GRAMTTY_INSTALL_DIR`, конкретная версия через `GRAMTTY_VERSION` (например `1.1.0`).
 
+### Windows
+
+В PowerShell:
+
+```
+irm https://raw.githubusercontent.com/methamphetaminelab/gramtty/main/scripts/install.ps1 | iex
+```
+
+Скачивает последний релиз, сверяет контрольную сумму SHA-256, кладёт `gramtty.exe` в `%LOCALAPPDATA%\Programs\gramtty`, добавляет его в `PATH` и ставит mpv, ffmpeg и Windows Terminal через winget (mpv попросит права администратора). `GRAMTTY_NO_DEPS=1` пропускает зависимости, `GRAMTTY_INSTALL_DIR` задаёт другой каталог, `GRAMTTY_VERSION` конкретную версию.
+
+Или скачайте установщик `gramtty-<версия>-x86_64-windows-setup.exe` на [странице релизов](https://github.com/methamphetaminelab/gramtty/releases/latest). Он ставит программу для текущего пользователя без прав администратора, добавляет ярлык в меню «Пуск» и `PATH`, умеет поставить те же зависимости, а удаляется через «Параметры» > «Приложения». Установщик не подписан, поэтому SmartScreen может переспросить: «Подробнее» > «Выполнить в любом случае».
+
+Запускайте `gramtty` в Windows Terminal: там картинки идут через sixel, в старой консоли только полублоками. Зависимости, поставленные позже, видны только в новом окне терминала.
+
 ### Homebrew (macOS, Linux)
 
 ```
@@ -95,7 +109,7 @@ cargo build --release
 | Для чего | Linux | macOS | Windows |
 |---|---|---|---|
 | Воспроизведение со звуком прямо в просмотрщике (только kitty) | `libmpv` (пакет `mpv`), загружается динамически | `libmpv` (`brew install mpv`) | недоступно (нет kitty), `x` играет в mpv |
-| Воспроизведение в отдельном окне (`x`) | `mpv` | `mpv` | `mpv` (`scoop install mpv`) |
+| Воспроизведение в отдельном окне (`x`) | `mpv` | `mpv` | `mpv` (`winget install shinchiro.mpv`) |
 | Превью видео и стикеров, WebM-стикеры и GIF в чате, миниатюры при отправке | `ffmpeg` | `ffmpeg` | `ffmpeg` (`winget install Gyan.FFmpeg`) |
 | Анализ медиа перед отправкой | `ffprobe` | `ffprobe` | `ffprobe` (идёт с ffmpeg) |
 | Запись голосовых | `pw-record` (PipeWire) и `opusenc` или `ffmpeg` с libopus | `ffmpeg` (терминалу нужен доступ к микрофону) | `ffmpeg` с libopus; пишет с первого микрофона DirectShow |
@@ -106,7 +120,7 @@ cargo build --release
 
 ## Ключи Telegram API
 
-Получите `api_id` и `api_hash` на https://my.telegram.org и положите в `~/.config/gramtty/api.toml`:
+Получите `api_id` и `api_hash` на https://my.telegram.org и положите в `~/.config/gramtty/api.toml` (на Windows `%APPDATA%\gramtty\api.toml`):
 
 ```toml
 api_id = 12345

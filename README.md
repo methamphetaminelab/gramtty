@@ -52,6 +52,20 @@ curl -fsSL https://raw.githubusercontent.com/methamphetaminelab/gramtty/main/scr
 
 Downloads the latest release, verifies its SHA-256 checksum and puts `gramtty` into `~/.local/bin`. Set `GRAMTTY_INSTALL_DIR` for another directory or `GRAMTTY_VERSION` (for example `1.1.0`) for a specific release.
 
+### Windows
+
+In PowerShell:
+
+```
+irm https://raw.githubusercontent.com/methamphetaminelab/gramtty/main/scripts/install.ps1 | iex
+```
+
+Downloads the latest release, verifies its SHA-256 checksum, puts `gramtty.exe` into `%LOCALAPPDATA%\Programs\gramtty`, adds it to `PATH` and installs mpv, ffmpeg and Windows Terminal with winget (mpv asks for administrator rights). Set `GRAMTTY_NO_DEPS=1` to skip the dependencies, `GRAMTTY_INSTALL_DIR` for another directory or `GRAMTTY_VERSION` for a specific release.
+
+Or take the installer `gramtty-<version>-x86_64-windows-setup.exe` from the [releases page](https://github.com/methamphetaminelab/gramtty/releases/latest). It installs for the current user without administrator rights, adds a Start menu entry and `PATH`, can install the same dependencies, and is removed in Settings > Apps. The installer is not code-signed, so SmartScreen may ask for confirmation: More info > Run anyway.
+
+Run `gramtty` in Windows Terminal: images use sixel there, the classic console only shows half-block pictures. Dependencies installed later only show up in a new terminal window.
+
 ### Homebrew (macOS, Linux)
 
 ```
@@ -95,7 +109,7 @@ All optional, looked up on `PATH`; a missing one only disables its feature.
 | Used for | Linux | macOS | Windows |
 |---|---|---|---|
 | Playing media with sound inside the viewer (kitty only) | `libmpv` (`mpv` package), loaded dynamically | `libmpv` (`brew install mpv`) | not available (no kitty), `x` plays in mpv |
-| Playing media in a separate window (`x`) | `mpv` | `mpv` | `mpv` (`scoop install mpv`) |
+| Playing media in a separate window (`x`) | `mpv` | `mpv` | `mpv` (`winget install shinchiro.mpv`) |
 | Video and sticker previews, inline WebM stickers and GIFs, upload thumbnails | `ffmpeg` | `ffmpeg` | `ffmpeg` (`winget install Gyan.FFmpeg`) |
 | Probing media before upload | `ffprobe` | `ffprobe` | `ffprobe` (comes with ffmpeg) |
 | Recording voice messages | `pw-record` (PipeWire) and `opusenc` or `ffmpeg` with libopus | `ffmpeg` (the terminal needs microphone permission) | `ffmpeg` with libopus; records from the first DirectShow microphone |
@@ -106,7 +120,7 @@ All optional, looked up on `PATH`; a missing one only disables its feature.
 
 ## Telegram API credentials
 
-Get `api_id` and `api_hash` at https://my.telegram.org and put them in `~/.config/gramtty/api.toml`:
+Get `api_id` and `api_hash` at https://my.telegram.org and put them in `~/.config/gramtty/api.toml` (on Windows `%APPDATA%\gramtty\api.toml`):
 
 ```toml
 api_id = 12345
