@@ -145,7 +145,7 @@ pub fn lines(m: &Msg, c: &Ctx) -> Vec<(String, String)> {
         None if m.deleted => put("Can be saved", "no longer on the server".to_owned()),
         None => {
             put("Can be saved", yes(m.meta.can_be_saved));
-            put("Can be forwarded", "checking...".to_owned());
+            put("Can be forwarded", "Checking…".to_owned());
         }
     }
     out
@@ -232,6 +232,7 @@ mod tests {
             can_be_saved: false,
             can_be_forwarded: true,
             can_be_copied: false,
+            ..Flags::default()
         };
         let rows = lines(&m, &ctx(false, Some(Ok(flags))));
         assert_eq!(get(&rows, "Message ID"), "4242");
@@ -258,7 +259,7 @@ mod tests {
         assert_eq!(get(&rows, "Can be forwarded"), "yes");
         let exact = lines(&m, &ctx(true, None));
         assert_eq!(get(&exact, "Views"), "15234");
-        assert_eq!(get(&exact, "Can be forwarded"), "checking...");
+        assert_eq!(get(&exact, "Can be forwarded"), "Checking…");
         assert_eq!(get(&exact, "Can be saved"), "yes");
     }
 

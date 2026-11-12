@@ -5,10 +5,11 @@ use std::time::Duration;
 
 use image::imageops::FilterType;
 use image::{DynamicImage, ImageReader, Limits, RgbaImage};
-use ratatui::layout::Size;
+use ratatui::buffer::{Buffer, CellDiffOption};
+use ratatui::layout::{Rect, Size};
 use ratatui_image::Resize;
 use ratatui_image::picker::Picker;
-use ratatui_image::sliced::SlicedProtocol;
+use ratatui_image::sliced::{SignedPosition, SlicedImage, SlicedProtocol};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::model::{Decode, FileRef};
@@ -24,10 +25,12 @@ const MAX_ANIMATION_FRAMES: usize = 30;
 const MIN_FRAME_DELAY: Duration = Duration::from_millis(50);
 const MAX_DIMENSION: u32 = 8192;
 const MAX_TRACKED_FILES: usize = 20_000;
+const CELL_OVERHEAD: u64 = 16;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Src {
     File(i32),
+    Clip(i32),
     Mini { chat: i64, msg: i64, idx: u8 },
 }
 
@@ -44,11 +47,13 @@ pub struct Key {
 pub enum Input {
     Path(String, Decode),
     Bytes(Arc<[u8]>),
+    Clip(std::path::PathBuf),
 }
 
 pub struct Frames {
     pub frames: Vec<(SlicedProtocol, Duration)>,
     pub bytes: u64,
+    pub cost: u64,
 }
 
 impl Frames {
@@ -266,9 +271,21 @@ impl Media {
         }
     }
 
+    pub fn forget(&mut self, key: &Key) {
+        self.cache.remove(key);
+    }
+
     #[cfg(test)]
     pub fn download_wanted(&self, file_id: i32) -> bool {
         self.requested.contains(&file_id) || self.downloads.iter().any(|(id, _)| *id == file_id)
+    }
+
+    #[cfg(test)]
+    pub fn clips_ready(&self) -> usize {
+        self.cache
+            .iter()
+            .filter(|(k, e)| matches!(k.src, Src::Clip(_)) && matches!(e.slot, Slot::Ready(_)))
+            .count()
     }
 
     #[cfg(test)]
@@ -726,6 +743,7 @@ pub fn load_frames(
         }
         Input::Path(path, Decode::Tgs) => render_lottie(&read_tgs(path)?, box_px, animate),
         Input::Path(path, Decode::Video) => video_frame(path).map(still),
+        Input::Clip(path) => Err(format!("{}: not a still image", path.display())),
     }
 }
 
@@ -774,22 +792,81 @@ pub fn shape_mask(img: &mut RgbaImage, shape: AvatarShape) {
     }
 }
 
+pub fn written(proto: &SlicedProtocol) -> Option<u64> {
+    if matches!(proto, SlicedProtocol::Kitty(_)) {
+        return None;
+    }
+    let size = proto.size();
+    let area = Rect::new(0, 0, size.width.max(1), size.height.max(1));
+    let mut buf = Buffer::empty(area);
+    ratatui::widgets::Widget::render(
+        SlicedImage::new(proto, SignedPosition { x: 0, y: 0 }),
+        area,
+        &mut buf,
+    );
+    Some(
+        buf.content
+            .iter()
+            .filter(|c| !matches!(c.diff_option, CellDiffOption::Skip))
+            .map(|c| c.symbol().len() as u64 + CELL_OVERHEAD)
+            .sum(),
+    )
+}
+
+fn clip_frames(
+    picker: &Picker,
+    path: &std::path::Path,
+    key: Key,
+    px: (u32, u32),
+) -> Result<Frames, String> {
+    let clip = crate::anim::read_clip(path)?;
+    let gaps: Vec<u32> = clip.frames.iter().map(|f| f.gap).collect();
+    let picks = crate::anim::redraw_picks(&gaps);
+    let mut frames = Vec::with_capacity(picks.len());
+    let (mut bytes, mut cost) = (0u64, 0u64);
+    for (i, ms) in picks {
+        let img = DynamicImage::ImageRgba8(crate::anim::frame_image(&clip, i)?);
+        let canvas = fit_canvas(&img, px.0, px.1);
+        drop(img);
+        let proto = SlicedProtocol::new_with_resize(
+            picker,
+            DynamicImage::ImageRgba8(canvas),
+            Size::new(key.cols, key.rows),
+            Resize::Fit(None),
+        )
+        .map_err(|e| format!("encode: {e}"))?;
+        let c = written(&proto).unwrap_or(u64::from(px.0) * u64::from(px.1) * 16 / 3);
+        bytes += c;
+        cost = cost.max(c);
+        frames.push((proto, Duration::from_millis(u64::from(ms))));
+    }
+    Ok(Frames {
+        frames,
+        bytes,
+        cost,
+    })
+}
+
 pub fn render(picker: &Picker, input: &Input, key: Key) -> Result<Frames, String> {
     let f = picker.font_size();
     let px = (
         u32::from(key.cols) * u32::from(f.width.max(1)),
         u32::from(key.rows) * u32::from(f.height.max(1)),
     );
+    if let Input::Clip(path) = input {
+        return clip_frames(picker, path, key, px);
+    }
     let images = load_frames(input, px, key.animate)?;
     let mut frames = Vec::with_capacity(images.len());
     let mut bytes = 0u64;
+    let cost = u64::from(px.0) * u64::from(px.1) * 16 / 3;
     for (img, delay) in images {
         let mut canvas = fit_canvas(&img, px.0, px.1);
         drop(img);
         if let Some(shape) = key.shape {
             shape_mask(&mut canvas, shape);
         }
-        bytes += u64::from(px.0) * u64::from(px.1) * 16 / 3;
+        bytes += cost;
         let proto = SlicedProtocol::new_with_resize(
             picker,
             DynamicImage::ImageRgba8(canvas),
@@ -799,7 +876,11 @@ pub fn render(picker: &Picker, input: &Input, key: Key) -> Result<Frames, String
         .map_err(|e| format!("encode: {e}"))?;
         frames.push((proto, delay));
     }
-    Ok(Frames { frames, bytes })
+    Ok(Frames {
+        frames,
+        bytes,
+        cost,
+    })
 }
 
 pub fn input_for(file: &FileRef, decode: Decode) -> Option<Input> {
@@ -896,6 +977,7 @@ mod tests {
                 (mk(), Duration::from_millis(50)),
             ],
             bytes: 0,
+            cost: 0,
         };
         assert!(f.animated());
         assert_eq!(f.total(), Duration::from_millis(150));
@@ -1021,6 +1103,87 @@ mod tests {
     }
 
     #[test]
+    fn clips_are_encoded_for_each_redraw_protocol_at_the_capped_rate() {
+        use ratatui_image::picker::ProtocolType;
+        let dir = std::env::temp_dir().join(format!("gramtty-media-clip-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tgs = dir.join("s.tgs");
+        std::fs::write(&tgs, crate::anim::test_lottie(30, 90)).unwrap();
+        let (cols, rows) = (16u16, 8u16);
+        let clip = crate::anim::tgs_clip(tgs.to_str().unwrap(), (160, 160)).unwrap();
+        let path = dir.join("s.anim");
+        crate::anim::write_clip(&path, &clip).unwrap();
+        let floor = Duration::from_millis(u64::from(1000 / crate::anim::REDRAW_FPS));
+        for protocol in [
+            ProtocolType::Sixel,
+            ProtocolType::Iterm2,
+            ProtocolType::Halfblocks,
+        ] {
+            #[allow(deprecated)]
+            let mut picker = Picker::from_fontsize(ratatui_image::FontSize {
+                width: 10,
+                height: 20,
+            });
+            picker.set_protocol_type(protocol);
+            let key = Key {
+                src: Src::Clip(1),
+                cols,
+                rows,
+                shape: None,
+                animate: true,
+            };
+            let f = render(&picker, &Input::Clip(path.clone()), key).unwrap();
+            assert!(f.animated(), "{protocol:?}");
+            assert_eq!(f.total(), Duration::from_millis(3000), "{protocol:?}");
+            assert!(
+                f.frames.len() <= 3 * crate::anim::REDRAW_FPS as usize,
+                "{protocol:?} {}",
+                f.frames.len()
+            );
+            assert!(f.frames.iter().all(|(_, d)| *d >= floor), "{protocol:?}");
+            assert!(
+                f.frames
+                    .iter()
+                    .all(|(p, _)| p.size() == Size::new(cols, rows))
+            );
+            let costs: Vec<u64> = f.frames.iter().map(|(p, _)| written(p).unwrap()).collect();
+            assert_eq!(f.bytes, costs.iter().sum::<u64>(), "{protocol:?}");
+            assert_eq!(f.cost, *costs.iter().max().unwrap(), "{protocol:?}");
+            assert!(f.cost > 0 && f.cost < 64 * 1024, "{protocol:?} {}", f.cost);
+            let rendered = |t: Duration| {
+                let mut b = Buffer::empty(Rect::new(0, 0, cols, rows));
+                ratatui::widgets::Widget::render(
+                    SlicedImage::new(f.at(t).unwrap(), SignedPosition { x: 0, y: 0 }),
+                    b.area,
+                    &mut b,
+                );
+                b
+            };
+            assert_ne!(
+                rendered(Duration::ZERO),
+                rendered(Duration::from_millis(400)),
+                "{protocol:?} frames differ"
+            );
+            eprintln!(
+                "{protocol:?} {cols}x{rows}: {} frames, {} bytes per frame at most, {} KB cached",
+                f.frames.len(),
+                f.cost,
+                f.bytes / 1024
+            );
+        }
+        std::fs::remove_file(&path).unwrap();
+        #[allow(deprecated)]
+        let mut sixel = Picker::from_fontsize(ratatui_image::FontSize {
+            width: 10,
+            height: 20,
+        });
+        sixel.set_protocol_type(ratatui_image::picker::ProtocolType::Sixel);
+        let gone = render(&sixel, &Input::Clip(path.clone()), key(cols, rows, true));
+        assert!(gone.is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn cache_evicts_least_recent_offscreen() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut m = Media::new(Picker::halfblocks(), tx);
@@ -1037,6 +1200,7 @@ mod tests {
                 Duration::ZERO,
             )],
             bytes,
+            cost: bytes,
         };
         for i in 0..(MAX_ENTRIES as u16 + 10) {
             m.insert_ready(key(i + 1, 1, false), frames(1), u64::from(i));

@@ -35,8 +35,8 @@ Name: "ru"; MessagesFile: "compiler:Languages\Russian.isl"
 [CustomMessages]
 en.PathTask=Add gramtty to PATH
 ru.PathTask=Добавить gramtty в PATH
-en.DepsTask=Install mpv, ffmpeg and Windows Terminal with winget (media, voice messages, images)
-ru.DepsTask=Установить mpv, ffmpeg и Windows Terminal через winget (медиа, голосовые, картинки)
+en.DepsTask=Install mpv and ffmpeg, install or update Windows Terminal with winget (media, voice messages, pictures)
+ru.DepsTask=Установить mpv и ffmpeg, установить или обновить Windows Terminal через winget (медиа, голосовые, картинки)
 en.DepsStatus=Installing mpv, ffmpeg and Windows Terminal...
 ru.DepsStatus=Устанавливаются mpv, ffmpeg и Windows Terminal...
 

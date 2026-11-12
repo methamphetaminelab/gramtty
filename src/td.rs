@@ -55,6 +55,7 @@ pub enum Event {
     },
     AuthError(String),
     Error(String),
+    ChatListLoaded(ListId),
     File(FileRef),
     DownloadFailed {
         file_id: i32,
@@ -69,6 +70,10 @@ pub enum Event {
     },
     Saved(Result<String, String>),
     Notice(String),
+    TerminalCopy {
+        text: String,
+        notice: String,
+    },
     Clipboard(Result<crate::upload::Clip, String>),
     DirListing {
         dir: std::path::PathBuf,
@@ -97,7 +102,23 @@ pub enum Event {
     CustomEmoji(Result<std::collections::HashMap<i64, String>, String>),
     Search {
         token: u64,
-        result: Result<Vec<Msg>, String>,
+        result: Result<Found, String>,
+    },
+    Peers {
+        token: u64,
+        result: Peers,
+    },
+    PrivateChat {
+        user_id: i64,
+        result: Result<i64, String>,
+    },
+    Joined {
+        chat_id: i64,
+        result: Result<(), String>,
+    },
+    DateMessage {
+        chat_id: i64,
+        result: Result<Option<(i64, Option<i32>)>, String>,
     },
     MediaCounts {
         chat_id: i64,
@@ -154,6 +175,198 @@ pub enum Event {
     ImageCopied(Result<(), String>),
     SettingsSaved(Result<(), String>),
     ThemeFile(Result<(), String>),
+    Link(Result<Resolved, String>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LinkAction {
+    Chat {
+        username: String,
+        profile: bool,
+    },
+    Bot {
+        username: String,
+        parameter: String,
+        autostart: bool,
+    },
+    Message(String),
+    Invite(String),
+    Phone {
+        phone: String,
+        profile: bool,
+    },
+    Token(String),
+    Browser,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Resolved {
+    Chat {
+        chat_id: i64,
+        profile: bool,
+    },
+    Bot {
+        chat_id: i64,
+        bot_id: i64,
+        parameter: String,
+        autostart: bool,
+    },
+    Message {
+        chat_id: i64,
+        message_id: Option<i64>,
+        topic: Option<i32>,
+    },
+    Invite(Invite),
+    Browser {
+        url: String,
+        hidden: bool,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Invite {
+    pub link: String,
+    pub title: String,
+    pub channel: bool,
+    pub members: i32,
+    pub request: bool,
+}
+
+pub fn link_action(link: &enums::InternalLinkType) -> LinkAction {
+    use enums::InternalLinkType as L;
+    match link {
+        L::PublicChat(p) => LinkAction::Chat {
+            username: p.chat_username.clone(),
+            profile: p.open_profile,
+        },
+        L::BotStart(b) => LinkAction::Bot {
+            username: b.bot_username.clone(),
+            parameter: b.start_parameter.clone(),
+            autostart: b.autostart,
+        },
+        L::Message(m) => LinkAction::Message(m.url.clone()),
+        L::ChatInvite(i) => LinkAction::Invite(i.invite_link.clone()),
+        L::UserPhoneNumber(p) => LinkAction::Phone {
+            phone: p.phone_number.clone(),
+            profile: p.open_profile,
+        },
+        L::UserToken(t) => LinkAction::Token(t.token.clone()),
+        _ => LinkAction::Browser,
+    }
+}
+
+pub fn message_target(info: types::MessageLinkInfo) -> Result<Resolved, String> {
+    let topic = msg_topic(&info.topic_id);
+    match info.message {
+        Some(m) => Ok(Resolved::Message {
+            chat_id: m.chat_id,
+            message_id: Some(m.id),
+            topic: msg_topic(&m.topic_id).or(topic),
+        }),
+        None if info.chat_id != 0 => Ok(Resolved::Message {
+            chat_id: info.chat_id,
+            message_id: None,
+            topic,
+        }),
+        None => Err("message link: the chat is private or no longer exists".to_owned()),
+    }
+}
+
+pub fn invite_target(link: String, info: types::ChatInviteLinkInfo) -> Resolved {
+    if info.chat_id != 0 && info.accessible_for == 0 {
+        return Resolved::Chat {
+            chat_id: info.chat_id,
+            profile: false,
+        };
+    }
+    Resolved::Invite(Invite {
+        link,
+        title: info.title,
+        channel: matches!(info.r#type, enums::InviteLinkChatType::Channel),
+        members: info.member_count,
+        request: info.creates_join_request,
+    })
+}
+
+async fn public_chat(username: &str, c: i32) -> Result<types::Chat, String> {
+    match tdlib_rs::functions::search_public_chat(username.to_owned(), c).await {
+        Ok(enums::Chat::Chat(chat)) => Ok(chat),
+        Err(e) if e.code == 400 => Err(format!("@{username} not found")),
+        Err(e) => Err(failed(&format!("find @{username}"), &friendly_error(&e))),
+    }
+}
+
+async fn private_chat(user_id: i64, profile: bool, c: i32) -> Result<Resolved, String> {
+    match tdlib_rs::functions::create_private_chat(user_id, false, c).await {
+        Ok(enums::Chat::Chat(chat)) => Ok(Resolved::Chat {
+            chat_id: chat.id,
+            profile,
+        }),
+        Err(e) => Err(failed("open the chat", &friendly_error(&e))),
+    }
+}
+
+async fn resolve_link(url: String, hidden: bool, c: i32) -> Result<Resolved, String> {
+    let kind = match tdlib_rs::functions::get_internal_link_type(url.clone(), c).await {
+        Ok(kind) => kind,
+        Err(e) if e.code == 404 => return Ok(Resolved::Browser { url, hidden }),
+        Err(e) => return Err(failed("open the link", &friendly_error(&e))),
+    };
+    match link_action(&kind) {
+        LinkAction::Chat { username, profile } => Ok(Resolved::Chat {
+            chat_id: public_chat(&username, c).await?.id,
+            profile,
+        }),
+        LinkAction::Bot {
+            username,
+            parameter,
+            autostart,
+        } => {
+            let chat = public_chat(&username, c).await?;
+            Ok(match chat.r#type {
+                enums::ChatType::Private(p) => Resolved::Bot {
+                    chat_id: chat.id,
+                    bot_id: p.user_id,
+                    parameter,
+                    autostart,
+                },
+                _ => Resolved::Chat {
+                    chat_id: chat.id,
+                    profile: false,
+                },
+            })
+        }
+        LinkAction::Message(link) => {
+            match tdlib_rs::functions::get_message_link_info(link, c).await {
+                Ok(enums::MessageLinkInfo::MessageLinkInfo(info)) => message_target(info),
+                Err(e) => Err(failed("open the message link", &friendly_error(&e))),
+            }
+        }
+        LinkAction::Invite(link) => {
+            match tdlib_rs::functions::check_chat_invite_link(link.clone(), c).await {
+                Ok(enums::ChatInviteLinkInfo::ChatInviteLinkInfo(info)) => {
+                    Ok(invite_target(link, info))
+                }
+                Err(e) => Err(failed("check the invite link", &friendly_error(&e))),
+            }
+        }
+        LinkAction::Phone { phone, profile } => {
+            match tdlib_rs::functions::search_user_by_phone_number(phone.clone(), false, c).await {
+                Ok(enums::User::User(u)) => private_chat(u.id, profile, c).await,
+                Err(e) if matches!(e.code, 400 | 404) => {
+                    Err(format!("no Telegram user with phone {phone}"))
+                }
+                Err(e) => Err(failed("open the phone link", &friendly_error(&e))),
+            }
+        }
+        LinkAction::Token(token) => {
+            match tdlib_rs::functions::search_user_by_token(token, c).await {
+                Ok(enums::User::User(u)) => private_chat(u.id, false, c).await,
+                Err(e) => Err(failed("open the user link", &friendly_error(&e))),
+            }
+        }
+        LinkAction::Browser => Ok(Resolved::Browser { url, hidden }),
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -168,6 +381,12 @@ pub struct Flags {
     pub can_be_saved: bool,
     pub can_be_forwarded: bool,
     pub can_be_copied: bool,
+    pub can_be_edited: bool,
+    pub can_be_pinned: bool,
+    pub can_be_replied: bool,
+    pub can_delete_for_self: bool,
+    pub can_delete_for_all: bool,
+    pub can_get_viewers: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -176,16 +395,38 @@ pub struct ReactionChoices {
     pub note: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Cursor {
+    Offset(String),
+    From(i64),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Found {
+    pub msgs: Vec<Msg>,
+    pub next: Option<Cursor>,
+    pub total: i32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Peers {
+    pub known: Vec<i64>,
+    pub contacts: Vec<i64>,
+    pub public: Vec<i64>,
+    pub errors: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TopicPage {
     pub topics: Vec<Topic>,
     pub next: Option<TopicCursor>,
     pub total: i32,
+    pub drafts: Vec<(i32, Option<model::Draft>)>,
 }
 
 pub type RequestLog = std::sync::Arc<std::sync::Mutex<Vec<String>>>;
 
-fn execute(request: &serde_json::Value) -> Result<(), String> {
+fn execute_value(request: &serde_json::Value) -> Result<serde_json::Value, String> {
     let raw = CString::new(request.to_string()).map_err(|e| e.to_string())?;
     let reply = unsafe {
         let ptr = td_execute(raw.as_ptr());
@@ -201,7 +442,116 @@ fn execute(request: &serde_json::Value) -> Result<(), String> {
             .unwrap_or("unknown error")
             .to_owned());
     }
-    Ok(())
+    Ok(reply)
+}
+
+fn execute(request: &serde_json::Value) -> Result<(), String> {
+    execute_value(request).map(|_| ())
+}
+
+fn markdown_text(text: &types::FormattedText) -> Result<String, String> {
+    if text.entities.is_empty() {
+        return Ok(text.text.clone());
+    }
+    let reply = execute_value(&serde_json::json!({
+        "@type": "getMarkdownText",
+        "text": text,
+    }))?;
+    reply["text"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "TDLib returned no text".to_owned())
+}
+
+pub fn convert_draft(d: &types::DraftMessage) -> (Option<model::Draft>, Option<String>) {
+    let (reply_to, quote) = match &d.reply_to {
+        Some(enums::InputMessageReplyTo::Message(r)) => (
+            Some(r.message_id),
+            r.quote.as_ref().map(|q| (q.text.text.clone(), q.position)),
+        ),
+        _ => (None, None),
+    };
+    let (text, problem) = match &d.input_message_text {
+        enums::InputMessageContent::InputMessageText(t) => match markdown_text(&t.text) {
+            Ok(text) => (text, None),
+            Err(e) => (t.text.text.clone(), Some(e)),
+        },
+        _ => (String::new(), None),
+    };
+    let draft = model::Draft {
+        text,
+        reply_to,
+        quote,
+    };
+    ((!draft.is_empty()).then_some(draft), problem)
+}
+
+fn draft_reply(d: &model::Draft) -> Option<enums::InputMessageReplyTo> {
+    d.reply_to.map(|message_id| {
+        enums::InputMessageReplyTo::Message(types::InputMessageReplyToMessage {
+            message_id,
+            quote: d
+                .quote
+                .clone()
+                .map(|(text, position)| types::InputTextQuote {
+                    text: types::FormattedText {
+                        text,
+                        entities: Vec::new(),
+                    },
+                    position,
+                }),
+            checklist_task_id: 0,
+        })
+    })
+}
+
+async fn save_draft(
+    chat_id: i64,
+    topic: Option<i32>,
+    draft: Option<model::Draft>,
+    c: i32,
+) -> Result<(), types::Error> {
+    let message = match draft {
+        Some(d) => {
+            let reply_to = draft_reply(&d);
+            let enums::FormattedText::FormattedText(text) = tdlib_rs::functions::parse_markdown(
+                types::FormattedText {
+                    text: d.text,
+                    entities: Vec::new(),
+                },
+                c,
+            )
+            .await?;
+            Some(types::DraftMessage {
+                reply_to,
+                date: 0,
+                input_message_text: enums::InputMessageContent::InputMessageText(
+                    types::InputMessageText {
+                        text,
+                        link_preview_options: None,
+                        clear_draft: false,
+                    },
+                ),
+                effect_id: 0,
+                suggested_post_info: None,
+            })
+        }
+        None => None,
+    };
+    tdlib_rs::functions::set_chat_draft_message(chat_id, message_topic(topic), message, c).await
+}
+
+pub type DraftSave = (i64, Option<i32>, Option<model::Draft>);
+
+fn draft_note(save: &DraftSave) -> String {
+    let (chat_id, topic, draft) = save;
+    match draft {
+        Some(d) => format!(
+            "draft {chat_id} topic {topic:?} {:?} reply {:?}",
+            d.text, d.reply_to
+        ),
+        None => format!("draft {chat_id} topic {topic:?} cleared"),
+    }
 }
 
 pub fn configure_logging(log_file: &Path) -> Result<(), String> {
@@ -236,25 +586,156 @@ pub fn spawn_receiver(tx: UnboundedSender<Event>) {
         .expect("spawn TDLib receive thread");
 }
 
+fn wait_time(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs} s"),
+        60..3600 => format!("{} min", secs.div_ceil(60)),
+        _ => format!("{} h", secs.div_ceil(3600)),
+    }
+}
+
+fn trailing_number(text: &str) -> Option<u64> {
+    let digits: String = text
+        .chars()
+        .rev()
+        .take_while(char::is_ascii_digit)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    digits.parse().ok()
+}
+
+fn error_code_like(text: &str) -> bool {
+    !text.is_empty()
+        && text
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+}
+
 pub fn friendly_error(err: &types::Error) -> String {
-    let hint = match err.message.as_str() {
+    let m = err.message.as_str();
+    let hint = match m {
         "PHONE_NUMBER_INVALID" => {
-            "invalid phone number, use international format like +79991234567"
+            "Invalid phone number; use the international format, like +79991234567"
         }
-        "PHONE_NUMBER_BANNED" => "this phone number is banned by Telegram",
-        "PHONE_CODE_INVALID" => "wrong code",
-        "PHONE_CODE_EXPIRED" => "the code expired, restart login",
-        "PASSWORD_HASH_INVALID" => "wrong password",
-        "API_ID_INVALID" | "API_ID_PUBLISHED_FLOOD" => "api_id/api_hash rejected by Telegram",
-        "AUTH_KEY_UNREGISTERED" => "session was terminated, log in again",
-        "MESSAGE_NOT_MODIFIED" => "message not modified",
-        "MESSAGE_ID_INVALID" => "message can't be changed",
-        m if m.starts_with("Too Many Requests") || m.starts_with("FLOOD_WAIT") => {
-            return format!("too many attempts, wait and retry ({m})");
+        "PHONE_NUMBER_BANNED" => "This phone number is banned by Telegram",
+        "PHONE_CODE_INVALID" => "Wrong code",
+        "PHONE_CODE_EXPIRED" => "The code expired; press Esc and request a new one",
+        "PASSWORD_HASH_INVALID" => "Wrong password",
+        "EMAIL_CODE_INVALID" => "Wrong code",
+        "EMAIL_INVALID" | "EMAIL_ADDRESS_INVALID" => "Invalid email address",
+        "API_ID_INVALID" | "API_ID_PUBLISHED_FLOOD" => "Telegram rejected the api_id/api_hash",
+        "AUTH_KEY_UNREGISTERED" | "SESSION_REVOKED" | "Unauthorized" => {
+            "Your session has ended; log in again"
         }
-        _ => return format!("{} ({})", err.message, err.code),
+        "MESSAGE_NOT_MODIFIED" => "Nothing changed in the message",
+        "MESSAGE_ID_INVALID" | "Message not found" | "MESSAGE_DELETE_FORBIDDEN" => {
+            "This message is no longer available"
+        }
+        "MESSAGE_TOO_LONG" => "The message is too long",
+        "MESSAGE_EMPTY" => "The message is empty",
+        "CHAT_WRITE_FORBIDDEN" | "Have no write access to the chat" => {
+            "You can't send messages here"
+        }
+        "CHAT_ADMIN_REQUIRED" | "Not enough rights" => "Only admins can do this here",
+        "CHANNEL_PRIVATE" => "This channel is private or you were removed from it",
+        "USER_IS_BLOCKED" => "This user has restricted who can message them",
+        "YOU_BLOCKED_USER" => "You blocked this user; unblock them first",
+        "USER_PRIVACY_RESTRICTED" => "This user's privacy settings don't allow it",
+        "PEER_ID_INVALID" | "Chat not found" | "CHAT_ID_INVALID" => "This chat is not available",
+        "USERNAME_NOT_OCCUPIED" | "USERNAME_INVALID" => "No one has this username",
+        "INVITE_HASH_EXPIRED" | "INVITE_HASH_INVALID" => "This invite link is no longer valid",
+        "FILE_REFERENCE_EXPIRED" => "The file link expired; reopen the chat and try again",
+        "PREMIUM_ACCOUNT_REQUIRED" => "This needs Telegram Premium",
+        "Request aborted" => "The request was cancelled",
+        "Request timeout" | "Timeout expired" => "Telegram didn't answer in time; try again",
+        _ if m.starts_with("Too Many Requests") || m.starts_with("FLOOD_WAIT") => {
+            return match trailing_number(m) {
+                Some(secs) => format!("Too many requests, try again in {}", wait_time(secs)),
+                None => "Too many requests, try again later".to_owned(),
+            };
+        }
+        _ if m.starts_with("SLOWMODE_WAIT") => {
+            return match trailing_number(m) {
+                Some(secs) => format!("Slow mode is on, try again in {}", wait_time(secs)),
+                None => "Slow mode is on, try again later".to_owned(),
+            };
+        }
+        _ if m.starts_with("Not enough rights") => {
+            return format!(
+                "You don't have the rights{}",
+                &m["Not enough rights".len()..]
+            );
+        }
+        _ if m.contains("NETWORK") || m.starts_with("Connection") || err.code == -1 => {
+            "No connection to Telegram; try again"
+        }
+        _ if error_code_like(m) => return format!("Telegram refused the request ({m})"),
+        _ => return sentence_case(m),
     };
     hint.to_owned()
+}
+
+pub fn sentence_case(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
+pub fn lower_first(text: &str) -> String {
+    let word = text.split_whitespace().next().unwrap_or_default();
+    let proper = ["Telegram", "TDLib", "I", "Ctrl", "Wayland"].contains(&word)
+        || word.chars().skip(1).any(char::is_uppercase);
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) if !proper => first.to_lowercase().chain(chars).collect(),
+        _ => text.to_owned(),
+    }
+}
+
+pub fn failed(what: &str, reason: &str) -> String {
+    format!("Couldn't {what}: {}", lower_first(reason))
+}
+
+fn failure_label(context: &str) -> &str {
+    match context {
+        "get option" => "start TDLib",
+        "open chat" => "open the chat",
+        "close chat" => "close the chat",
+        "close" => "close the session",
+        "mark read" => "mark messages as read",
+        "delete" => "delete the messages",
+        "forward" => "forward the messages",
+        "react" => "set the reaction",
+        "resend" => "resend the message",
+        "send sticker" => "send the sticker",
+        "send voice" => "send the voice message",
+        "read reactions" => "mark reactions as read",
+        "read mentions" => "mark mentions as read",
+        "topic notifications" => "change the topic notifications",
+        "pin topic" => "pin the topic",
+        "close topic" => "close the topic",
+        "hide General" => "hide the General topic",
+        "start bot" => "start the bot",
+        "recent found" => "update recent searches",
+        "chat action" => "send the typing status",
+        "auto-delete timer" => "set the auto-delete timer",
+        "close secret chat" => "close the secret chat",
+        "delete secret chat" => "delete the secret chat",
+        "go online" | "go offline" => "update your online status",
+        "pin" => "pin the message",
+        "unpin" => "unpin the message",
+        "save draft" => "save the draft",
+        "chat notifications" => "change the chat notifications",
+        "pin chat" => "pin or unpin the chat",
+        "archive chat" => "move the chat to or from the archive",
+        "leave chat" => "leave the chat",
+        "delete chat" => "delete the chat",
+        other => other,
+    }
 }
 
 #[derive(Clone)]
@@ -297,6 +778,9 @@ impl Td {
     }
 
     pub fn recreate(&mut self) {
+        if self.fake("recreate client") {
+            return;
+        }
         self.client_id = tdlib_rs::create_client();
     }
 
@@ -314,7 +798,7 @@ impl Td {
                 let ev = if auth {
                     Event::AuthError(text)
                 } else {
-                    Event::Error(format!("{context}: {text}"))
+                    Event::Error(failed(failure_label(context), &text))
                 };
                 let _ = tx.send(ev);
             }
@@ -409,10 +893,29 @@ impl Td {
         });
     }
 
-    pub fn close(&self) {
+    pub fn close(&self, drafts: Vec<DraftSave>) {
+        for save in &drafts {
+            self.note(draft_note(save));
+        }
         let c = self.client_id;
+        let tx = self.tx.clone();
         self.spawn("close", false, async move {
+            for (chat_id, topic, draft) in drafts {
+                if let Err(e) = save_draft(chat_id, topic, draft, c).await {
+                    let text = failed("save the draft", &friendly_error(&e));
+                    let _ = tx.send(Event::Error(text));
+                }
+            }
             tdlib_rs::functions::close(c).await
+        });
+    }
+
+    pub fn set_draft(&self, save: DraftSave) {
+        self.note(draft_note(&save));
+        let c = self.client_id;
+        self.spawn("save draft", false, async move {
+            let (chat_id, topic, draft) = save;
+            save_draft(chat_id, topic, draft, c).await
         });
     }
 
@@ -423,11 +926,13 @@ impl Td {
         let c = self.client_id;
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = tdlib_rs::functions::load_chats(Some(to_chat_list(list)), 100, c).await
-                && e.code != 404
-            {
-                let _ = tx.send(Event::Error(format!("load chats: {}", friendly_error(&e))));
-            }
+            let result = tdlib_rs::functions::load_chats(Some(to_chat_list(list)), 100, c).await;
+            let ev = match result {
+                Ok(()) => return,
+                Err(e) if e.code == 404 => Event::ChatListLoaded(list),
+                Err(e) => Event::Error(failed("load chats", &friendly_error(&e))),
+            };
+            let _ = tx.send(ev);
         });
     }
 
@@ -486,7 +991,7 @@ impl Td {
                     msgs,
                     epoch,
                 },
-                Err(e) => Event::Error(format!("load newer messages: {e}")),
+                Err(e) => Event::Error(failed("load newer messages", &e)),
             }
         });
     }
@@ -497,7 +1002,7 @@ impl Td {
         self.task("load around", async move {
             let result = match tdlib_rs::functions::get_message(chat_id, target, c).await {
                 Err(e) if e.code == 404 => Err("that message was deleted".to_owned()),
-                Err(e) => Err(format!("cannot open that message: {}", friendly_error(&e))),
+                Err(e) => Err(failed("open that message", &friendly_error(&e))),
                 Ok(enums::Message::Message(m)) => {
                     around_window(convert_message(m), || {
                         history_page(chat_id, target, AROUND_OFFSET, AROUND_LIMIT, topic, c)
@@ -592,8 +1097,12 @@ impl Td {
             }
             .await;
             if let Err(e) = result {
-                let what = if edit.is_some() { "edit" } else { "send" };
-                let _ = tx.send(Event::Error(format!("{what}: {}", friendly_error(&e))));
+                let what = if edit.is_some() {
+                    "edit the message"
+                } else {
+                    "send the message"
+                };
+                let _ = tx.send(Event::Error(failed(what, &friendly_error(&e))));
             }
         });
     }
@@ -615,13 +1124,14 @@ impl Td {
                     message_id,
                     text: md.text,
                 },
-                Err(e) => Event::Error(format!("edit: {}", friendly_error(&e))),
+                Err(e) => Event::Error(failed("edit the message", &friendly_error(&e))),
             };
             let _ = tx.send(ev);
         });
     }
 
     pub fn delete_messages(&self, chat_id: i64, message_ids: Vec<i64>, revoke: bool) {
+        self.note(format!("delete {chat_id} {message_ids:?} {revoke}"));
         let c = self.client_id;
         self.spawn("delete", false, async move {
             tdlib_rs::functions::delete_messages(chat_id, message_ids, revoke, c).await
@@ -1011,7 +1521,7 @@ impl Td {
                 let _ = tx.send(Event::Notice(notes.join("; ")));
             }
             if let Err(e) = result {
-                let _ = tx.send(Event::Error(format!("send: {}", friendly_error(&e))));
+                let _ = tx.send(Event::Error(failed("send the files", &friendly_error(&e))));
             }
         });
     }
@@ -1499,6 +2009,7 @@ impl Td {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn search(
         &self,
         token: u64,
@@ -1507,41 +2018,108 @@ impl Td {
         pinned: bool,
         sender: Option<Sender>,
         media: Option<crate::model::MediaFilter>,
+        from: Option<Cursor>,
     ) {
         self.note(format!("search {chat_id:?} sender {sender:?}"));
+        if let Some(cursor) = &from {
+            self.note(format!("search more {cursor:?}"));
+        }
         let c = self.client_id;
         self.task("search", async move {
+            let filter = media
+                .map(media_filter)
+                .or(pinned.then_some(enums::SearchMessagesFilter::Pinned));
             let result = match chat_id {
                 Some(chat_id) => {
-                    let filter = media
-                        .map(media_filter)
-                        .or(pinned.then_some(enums::SearchMessagesFilter::Pinned));
+                    let from_id = match from {
+                        Some(Cursor::From(id)) => id,
+                        _ => 0,
+                    };
                     let sender_id = sender.map(input_sender);
                     tdlib_rs::functions::search_chat_messages(
-                        chat_id, None, query, sender_id, 0, 0, 100, filter, c,
+                        chat_id, None, query, sender_id, from_id, 0, 50, filter, c,
                     )
                     .await
-                    .map(|enums::FoundChatMessages::FoundChatMessages(f)| f.messages)
+                    .map(found_chat_messages)
                 }
-                None => tdlib_rs::functions::search_messages(
-                    None,
-                    query,
-                    String::new(),
-                    100,
-                    None,
-                    None,
-                    0,
-                    0,
-                    c,
-                )
-                .await
-                .map(|enums::FoundMessages::FoundMessages(f)| f.messages),
+                None => {
+                    let offset = match from {
+                        Some(Cursor::Offset(o)) => o,
+                        _ => String::new(),
+                    };
+                    tdlib_rs::functions::search_messages(
+                        None, query, offset, 50, filter, None, 0, 0, c,
+                    )
+                    .await
+                    .map(found_messages)
+                }
             };
             Event::Search {
                 token,
-                result: result
-                    .map(|m| m.into_iter().map(convert_message).collect())
-                    .map_err(|e| friendly_error(&e)),
+                result: result.map_err(|e| friendly_error(&e)),
+            }
+        });
+    }
+
+    pub fn find_peers(&self, token: u64, query: String) {
+        self.note(format!("find chats {query:?}"));
+        let c = self.client_id;
+        self.task("find chats", async move {
+            use tdlib_rs::functions as f;
+            let result = if query.is_empty() {
+                peers_from(vec![f::search_chats(query, 50, c).await], None, None)
+            } else {
+                let (known, server, contacts, public) = futures::join!(
+                    f::search_chats(query.clone(), 50, c),
+                    f::search_chats_on_server(query.clone(), 50, c),
+                    f::search_contacts(query.clone(), 50, c),
+                    f::search_public_chats(query.clone(), c),
+                );
+                peers_from(vec![known, server], Some(contacts), Some(public))
+            };
+            Event::Peers { token, result }
+        });
+    }
+
+    pub fn add_recent_found(&self, chat_id: i64) {
+        self.note(format!("recent found {chat_id}"));
+        let c = self.client_id;
+        self.spawn("recent found", false, async move {
+            tdlib_rs::functions::add_recently_found_chat(chat_id, c).await
+        });
+    }
+
+    pub fn open_private_chat(&self, user_id: i64) {
+        self.note(format!("private chat {user_id}"));
+        let c = self.client_id;
+        self.task("private chat", async move {
+            let result = tdlib_rs::functions::create_private_chat(user_id, false, c)
+                .await
+                .map(|enums::Chat::Chat(chat)| chat.id)
+                .map_err(|e| friendly_error(&e));
+            Event::PrivateChat { user_id, result }
+        });
+    }
+
+    pub fn join_chat(&self, chat_id: i64) {
+        self.note(format!("join {chat_id}"));
+        let c = self.client_id;
+        self.task("join", async move {
+            let result = tdlib_rs::functions::join_chat(chat_id, c)
+                .await
+                .map_err(|e| friendly_error(&e));
+            Event::Joined { chat_id, result }
+        });
+    }
+
+    pub fn message_by_date(&self, chat_id: i64, date: i32) {
+        self.note(format!("message by date {chat_id} {date}"));
+        let c = self.client_id;
+        self.task("message by date", async move {
+            let reply = tdlib_rs::functions::get_chat_message_by_date(chat_id, date, c).await;
+            Event::DateMessage {
+                chat_id,
+                result: dated(reply),
             }
         });
     }
@@ -1613,6 +2191,12 @@ impl Td {
                     can_be_saved: p.can_be_saved,
                     can_be_forwarded: p.can_be_forwarded,
                     can_be_copied: p.can_be_copied,
+                    can_be_edited: p.can_be_edited,
+                    can_be_pinned: p.can_be_pinned,
+                    can_be_replied: p.can_be_replied,
+                    can_delete_for_self: p.can_be_deleted_only_for_self,
+                    can_delete_for_all: p.can_be_deleted_for_all_users,
+                    can_get_viewers: p.can_get_viewers,
                 })
                 .map_err(|e| friendly_error(&e));
             Event::Properties {
@@ -1731,11 +2315,16 @@ impl Td {
     }
 
     pub fn copy_text(&self, text: String) {
+        self.copy_text_as(text, "copied to clipboard".to_owned());
+    }
+
+    pub fn copy_text_as(&self, text: String, notice: String) {
         self.note(format!("copy {text}"));
         self.task("clipboard", async move {
-            match upload::copy_text(text).await {
-                Ok(()) => Event::Notice("copied to clipboard".to_owned()),
-                Err(e) => Event::Error(e),
+            match upload::copy_text(text.clone()).await {
+                Ok(upload::Copied::System) => Event::Notice(notice),
+                Ok(upload::Copied::Terminal) => Event::TerminalCopy { text, notice },
+                Err(e) => Event::Error(failed("copy", &e)),
             }
         });
     }
@@ -1752,7 +2341,7 @@ impl Td {
         self.task("get message", async move {
             match tdlib_rs::functions::get_message(chat_id, message_id, c).await {
                 Ok(enums::Message::Message(m)) => Event::Fetched(convert_message(m)),
-                Err(e) => Event::Error(format!("load keyboard: {}", friendly_error(&e))),
+                Err(e) => Event::Error(failed("load the bot keyboard", &friendly_error(&e))),
             }
         });
     }
@@ -1781,10 +2370,20 @@ impl Td {
                         message_id: f.next_offset_message_id,
                         topic_id: f.next_offset_forum_topic_id,
                     });
+                    let drafts = f
+                        .topics
+                        .iter()
+                        .filter(|t| !t.info.is_general)
+                        .map(|t| {
+                            let draft = t.draft_message.as_ref().and_then(|d| convert_draft(d).0);
+                            (t.info.forum_topic_id, draft)
+                        })
+                        .collect();
                     Ok(TopicPage {
                         topics: topics_with_icons(f.topics, c).await,
                         next,
                         total: f.total_count,
+                        drafts,
                     })
                 }
                 Err(e) => Err(friendly_error(&e)),
@@ -1819,6 +2418,50 @@ impl Td {
                 c,
             )
             .await
+        });
+    }
+
+    pub fn mute_chat(&self, chat_id: i64, mute_for: i32) {
+        self.note(format!("mute chat {chat_id} {mute_for}"));
+        let c = self.client_id;
+        self.spawn("chat notifications", false, async move {
+            let enums::Chat::Chat(chat) = tdlib_rs::functions::get_chat(chat_id, c).await?;
+            let mut settings = chat.notification_settings;
+            settings.use_default_mute_for = false;
+            settings.mute_for = mute_for;
+            tdlib_rs::functions::set_chat_notification_settings(chat_id, settings, c).await
+        });
+    }
+
+    pub fn pin_chat(&self, list: ListId, chat_id: i64, pin: bool) {
+        self.note(format!("pin chat {list:?} {chat_id} {pin}"));
+        let c = self.client_id;
+        self.spawn("pin chat", false, async move {
+            tdlib_rs::functions::toggle_chat_is_pinned(to_chat_list(list), chat_id, pin, c).await
+        });
+    }
+
+    pub fn move_chat(&self, chat_id: i64, list: ListId) {
+        self.note(format!("move chat {chat_id} {list:?}"));
+        let c = self.client_id;
+        self.spawn("archive chat", false, async move {
+            tdlib_rs::functions::add_chat_to_list(chat_id, to_chat_list(list), c).await
+        });
+    }
+
+    pub fn leave_chat(&self, chat_id: i64) {
+        self.note(format!("leave chat {chat_id}"));
+        let c = self.client_id;
+        self.spawn("leave chat", false, async move {
+            tdlib_rs::functions::leave_chat(chat_id, c).await
+        });
+    }
+
+    pub fn delete_chat(&self, chat_id: i64, revoke: bool) {
+        self.note(format!("delete chat {chat_id} {revoke}"));
+        let c = self.client_id;
+        self.spawn("delete chat", false, async move {
+            tdlib_rs::functions::delete_chat_history(chat_id, true, revoke, c).await
         });
     }
 
@@ -1916,6 +2559,49 @@ impl Td {
                 tdlib_rs::functions::close_secret_chat(secret_id, c).await?;
             }
             tdlib_rs::functions::delete_chat_history(chat_id, true, false, c).await
+        });
+    }
+
+    pub fn resolve_link(&self, url: String, hidden: bool) {
+        self.note(format!("resolve link {url}"));
+        let c = self.client_id;
+        self.task("resolve link", async move {
+            Event::Link(resolve_link(url, hidden, c).await)
+        });
+    }
+
+    pub fn open_user(&self, user_id: i64) {
+        self.note(format!("open user {user_id}"));
+        let c = self.client_id;
+        self.task("open user", async move {
+            Event::Link(private_chat(user_id, false, c).await)
+        });
+    }
+
+    pub fn join_by_link(&self, link: String) {
+        self.note(format!("join link {link}"));
+        let c = self.client_id;
+        self.task("join chat", async move {
+            match tdlib_rs::functions::join_chat_by_invite_link(link, c).await {
+                Ok(enums::Chat::Chat(chat)) => Event::Link(Ok(Resolved::Chat {
+                    chat_id: chat.id,
+                    profile: false,
+                })),
+                Err(e) if e.message == "INVITE_REQUEST_SENT" => {
+                    Event::Notice("join request sent, an admin has to approve it".to_owned())
+                }
+                Err(e) => Event::Link(Err(failed("join", &friendly_error(&e)))),
+            }
+        });
+    }
+
+    pub fn start_bot(&self, bot_id: i64, chat_id: i64, parameter: String) {
+        self.note(format!("start bot {bot_id} {chat_id} {parameter}"));
+        let c = self.client_id;
+        self.spawn("start bot", false, async move {
+            tdlib_rs::functions::send_bot_start_message(bot_id, chat_id, parameter, c)
+                .await
+                .map(|_| ())
         });
     }
 
@@ -2211,6 +2897,10 @@ pub fn convert_position(p: &types::ChatPosition) -> Position {
     }
 }
 
+pub fn reactions_off(r: &enums::ChatAvailableReactions) -> bool {
+    matches!(r, enums::ChatAvailableReactions::Some(s) if s.reactions.is_empty())
+}
+
 pub fn convert_chat(chat: types::Chat) -> ChatInfo {
     let kind = match &chat.r#type {
         enums::ChatType::Private(p) => ChatKind::Private(p.user_id),
@@ -2231,6 +2921,7 @@ pub fn convert_chat(chat: types::Chat) -> ChatInfo {
         auto_delete: chat.message_auto_delete_time,
         perms: convert_perms(&chat.permissions),
         protected: chat.has_protected_content,
+        reactions_off: reactions_off(&chat.available_reactions),
         id: chat.id,
         title: chat.title,
         kind,
@@ -2264,8 +2955,8 @@ fn convert_entity(e: &types::TextEntity) -> Option<Entity> {
         TextEntityType::Url => EntityKind::Link(None),
         TextEntityType::EmailAddress => EntityKind::Link(None),
         TextEntityType::TextUrl(u) => EntityKind::Link(Some(u.url.clone())),
+        TextEntityType::MentionName(m) => EntityKind::MentionName(m.user_id),
         TextEntityType::Mention
-        | TextEntityType::MentionName(_)
         | TextEntityType::Hashtag
         | TextEntityType::Cashtag
         | TextEntityType::BotCommand => EntityKind::Mention,
@@ -2292,7 +2983,7 @@ fn to_td_entity(e: &Entity) -> Option<types::TextEntity> {
             TextEntityType::TextUrl(types::TextEntityTypeTextUrl { url: url.clone() })
         }
         EntityKind::Quote => TextEntityType::BlockQuote,
-        EntityKind::Link(None) | EntityKind::Mention => return None,
+        EntityKind::Link(None) | EntityKind::Mention | EntityKind::MentionName(_) => return None,
     };
     Some(types::TextEntity {
         offset: i32::try_from(e.offset).ok()?,
@@ -2700,6 +3391,7 @@ pub fn convert_message(m: types::Message) -> Msg {
         via_bot: m.via_bot_user_id,
         signature: m.author_signature.clone(),
         story,
+        reactors_visible: reactors_visible(info),
     };
     let content = convert_content(m.content);
     let state = match m.sending_state {
@@ -2755,6 +3447,7 @@ pub fn convert_perms(p: &types::ChatPermissions) -> Rights {
         create_topics: p.can_create_topics,
         pin: p.can_pin_messages,
         change_info: p.can_change_info,
+        no_send: !p.can_send_basic_messages,
     }
 }
 
@@ -2766,6 +3459,7 @@ pub fn convert_membership(s: &enums::ChatMemberStatus) -> Membership {
             create_topics: a.rights.can_manage_topics,
             pin: a.rights.can_pin_messages,
             change_info: a.rights.can_change_info,
+            no_send: !a.rights.can_post_messages,
         }),
         enums::ChatMemberStatus::Member(_) => Membership::Member,
         enums::ChatMemberStatus::Restricted(r) if r.is_member => {
@@ -2888,7 +3582,7 @@ fn topic_settings(mute: bool) -> types::ChatNotificationSettings {
     }
 }
 
-const MUTE_FOREVER: i32 = 367 * 86_400;
+pub const MUTE_FOREVER: i32 = 367 * 86_400;
 pub const TOPIC_ICON_COLOR: i32 = 0x6F_B9_F0;
 
 pub fn convert_origin(o: enums::MessageOrigin) -> Origin {
@@ -2898,6 +3592,11 @@ pub fn convert_origin(o: enums::MessageOrigin) -> Origin {
         enums::MessageOrigin::Chat(c) => Origin::Sender(Sender::Chat(c.sender_chat_id)),
         enums::MessageOrigin::Channel(c) => Origin::Sender(Sender::Chat(c.chat_id)),
     }
+}
+
+pub fn reactors_visible(info: Option<&types::MessageInteractionInfo>) -> bool {
+    info.and_then(|i| i.reactions.as_ref())
+        .is_some_and(|r| r.can_get_added_reactions)
 }
 
 pub fn convert_reactions(info: Option<&types::MessageInteractionInfo>) -> Vec<Reaction> {
@@ -3034,6 +3733,83 @@ pub fn user_meta(u: &types::User) -> crate::model::UserMeta {
             .map(|n| n.active_usernames.clone())
             .unwrap_or_default(),
         photo: u.profile_photo.as_ref().map(|p| convert_file(&p.small)),
+    }
+}
+
+pub fn found_messages(found: enums::FoundMessages) -> Found {
+    let enums::FoundMessages::FoundMessages(f) = found;
+    let msgs: Vec<Msg> = f.messages.into_iter().map(convert_message).collect();
+    let next =
+        (!f.next_offset.is_empty() && !msgs.is_empty()).then_some(Cursor::Offset(f.next_offset));
+    Found {
+        msgs,
+        next,
+        total: f.total_count,
+    }
+}
+
+pub fn found_chat_messages(found: enums::FoundChatMessages) -> Found {
+    let enums::FoundChatMessages::FoundChatMessages(f) = found;
+    let msgs: Vec<Msg> = f.messages.into_iter().map(convert_message).collect();
+    let next = (f.next_from_message_id != 0 && !msgs.is_empty())
+        .then_some(Cursor::From(f.next_from_message_id));
+    Found {
+        msgs,
+        next,
+        total: f.total_count,
+    }
+}
+
+type Reply<T> = Result<T, types::Error>;
+
+pub fn peers_from(
+    known: Vec<Reply<enums::Chats>>,
+    contacts: Option<Reply<enums::Users>>,
+    public: Option<Reply<enums::Chats>>,
+) -> Peers {
+    let mut peers = Peers::default();
+    for reply in known {
+        match reply {
+            Ok(enums::Chats::Chats(c)) => {
+                for id in c.chat_ids {
+                    if !peers.known.contains(&id) {
+                        peers.known.push(id);
+                    }
+                }
+            }
+            Err(e) => peers
+                .errors
+                .push(failed("search chats", &friendly_error(&e))),
+        }
+    }
+    match contacts {
+        Some(Ok(enums::Users::Users(u))) => peers.contacts = u.user_ids,
+        Some(Err(e)) => peers
+            .errors
+            .push(failed("search contacts", &friendly_error(&e))),
+        None => {}
+    }
+    match public {
+        Some(Ok(enums::Chats::Chats(c))) => {
+            peers.public = c
+                .chat_ids
+                .into_iter()
+                .filter(|id| !peers.known.contains(id))
+                .collect()
+        }
+        Some(Err(e)) => peers
+            .errors
+            .push(failed("search globally", &friendly_error(&e))),
+        None => {}
+    }
+    peers
+}
+
+pub fn dated(reply: Reply<enums::Message>) -> Result<Option<(i64, Option<i32>)>, String> {
+    match reply {
+        Ok(enums::Message::Message(m)) => Ok(Some((m.id, msg_topic(&m.topic_id)))),
+        Err(e) if e.code == 404 => Ok(None),
+        Err(e) => Err(friendly_error(&e)),
     }
 }
 
@@ -3641,7 +4417,8 @@ mod tests {
                 manage_topics: true,
                 create_topics: true,
                 pin: false,
-                change_info: true
+                change_info: true,
+                no_send: true
             })
         );
         let left: enums::ChatMemberStatus = serde_json::from_value(json!({
@@ -3657,5 +4434,421 @@ mod tests {
             }))
         );
         assert_eq!(message_topic(None), None);
+    }
+
+    fn link_type(v: Value) -> LinkAction {
+        link_action(&serde_json::from_value(v).expect("internal link JSON"))
+    }
+
+    #[test]
+    fn internal_links_map_to_actions() {
+        assert_eq!(
+            link_type(json!({
+                "@type": "internalLinkTypePublicChat", "chat_username": "durov",
+                "draft_text": "", "open_profile": true,
+            })),
+            LinkAction::Chat {
+                username: "durov".to_owned(),
+                profile: true
+            }
+        );
+        assert_eq!(
+            link_type(json!({
+                "@type": "internalLinkTypeBotStart", "bot_username": "some_bot",
+                "start_parameter": "ref42", "autostart": false,
+            })),
+            LinkAction::Bot {
+                username: "some_bot".to_owned(),
+                parameter: "ref42".to_owned(),
+                autostart: false
+            }
+        );
+        assert_eq!(
+            link_type(json!({"@type": "internalLinkTypeMessage", "url": "https://t.me/rust/5"})),
+            LinkAction::Message("https://t.me/rust/5".to_owned())
+        );
+        assert_eq!(
+            link_type(
+                json!({"@type": "internalLinkTypeChatInvite", "invite_link": "https://t.me/+abc"})
+            ),
+            LinkAction::Invite("https://t.me/+abc".to_owned())
+        );
+        assert_eq!(
+            link_type(json!({
+                "@type": "internalLinkTypeUserPhoneNumber", "phone_number": "79991234567",
+                "draft_text": "", "open_profile": false,
+            })),
+            LinkAction::Phone {
+                phone: "79991234567".to_owned(),
+                profile: false
+            }
+        );
+        assert_eq!(
+            link_type(json!({"@type": "internalLinkTypeUserToken", "token": "tok"})),
+            LinkAction::Token("tok".to_owned())
+        );
+        assert_eq!(
+            link_type(json!({
+                "@type": "internalLinkTypeStickerSet", "sticker_set_name": "cats",
+                "expect_custom_emoji": false,
+            })),
+            LinkAction::Browser
+        );
+        assert_eq!(
+            link_type(json!({
+                "@type": "internalLinkTypeBotStartInGroup", "bot_username": "some_bot",
+                "start_parameter": "", "administrator_rights": null,
+            })),
+            LinkAction::Browser
+        );
+    }
+
+    #[test]
+    fn message_links_resolve_to_the_message_or_its_chat() {
+        let info = |chat_id: i64, topic: Value, message: Value| -> types::MessageLinkInfo {
+            serde_json::from_value(json!({
+                "@type": "messageLinkInfo", "is_public": true, "chat_id": chat_id,
+                "topic_id": topic, "message": message, "media_timestamp": 0, "for_album": false,
+            }))
+            .expect("message link JSON")
+        };
+        let forum = json!({"@type": "messageTopicForum", "forum_topic_id": 7});
+        assert_eq!(
+            message_target(info(
+                -100,
+                forum.clone(),
+                message_json(55, forum.clone(), Value::Null)
+            )),
+            Ok(Resolved::Message {
+                chat_id: -100,
+                message_id: Some(55),
+                topic: Some(7)
+            })
+        );
+        assert_eq!(
+            message_target(info(
+                -555,
+                Value::Null,
+                message_json(56, Value::Null, Value::Null)
+            )),
+            Ok(Resolved::Message {
+                chat_id: -100,
+                message_id: Some(56),
+                topic: None
+            })
+        );
+        assert_eq!(
+            message_target(info(-200, forum, Value::Null)),
+            Ok(Resolved::Message {
+                chat_id: -200,
+                message_id: None,
+                topic: Some(7)
+            })
+        );
+        assert!(message_target(info(0, Value::Null, Value::Null)).is_err());
+    }
+
+    #[test]
+    fn invite_links_open_known_chats_and_describe_the_rest() {
+        let info = |chat_id: i64, accessible_for: i32, kind: &str, request: bool| {
+            serde_json::from_value::<types::ChatInviteLinkInfo>(json!({
+                "@type": "chatInviteLinkInfo", "chat_id": chat_id,
+                "accessible_for": accessible_for, "type": {"@type": kind}, "title": "Rust",
+                "photo": null, "accent_color_id": 0, "description": "", "member_count": 1234,
+                "member_user_ids": [], "subscription_info": null,
+                "creates_join_request": request, "is_public": false, "verification_status": null,
+            }))
+            .expect("invite link JSON")
+        };
+        let link = || "https://t.me/+abc".to_owned();
+        assert_eq!(
+            invite_target(link(), info(-100, 0, "inviteLinkChatTypeSupergroup", false)),
+            Resolved::Chat {
+                chat_id: -100,
+                profile: false
+            }
+        );
+        let preview = Resolved::Invite(Invite {
+            link: link(),
+            title: "Rust".to_owned(),
+            channel: true,
+            members: 1234,
+            request: false,
+        });
+        assert_eq!(
+            invite_target(link(), info(-100, 3600, "inviteLinkChatTypeChannel", false)),
+            preview
+        );
+        assert_eq!(
+            invite_target(link(), info(0, 0, "inviteLinkChatTypeBasicGroup", true)),
+            Resolved::Invite(Invite {
+                link: link(),
+                title: "Rust".to_owned(),
+                channel: false,
+                members: 1234,
+                request: true,
+            })
+        );
+    }
+
+    #[test]
+    fn mention_names_keep_the_user_id() {
+        let t: types::FormattedText = serde_json::from_value(json!({
+            "@type": "formattedText", "text": "hi Alice and @bob",
+            "entities": [
+                {"@type": "textEntity", "offset": 3, "length": 5,
+                 "type": {"@type": "textEntityTypeMentionName", "user_id": 42}},
+                {"@type": "textEntity", "offset": 13, "length": 4,
+                 "type": {"@type": "textEntityTypeMention"}},
+            ],
+        }))
+        .expect("formatted text JSON");
+        let rt = convert_text(t);
+        assert_eq!(rt.entities[0].kind, EntityKind::MentionName(42));
+        assert_eq!(rt.entities[1].kind, EntityKind::Mention);
+        assert!(to_td_entity(&rt.entities[0]).is_none());
+    }
+
+    fn tl_error(code: i32, message: &str) -> types::Error {
+        types::Error {
+            code,
+            message: message.to_owned(),
+        }
+    }
+
+    #[test]
+    fn found_messages_carry_the_next_page_cursor() {
+        let mut topic = message_json(
+            31,
+            json!({"@type": "messageTopicForum", "forum_topic_id": 7}),
+            Value::Null,
+        );
+        topic["chat_id"] = json!(-200);
+        let global: enums::FoundMessages = serde_json::from_value(json!({
+            "@type": "foundMessages", "total_count": 120,
+            "messages": [message_json(30, Value::Null, Value::Null), topic],
+            "next_offset": "AQID",
+        }))
+        .expect("foundMessages JSON");
+        let found = found_messages(global);
+        assert_eq!(found.total, 120);
+        assert_eq!(found.next, Some(Cursor::Offset("AQID".to_owned())));
+        let ids: Vec<(i64, i64, Option<i32>)> = found
+            .msgs
+            .iter()
+            .map(|m| (m.chat_id, m.id, m.topic))
+            .collect();
+        assert_eq!(ids, vec![(-100, 30, None), (-200, 31, Some(7))]);
+        let last: enums::FoundMessages = serde_json::from_value(json!({
+            "@type": "foundMessages", "total_count": 2,
+            "messages": [message_json(1, Value::Null, Value::Null)], "next_offset": "",
+        }))
+        .expect("last page JSON");
+        assert_eq!(found_messages(last).next, None);
+        let in_chat: enums::FoundChatMessages = serde_json::from_value(json!({
+            "@type": "foundChatMessages", "total_count": 57,
+            "messages": [message_json(90, Value::Null, Value::Null), message_json(80, Value::Null, Value::Null)],
+            "next_from_message_id": 80,
+        }))
+        .expect("foundChatMessages JSON");
+        let found = found_chat_messages(in_chat);
+        assert_eq!((found.total, found.next), (57, Some(Cursor::From(80))));
+        assert_eq!(found.msgs[0].body.text, "hi");
+        let empty: enums::FoundChatMessages = serde_json::from_value(json!({
+            "@type": "foundChatMessages", "total_count": 57, "messages": [], "next_from_message_id": 80,
+        }))
+        .expect("empty page JSON");
+        assert_eq!(
+            found_chat_messages(empty).next,
+            None,
+            "an empty page ends paging"
+        );
+    }
+
+    #[test]
+    fn peers_merge_dedupe_and_report_errors() {
+        let chats = |ids: Value| -> Reply<enums::Chats> {
+            let v = json!({"@type": "chats", "total_count": 9, "chat_ids": ids});
+            Ok(serde_json::from_value(v).expect("chats JSON"))
+        };
+        let users: Reply<enums::Users> = Ok(serde_json::from_value(
+            json!({"@type": "users", "total_count": 2, "user_ids": [5, 6]}),
+        )
+        .expect("users JSON"));
+        let peers = peers_from(
+            vec![chats(json!([1, 2])), chats(json!([2, 3]))],
+            Some(users),
+            Some(chats(json!([3, 4]))),
+        );
+        assert_eq!(
+            peers,
+            Peers {
+                known: vec![1, 2, 3],
+                contacts: vec![5, 6],
+                public: vec![4],
+                errors: Vec::new(),
+            }
+        );
+        let peers = peers_from(
+            vec![chats(json!([1])), Err(tl_error(500, "Request aborted"))],
+            None,
+            Some(Err(tl_error(429, "Too Many Requests: retry after 5"))),
+        );
+        assert_eq!(peers.known, vec![1]);
+        assert_eq!(
+            peers.errors,
+            vec![
+                "Couldn't search chats: the request was cancelled".to_owned(),
+                "Couldn't search globally: too many requests, try again in 5 s".to_owned(),
+            ]
+        );
+    }
+
+    #[test]
+    fn telegram_errors_read_as_plain_sentences() {
+        let cases = [
+            (
+                429,
+                "Too Many Requests: retry after 17",
+                "Too many requests, try again in 17 s",
+            ),
+            (
+                420,
+                "FLOOD_WAIT_300",
+                "Too many requests, try again in 5 min",
+            ),
+            (
+                420,
+                "FLOOD_WAIT_7200",
+                "Too many requests, try again in 2 h",
+            ),
+            (
+                429,
+                "Too Many Requests",
+                "Too many requests, try again later",
+            ),
+            (
+                400,
+                "SLOWMODE_WAIT_30",
+                "Slow mode is on, try again in 30 s",
+            ),
+            (403, "CHAT_WRITE_FORBIDDEN", "You can't send messages here"),
+            (
+                400,
+                "Have no write access to the chat",
+                "You can't send messages here",
+            ),
+            (
+                400,
+                "MESSAGE_ID_INVALID",
+                "This message is no longer available",
+            ),
+            (
+                400,
+                "CHANNEL_PRIVATE",
+                "This channel is private or you were removed from it",
+            ),
+            (
+                400,
+                "USER_IS_BLOCKED",
+                "This user has restricted who can message them",
+            ),
+            (400, "PEER_ID_INVALID", "This chat is not available"),
+            (
+                400,
+                "FILE_REFERENCE_EXPIRED",
+                "The file link expired; reopen the chat and try again",
+            ),
+            (
+                400,
+                "Not enough rights to send photos to the chat",
+                "You don't have the rights to send photos to the chat",
+            ),
+            (500, "Request aborted", "The request was cancelled"),
+            (
+                -1,
+                "Connection closed",
+                "No connection to Telegram; try again",
+            ),
+            (
+                400,
+                "SOMETHING_NEW",
+                "Telegram refused the request (SOMETHING_NEW)",
+            ),
+            (400, "some readable text", "Some readable text"),
+        ];
+        for (code, message, want) in cases {
+            assert_eq!(friendly_error(&tl_error(code, message)), want, "{message}");
+        }
+        assert_eq!(
+            failed("send the message", "You can't send messages here"),
+            "Couldn't send the message: you can't send messages here"
+        );
+        assert_eq!(
+            failed("join", "Telegram refused the request (X)"),
+            "Couldn't join: Telegram refused the request (X)"
+        );
+        assert_eq!(
+            failed("copy", "TDLib is gone"),
+            "Couldn't copy: TDLib is gone"
+        );
+        assert_eq!(failure_label("mark read"), "mark messages as read");
+        assert_eq!(failure_label("leave chat"), "leave the chat");
+    }
+
+    #[test]
+    fn drafts_convert_from_tdlib_without_formatting() {
+        let d: types::DraftMessage = serde_json::from_value(json!({
+            "reply_to": {
+                "@type": "inputMessageReplyToMessage", "message_id": 42,
+                "quote": {"text": {"text": "part", "entities": []}, "position": 3},
+                "checklist_task_id": 0
+            },
+            "date": 1,
+            "input_message_text": {
+                "@type": "inputMessageText",
+                "text": {"text": "hello", "entities": []},
+                "link_preview_options": null, "clear_draft": false
+            },
+            "effect_id": "0", "suggested_post_info": null
+        }))
+        .expect("draft JSON");
+        let (draft, problem) = convert_draft(&d);
+        assert_eq!(problem, None);
+        assert_eq!(
+            draft,
+            Some(model::Draft {
+                text: "hello".to_owned(),
+                reply_to: Some(42),
+                quote: Some(("part".to_owned(), 3)),
+            })
+        );
+        let empty: types::DraftMessage = serde_json::from_value(json!({
+            "reply_to": null, "date": 1,
+            "input_message_text": {
+                "@type": "inputMessageText",
+                "text": {"text": "  ", "entities": []},
+                "link_preview_options": null, "clear_draft": false
+            },
+            "effect_id": "0", "suggested_post_info": null
+        }))
+        .expect("empty draft JSON");
+        assert_eq!(convert_draft(&empty), (None, None));
+    }
+
+    #[test]
+    fn message_by_date_treats_404_as_nothing_found() {
+        let m: enums::Message = serde_json::from_value(message_json(
+            44,
+            json!({"@type": "messageTopicForum", "forum_topic_id": 3}),
+            Value::Null,
+        ))
+        .expect("message JSON");
+        assert_eq!(dated(Ok(m)), Ok(Some((44, Some(3)))));
+        assert_eq!(dated(Err(tl_error(404, "Not Found"))), Ok(None));
+        assert_eq!(
+            dated(Err(tl_error(400, "CHAT_ID_INVALID"))),
+            Err("This chat is not available".to_owned())
+        );
     }
 }

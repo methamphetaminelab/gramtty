@@ -2,7 +2,6 @@ use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
 
-use ratatui::layout::Constraint;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::symbols::border;
 use ratatui::widgets::{Block, Borders};
@@ -256,10 +255,10 @@ pub enum PaneWidth {
 }
 
 impl PaneWidth {
-    pub fn constraint(self) -> Constraint {
+    pub fn cols(self, total: u16) -> u16 {
         match self {
-            PaneWidth::Cols(n) => Constraint::Length(n),
-            PaneWidth::Percent(p) => Constraint::Percentage(p),
+            PaneWidth::Cols(n) => n,
+            PaneWidth::Percent(p) => (u32::from(total) * u32::from(p) / 100) as u16,
         }
     }
 }

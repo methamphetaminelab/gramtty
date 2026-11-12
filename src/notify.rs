@@ -189,6 +189,14 @@ pub fn send(title: String, body: String, icon: Option<String>, tx: UnboundedSend
     });
 }
 
+const SOUND_TOOLS: &str = if cfg!(target_os = "macos") {
+    "afplay or mpv"
+} else if cfg!(windows) {
+    "mpv"
+} else {
+    "pw-play, canberra-gtk-play or mpv"
+};
+
 pub const DEFAULT_SOUND: &[u8] = include_bytes!("../assets/msg_incoming.ogg");
 pub const DEFAULT_SOUND_NAME: &str = "msg_incoming.ogg";
 
@@ -316,7 +324,7 @@ pub fn sound_command(
     if env.mpv {
         return Ok(Some(mpv_sound(volume, file, builtin)));
     }
-    Err("notification sound needs pw-play, canberra-gtk-play or mpv".to_owned())
+    Err(format!("notification sound needs {SOUND_TOOLS}"))
 }
 
 fn write_default_sound(path: &Path) -> std::io::Result<()> {

@@ -1,4 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Chord {
@@ -52,15 +53,166 @@ impl Chord {
     }
 }
 
-const LAYOUT_RU: &str = "йцукенгшщзхъфывапролджэячсмитьбюё";
-const LAYOUT_EN: &str = "qwertyuiop[]asdfghjkl;'zxcvbnm,.`";
-const LAYOUT_RU_SHIFT: &str = "ЙЦУКЕНГШЩЗХЪФЫВАПРОЛДЖЭЯЧСМИТЬБЮЁ";
-const LAYOUT_EN_SHIFT: &str = "QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>~";
+const QWERTY: (&str, &str) = (
+    "`1234567890-=qwertyuiop[]\\asdfghjkl;'zxcvbnm,./",
+    "~!@#$%^&*()_+QWERTYUIOP{}|ASDFGHJKL:\"ZXCVBNM<>?",
+);
 
-pub fn latin_key(c: char) -> Option<char> {
-    [(LAYOUT_RU, LAYOUT_EN), (LAYOUT_RU_SHIFT, LAYOUT_EN_SHIFT)]
+const LAYOUTS: [(&str, &str, &str); 15] = [
+    (
+        "ru",
+        "ё1234567890-=йцукенгшщзхъ\\фывапролджэячсмитьбю.",
+        "Ё!\"№;%:?*()_+ЙЦУКЕНГШЩЗХЪ/ФЫВАПРОЛДЖЭЯЧСМИТЬБЮ,",
+    ),
+    (
+        "uk",
+        "'1234567890-=йцукенгшщзхїґфівапролджєячсмитьбю.",
+        "ʼ!\"№;%:?*()_+ЙЦУКЕНГШЩЗХЇҐФІВАПРОЛДЖЄЯЧСМИТЬБЮ,",
+    ),
+    (
+        "be",
+        "ё1234567890-=йцукенгшўзх'\\фывапролджэячсмітьбю.",
+        "Ё!\"№;%:?*()_+ЙЦУКЕНГШЎЗХ'/ФЫВАПРОЛДЖЭЯЧСМІТЬБЮ,",
+    ),
+    (
+        "kk",
+        "(\"әіңғ,.үұқөһйцукенгшщзхъ\\фывапролджэячсмитьбю№",
+        ")!ӘІҢҒ;:ҮҰҚӨҺЙЦУКЕНГШЩЗХЪ/ФЫВАПРОЛДЖЭЯЧСМИТЬБЮ?",
+    ),
+    (
+        "bg",
+        "(1234567890-.,уеишщксдзц;„ьяаожгтнвмчюйъэфхпрлб",
+        ")!?+\"%=:/–№$€ыУЕИШЩКСДЗЦ§“ѝЯАОЖГТНВМЧЮЙЪЭФХПРЛБ",
+    ),
+    (
+        "sr",
+        "`1234567890'+љњертзуиопшђ\\асдфгхјклчћжџцвбнм,.-",
+        "~!\"#$%&/()=?*ЉЊЕРТЗУИОПШЂ|АСДФГХЈКЛЧЋЖЏЦВБНМ;:_",
+    ),
+    (
+        "mk",
+        "`1234567890-=љњертѕуиопшѓжасдфгхјклчќзџцвбнм,./",
+        "~!„“$%^&*()_+ЉЊЕРТЅУИОПШЃЖАСДФГХЈКЛЧЌЗЏЦВБНМ;:?",
+    ),
+    (
+        "el",
+        "`1234567890-=;ςερτυθιοπ[]\\ασδφγηξκλ;'ζχψωβνμ,./",
+        "~!@#$%^&*()_+:WΕΡΤΥΘΙΟΠ{}|ΑΣΔΦΓΗΞΚΛ:\"ΖΧΨΩΒΝΜ<>?",
+    ),
+    (
+        "he",
+        ";1234567890-=/'קראטוןםפ][\\שדגכעיחלךף,זסבהנמצתץ.",
+        "~!@#$%^&*)(_+QWERTYUIOP}{|ASDFGHJKL:\"ZXCVBNM><?",
+    ),
+    (
+        "ar",
+        "ذ1234567890-=ضصثقفغعهخحجد\\شسيبلاتنمكطئءؤرﻻىةوزظ",
+        "ّ!@#$%^&*)(_+ًٌَُﻹإ`÷×؛<>|ٍِ][ﻷأـ،/:\"~ْ}{ﻵآ',.؟",
+    ),
+    (
+        "fa",
+        "`۱۲۳۴۵۶۷۸۹۰-=ضصثقفغعهخحجچ\\شسیبلاتنمکگظطزرذدپو./",
+        "÷!٬٫﷼٪×،*)(ـ+ًٌٍَُِّْ][}{|ؤئيإأآة»«:؛كٓژٰBٔء><؟",
+    ),
+    (
+        "ka",
+        "„1234567890-=ქწერტყუიოპ[]\\ასდფგჰჯკლ;'ზხცვბნმ,./",
+        "“!@#$%^&*()_+QჭEღთYUIOP{}|AშDFGHჟKL:\"ძXჩVBNM<>?",
+    ),
+    (
+        "hy",
+        "՝։ձյ՛,-.«»օռժխւէրտեըիոպչջ'ասդֆգհճկլթփզցքվբնմշղծ",
+        "՜1ՁՅ349և()ՕՌԺԽՒԷՐՏԵԸԻՈՊՉՋ՞ԱՍԴՖԳՀՃԿԼԹՓԶՑՔՎԲՆՄՇՂԾ",
+    ),
+    (
+        "th",
+        "_ๅ/-ภถุึคตจขชๆไำพะัีรนยบลฃฟหกดเ้่าสวงผปแอิืทมใฝ",
+        "%+๑๒๓๔ู฿๕๖๗๘๙๐\"ฎฑธํ๊ณฯญฐ,ฅฤฆฏโฌ็๋ษศซ.()ฉฮฺ์?ฒฬฦ",
+    ),
+    (
+        "ko",
+        "`1234567890-=ㅂㅈㄷㄱㅅㅛㅕㅑㅐㅔ[]\\ㅁㄴㅇㄹㅎㅗㅓㅏㅣ;'ㅋㅌㅊㅍㅠㅜㅡ,./",
+        "~!@#$%^&*()_+ㅃㅉㄸㄲㅆYUIㅒㅖ{}|ASDFGHJKL:\"ZXCVBNM<>?",
+    ),
+];
+
+fn layout_char(c: char) -> bool {
+    c >= '\u{370}' && !('\u{2000}'..='\u{20cf}').contains(&c)
+}
+
+fn qwerty_in(layout: usize, c: char) -> Option<char> {
+    let (_, base, shift) = LAYOUTS[layout];
+    [(base, QWERTY.0), (shift, QWERTY.1)]
         .into_iter()
-        .find_map(|(ru, en)| en.chars().nth(ru.chars().position(|r| r == c)?))
+        .find_map(|(keys, us)| us.chars().nth(keys.chars().position(|k| k == c)?))
+}
+
+fn holders(c: char) -> u32 {
+    if !layout_char(c) {
+        return 0;
+    }
+    (0..LAYOUTS.len())
+        .filter(|i| qwerty_in(*i, c).is_some())
+        .fold(0, |mask, i| mask | 1 << i)
+}
+
+fn narrow(likely: u32, found: u32) -> u32 {
+    if likely & found != 0 {
+        likely & found
+    } else {
+        found
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LayoutGuess {
+    likely: u32,
+}
+
+impl LayoutGuess {
+    pub fn for_locale(locale: &str) -> Self {
+        let lang = locale
+            .split(['_', '.', '@', '-'])
+            .next()
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let likely = LAYOUTS
+            .iter()
+            .position(|(l, _, _)| *l == lang)
+            .map_or(0, |i| 1 << i);
+        Self { likely }
+    }
+
+    pub fn from_env() -> Self {
+        ["LC_ALL", "LC_CTYPE", "LANG"]
+            .iter()
+            .filter_map(|k| std::env::var(k).ok())
+            .find(|v| !v.is_empty())
+            .map_or_else(Self::default, |v| Self::for_locale(&v))
+    }
+
+    pub fn observe(&mut self, c: char) {
+        let found = holders(c);
+        if found != 0 {
+            self.likely = narrow(self.likely, found);
+        }
+    }
+
+    pub fn latin(&self, c: char) -> Option<char> {
+        match narrow(self.likely, holders(c)) {
+            0 => None,
+            found => qwerty_in(found.trailing_zeros() as usize, c),
+        }
+    }
+
+    pub fn latin_event(&self, mut key: KeyEvent) -> KeyEvent {
+        if let KeyCode::Char(c) = key.code
+            && let Some(l) = self.latin(c)
+        {
+            key.code = KeyCode::Char(l);
+        }
+        key
+    }
 }
 
 fn normalize(code: KeyCode, mods: KeyModifiers) -> Chord {
@@ -149,6 +301,10 @@ pub enum Action {
     MarkMessage,
     SelectText,
     OpenSharedMedia,
+    NextSearchResult,
+    PreviousSearchResult,
+    ShowHelp,
+    ShowStatusLog,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -171,6 +327,124 @@ impl Group {
         }
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Section {
+    Global,
+    Chats,
+    Messages,
+    Composer,
+    Viewer,
+    Popups,
+}
+
+impl Section {
+    pub const ALL: [Section; 6] = [
+        Section::Global,
+        Section::Chats,
+        Section::Messages,
+        Section::Composer,
+        Section::Viewer,
+        Section::Popups,
+    ];
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Section::Global => "Global",
+            Section::Chats => "Chats",
+            Section::Messages => "Messages",
+            Section::Composer => "Composer",
+            Section::Viewer => "Viewer",
+            Section::Popups => "Popups, menus and search",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HelpLine {
+    Title(Section),
+    Row {
+        keys: String,
+        desc: &'static str,
+        action: Option<Action>,
+    },
+    Blank,
+}
+
+const HELP_EXTRA: [(Section, &str, &str); 28] = [
+    (
+        Section::Global,
+        "Enter",
+        "open chat; on a message, its actions",
+    ),
+    (
+        Section::Global,
+        "Esc",
+        "clear marks, reply or filter; deselect",
+    ),
+    (Section::Global, "<C-n>, <C-p>", "next, previous"),
+    (Section::Global, "<C-c>", "quit"),
+    (Section::Composer, "Enter", "send"),
+    (Section::Composer, "<S-Enter> <A-Enter> <C-j>", "new line"),
+    (
+        Section::Composer,
+        "Esc",
+        "leave the composer, keeping the draft",
+    ),
+    (Section::Composer, "<C-o>, <C-v>", "attach a file, paste"),
+    (
+        Section::Composer,
+        "<C-r>",
+        "record voice (Enter sends, Esc cancels)",
+    ),
+    (Section::Composer, "<C-s>, <C-g>", "stickers, GIFs"),
+    (Section::Composer, "<C-k>", "bot buttons"),
+    (Section::Composer, "<C-n>", "next unread chat"),
+    (
+        Section::Composer,
+        "Tab",
+        "complete /command, @mention; attachments",
+    ),
+    (
+        Section::Composer,
+        "j k, J K, f, d",
+        "attachments: select, move, as file, drop",
+    ),
+    (Section::Viewer, "j k, l h", "next, previous"),
+    (Section::Viewer, "Space", "pause or play"),
+    (
+        Section::Viewer,
+        "← →, ↑ ↓, m",
+        "while playing: seek, volume, mute",
+    ),
+    (Section::Viewer, "x, Enter", "play in mpv or open"),
+    (
+        Section::Viewer,
+        "s, o",
+        "save to Downloads, open externally",
+    ),
+    (Section::Viewer, "Esc, q, v", "close"),
+    (Section::Popups, "j k, ↑ ↓, <C-n> <C-p>", "move"),
+    (Section::Popups, "PgDn PgUp, Home End", "page, first, last"),
+    (Section::Popups, "a-z", "run the menu item with that key"),
+    (Section::Popups, "Enter", "run or open the selected item"),
+    (Section::Popups, "Esc, q", "close"),
+    (
+        Section::Popups,
+        "Tab, S-Tab",
+        "search: next/previous section or media",
+    ),
+    (
+        Section::Popups,
+        "<A-Enter>",
+        "search: join the selected chat",
+    ),
+    (
+        Section::Popups,
+        "h j k l w b, v, y",
+        "text selection: move, select, copy",
+    ),
+];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hint {
@@ -216,8 +490,8 @@ impl Action {
             Action::ToggleChatPane => (Group::Panes, 1),
             Action::ToggleInfoPane => (Group::Panes, 2),
             Action::RefreshScreen => (Group::Panes, 3),
-            Action::Quit => (Group::Account, 1),
-            Action::LogOut => (Group::Account, 2),
+            Action::Quit => (Group::Account, 2),
+            Action::LogOut => (Group::Account, 3),
             Action::CopyMessage => (Group::Message, 6),
             Action::ReactMessage => (Group::Message, 7),
             Action::ForwardMessage => (Group::Message, 8),
@@ -231,7 +505,7 @@ impl Action {
             Action::OpenInbox => (Group::Navigate, 21),
             Action::MarkChatRead => (Group::Navigate, 22),
             Action::OpenBotKeyboard => (Group::Compose, 4),
-            Action::OpenOptions => (Group::Account, 0),
+            Action::OpenOptions => (Group::Account, 1),
             Action::JumpToPinned => (Group::Navigate, 23),
             Action::OpenNextUnread => (Group::Navigate, 24),
             Action::JumpToNextMention => (Group::Navigate, 25),
@@ -242,6 +516,79 @@ impl Action {
             Action::MarkMessage => (Group::Message, 16),
             Action::SelectText => (Group::Message, 17),
             Action::OpenSharedMedia => (Group::Navigate, 29),
+            Action::NextSearchResult => (Group::Navigate, 30),
+            Action::PreviousSearchResult => (Group::Navigate, 31),
+            Action::ShowHelp => (Group::Account, 0),
+            Action::ShowStatusLog => (Group::Panes, 4),
+        }
+    }
+
+    pub fn section(self) -> (Section, u8) {
+        match self {
+            Action::ShowHelp => (Section::Global, 0),
+            Action::ChatSwitcher => (Section::Global, 1),
+            Action::SearchMessages => (Section::Global, 2),
+            Action::OpenPaneActions => (Section::Global, 3),
+            Action::OpenPaneFilter => (Section::Global, 4),
+            Action::FocusFolderPane => (Section::Global, 5),
+            Action::FocusChatPane => (Section::Global, 6),
+            Action::FocusMessagePane => (Section::Global, 7),
+            Action::FocusInfoPane => (Section::Global, 8),
+            Action::CycleFocusNext => (Section::Global, 9),
+            Action::CycleFocusPrevious => (Section::Global, 10),
+            Action::SelectNext => (Section::Global, 11),
+            Action::SelectPrevious => (Section::Global, 12),
+            Action::HalfPageDown => (Section::Global, 13),
+            Action::HalfPageUp => (Section::Global, 14),
+            Action::PageDown => (Section::Global, 15),
+            Action::PageUp => (Section::Global, 16),
+            Action::JumpTop => (Section::Global, 17),
+            Action::JumpBottom => (Section::Global, 18),
+            Action::ToggleFolderPane => (Section::Global, 19),
+            Action::ToggleChatPane => (Section::Global, 20),
+            Action::ToggleInfoPane => (Section::Global, 21),
+            Action::OpenInbox => (Section::Global, 22),
+            Action::OpenOptions => (Section::Global, 23),
+            Action::RefreshScreen => (Section::Global, 24),
+            Action::ShowStatusLog => (Section::Global, 25),
+            Action::ClosePopup => (Section::Global, 26),
+            Action::Quit => (Section::Global, 27),
+            Action::LogOut => (Section::Global, 28),
+            Action::OpenNextUnread => (Section::Chats, 0),
+            Action::JumpToNextMention => (Section::Chats, 1),
+            Action::JumpToNextReaction => (Section::Chats, 2),
+            Action::MarkChatRead => (Section::Chats, 3),
+            Action::OpenProfile => (Section::Chats, 4),
+            Action::ShowPinned => (Section::Chats, 5),
+            Action::JumpToPinned => (Section::Chats, 6),
+            Action::OpenSharedMedia => (Section::Chats, 7),
+            Action::NextSearchResult => (Section::Chats, 8),
+            Action::PreviousSearchResult => (Section::Chats, 9),
+            Action::ReplyMessage => (Section::Messages, 0),
+            Action::EditMessage => (Section::Messages, 1),
+            Action::DeleteMessage => (Section::Messages, 2),
+            Action::ReactMessage => (Section::Messages, 3),
+            Action::ForwardMessage => (Section::Messages, 4),
+            Action::CopyMessage => (Section::Messages, 5),
+            Action::PinMessage => (Section::Messages, 6),
+            Action::OpenMessageUrl => (Section::Messages, 7),
+            Action::PlayMedia => (Section::Messages, 8),
+            Action::ViewAttachment => (Section::Messages, 9),
+            Action::MarkMessage => (Section::Messages, 10),
+            Action::SelectText => (Section::Messages, 11),
+            Action::ScrollViewportDown => (Section::Messages, 12),
+            Action::ScrollViewportUp => (Section::Messages, 13),
+            Action::GoToReply => (Section::Messages, 14),
+            Action::ShowMessageProfile => (Section::Messages, 15),
+            Action::ShowReactionUsers => (Section::Messages, 16),
+            Action::CopyQuote => (Section::Messages, 17),
+            Action::TranslateMessage => (Section::Messages, 18),
+            Action::SaveMessage => (Section::Messages, 19),
+            Action::StartComposer => (Section::Composer, 0),
+            Action::AttachFile => (Section::Composer, 1),
+            Action::RecordVoice => (Section::Composer, 2),
+            Action::OpenStickers => (Section::Composer, 3),
+            Action::OpenBotKeyboard => (Section::Composer, 4),
         }
     }
 
@@ -249,7 +596,7 @@ impl Action {
         matches!(self, Action::LogOut | Action::DeleteMessage)
     }
 
-    pub const ALL: [Action; 60] = [
+    pub const ALL: [Action; 64] = [
         Action::StartComposer,
         Action::OpenPaneFilter,
         Action::ClosePopup,
@@ -310,6 +657,10 @@ impl Action {
         Action::MarkMessage,
         Action::SelectText,
         Action::OpenSharedMedia,
+        Action::NextSearchResult,
+        Action::PreviousSearchResult,
+        Action::ShowHelp,
+        Action::ShowStatusLog,
     ];
 
     pub fn name(self) -> &'static str {
@@ -374,6 +725,10 @@ impl Action {
             Action::MarkMessage => "MarkMessage",
             Action::SelectText => "SelectMessageText",
             Action::OpenSharedMedia => "OpenSharedMedia",
+            Action::NextSearchResult => "NextSearchResult",
+            Action::PreviousSearchResult => "PreviousSearchResult",
+            Action::ShowHelp => "ShowKeyBindings",
+            Action::ShowStatusLog => "ShowStatusLog",
         }
     }
 
@@ -406,7 +761,7 @@ impl Action {
             Action::ReplyMessage => "reply",
             Action::DeleteMessage => "delete",
             Action::EditMessage => "edit",
-            Action::OpenMessageUrl => "open url",
+            Action::OpenMessageUrl => "open link / mention",
             Action::PlayMedia => "play / open media",
             Action::ViewAttachment => "view attachment",
             Action::ToggleFolderPane => "toggle folders",
@@ -443,6 +798,10 @@ impl Action {
             Action::MarkMessage => "mark / unmark message",
             Action::SelectText => "select text to copy",
             Action::OpenSharedMedia => "shared media",
+            Action::NextSearchResult => "next result of the chat search",
+            Action::PreviousSearchResult => "previous result of the chat search",
+            Action::ShowHelp => "all key bindings",
+            Action::ShowStatusLog => "recent notices and errors",
         }
     }
 
@@ -506,6 +865,10 @@ impl Action {
             Action::MarkMessage => &["m"],
             Action::SelectText => &["V"],
             Action::OpenSharedMedia => &["<leader>g"],
+            Action::NextSearchResult => &["n"],
+            Action::PreviousSearchResult => &["N"],
+            Action::ShowHelp => &["?", "<leader>?"],
+            Action::ShowStatusLog => &["<leader>M"],
         }
     }
 }
@@ -717,11 +1080,11 @@ impl Keymap {
         if prefix { Feed::Pending } else { Feed::Unbound }
     }
 
-    pub fn layout_fallback(&self, pending: &[Chord], chord: Chord) -> Chord {
+    pub fn layout_fallback(&self, pending: &[Chord], chord: Chord, guess: &LayoutGuess) -> Chord {
         let KeyCode::Char(c) = chord.code else {
             return chord;
         };
-        match latin_key(c) {
+        match guess.latin(c) {
             Some(l) if self.feed(pending, chord) == Feed::Unbound => {
                 Chord::new(KeyCode::Char(l), chord.mods)
             }
@@ -775,20 +1138,86 @@ impl Keymap {
     }
 
     pub fn label_for(&self, action: Action) -> Option<String> {
+        self.labels_for(action).into_iter().next()
+    }
+
+    pub fn labels_for(&self, action: Action) -> Vec<String> {
         self.bindings
             .iter()
-            .find(|(_, a)| *a == action)
-            .map(|(keys, _)| {
-                keys.iter()
-                    .map(|c| {
-                        if *c == self.leader {
-                            "<leader>".to_owned()
-                        } else {
-                            c.label()
-                        }
-                    })
-                    .collect()
-            })
+            .filter(|(_, a)| *a == action)
+            .map(|(keys, _)| sequence_label(keys))
+            .collect()
+    }
+
+    pub fn help(&self) -> Vec<HelpLine> {
+        let mut out = Vec::new();
+        for section in Section::ALL {
+            if !out.is_empty() {
+                out.push(HelpLine::Blank);
+            }
+            out.push(HelpLine::Title(section));
+            let mut actions: Vec<Action> = Action::ALL
+                .into_iter()
+                .filter(|a| a.section().0 == section)
+                .collect();
+            actions.sort_by_key(|a| a.section());
+            out.extend(actions.into_iter().map(|a| HelpLine::Row {
+                keys: self.labels_for(a).join(", "),
+                desc: a.description(),
+                action: Some(a),
+            }));
+            out.extend(HELP_EXTRA.iter().filter(|(s, _, _)| *s == section).map(
+                |(_, keys, desc)| HelpLine::Row {
+                    keys: (*keys).to_owned(),
+                    desc,
+                    action: None,
+                },
+            ));
+        }
+        out
+    }
+
+    pub fn help_text(&self) -> String {
+        let lines = self.help();
+        let width = |f: fn(&HelpLine) -> usize| lines.iter().map(f).max().unwrap_or(0);
+        let key_w = width(|l| match l {
+            HelpLine::Row { keys, .. } => keys.width(),
+            _ => 0,
+        })
+        .max(1);
+        let desc_w = width(|l| match l {
+            HelpLine::Row { desc, .. } => desc.width(),
+            _ => 0,
+        });
+        let mut out = String::new();
+        for line in &lines {
+            let text = match line {
+                HelpLine::Title(s) => s.title().to_owned(),
+                HelpLine::Blank => String::new(),
+                HelpLine::Row { keys, desc, action } => {
+                    let keys = if keys.is_empty() { "-" } else { keys };
+                    let row = format!(
+                        "  {keys}{}  {desc}{}  {}",
+                        " ".repeat(key_w - keys.width()),
+                        " ".repeat(desc_w - desc.width()),
+                        action.map_or("", |a| a.name())
+                    );
+                    row.trim_end().to_owned()
+                }
+            };
+            out.push_str(&text);
+            out.push('\n');
+        }
+        out
+    }
+}
+
+fn sequence_label(keys: &[Chord]) -> String {
+    let parts: Vec<String> = keys.iter().map(Chord::label).collect();
+    if parts.iter().all(|p| p.chars().count() == 1) {
+        parts.concat()
+    } else {
+        parts.join(" ")
     }
 }
 
@@ -948,6 +1377,7 @@ Bogus = "x"
             Feed::Action(Action::ChatSwitcher)
         );
         assert_eq!(map.feed(&[], space()), Feed::Unbound);
+        assert_eq!(map.label_for(Action::ChatSwitcher).unwrap(), ",,");
     }
 
     #[test]
@@ -975,10 +1405,8 @@ Bogus = "x"
                 .iter()
                 .any(|h| h.key == "Space" && h.desc == "find chat")
         );
-        assert_eq!(
-            map.label_for(Action::ChatSwitcher).unwrap(),
-            "<leader><leader>"
-        );
+        assert_eq!(map.label_for(Action::ChatSwitcher).unwrap(), "Space Space");
+        assert_eq!(map.label_for(Action::OpenProfile).unwrap(), "Space p");
     }
 
     #[test]
@@ -996,8 +1424,8 @@ Bogus = "x"
             [
                 vec!["Space", "a", "p", "P", "/", "n", "m", "g"],
                 vec!["u", "v", "s", "k"],
-                vec!["1", "2", "4", "r"],
-                vec!["o", "L"]
+                vec!["1", "2", "4", "r", "M"],
+                vec!["?", "o", "L"]
             ]
         );
         assert!(
@@ -1012,5 +1440,182 @@ Bogus = "x"
         );
         let total: usize = groups.iter().map(|(_, h)| h.len()).sum();
         assert_eq!(total, map.continuations(&[space()]).len());
+    }
+
+    #[test]
+    fn help_lists_every_action_once_in_its_section_with_remaps() {
+        let raw = "[keymap]\nReplyMessage = \"<leader>R\"\nGoToReferencedMessage = \"gr\"\n";
+        let mut warnings = Vec::new();
+        let map = Keymap::from_toml(raw, &mut warnings).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        let help = map.help();
+        let titles: Vec<Section> = help
+            .iter()
+            .filter_map(|l| match l {
+                HelpLine::Title(s) => Some(*s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(titles, Section::ALL);
+        let keys_of = |action: Action| -> Vec<&str> {
+            help.iter()
+                .filter_map(|l| match l {
+                    HelpLine::Row {
+                        keys,
+                        action: Some(a),
+                        ..
+                    } if *a == action => Some(keys.as_str()),
+                    _ => None,
+                })
+                .collect()
+        };
+        for action in Action::ALL {
+            assert_eq!(keys_of(action).len(), 1, "{action:?}");
+        }
+        assert_eq!(keys_of(Action::ReplyMessage), ["Space R"]);
+        assert_eq!(keys_of(Action::GoToReply), ["gr"]);
+        assert_eq!(keys_of(Action::ShowReactionUsers), [""]);
+        assert_eq!(keys_of(Action::SelectNext), ["j, ↓"]);
+        assert_eq!(keys_of(Action::ShowHelp), ["?, Space ?"]);
+        assert_eq!(keys_of(Action::ShowStatusLog), ["Space M"]);
+        assert_eq!(keys_of(Action::CycleFocusPrevious), ["S-Tab, h, ←"]);
+        let mut section = Section::Global;
+        for line in &help {
+            match line {
+                HelpLine::Title(s) => section = *s,
+                HelpLine::Row {
+                    action: Some(a), ..
+                } => assert_eq!(a.section().0, section, "{a:?}"),
+                _ => {}
+            }
+        }
+        let text = map.help_text();
+        assert!(text.starts_with("Global\n"), "{text}");
+        let reply = text.lines().find(|l| l.contains("ReplyMessage")).unwrap();
+        assert!(reply.starts_with("  Space R "), "{reply}");
+        let quote = text.lines().find(|l| l.contains("CopyQuote")).unwrap();
+        assert!(
+            quote.starts_with("  - "),
+            "unbound actions still show their name"
+        );
+        assert!(
+            text.contains("\nViewer\n") && text.contains("\nPopups, menus and search\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn every_layout_row_lines_up_with_qwerty() {
+        for (lang, base, shift) in LAYOUTS {
+            let guess = LayoutGuess::for_locale(lang);
+            assert_ne!(guess, LayoutGuess::default(), "{lang}");
+            let mut seen = Vec::new();
+            for (row, us) in [(base, QWERTY.0), (shift, QWERTY.1)] {
+                assert_eq!(row.chars().count(), us.chars().count(), "{lang}: {row}");
+                for (c, q) in row.chars().zip(us.chars()) {
+                    if layout_char(c) {
+                        assert!(!seen.contains(&c), "{lang}: {c} sits on two keys");
+                        seen.push(c);
+                        assert_eq!(guess.latin(c), Some(q), "{lang}: {c}");
+                    } else {
+                        assert_eq!(guess.latin(c), None, "{lang}: {c:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn known_keys_land_on_the_qwerty_key_at_the_same_place() {
+        let cases = [
+            ("ru", "йолъёЩжэ", "qjk]`O;'"),
+            ("uk", "іїєйо", "s]'qj"),
+            ("be", "ўіыэё", "obs'`"),
+            ("kk", "әіңғүұқөһ№", "2345890-=/"),
+            ("bg", "уеишщкьяотнюб", "wertyuasfjkz/"),
+            ("sr", "љњзјкћџж", "qwyjk'xz"),
+            ("mk", "ѕзѓќјк", "yz]'jk"),
+            ("el", "ςερτυθξκλζψωβσΣ", "wertyujklzcvbsS"),
+            ("he", "קראחלשת", "ertjka,"),
+            ("ar", "ضتنكطذد", "qjk;'`]"),
+            ("fa", "ضتنیکگچپ۱۰دذ", "qjkd;']m10nb"),
+            ("ka", "ქჯკლშჭ", "qjklSW"),
+            ("hy", "խճկլաս", "qjklas"),
+            ("th", "ๆไกด่าสผ", "qwdfjklz"),
+            ("ko", "ㅂㅓㅏㅣㅃㅒ", "qjklQO"),
+        ];
+        assert_eq!(cases.len(), LAYOUTS.len());
+        for (lang, typed, qwerty) in cases {
+            let guess = LayoutGuess::for_locale(lang);
+            let got: String = typed
+                .chars()
+                .map(|c| guess.latin(c).unwrap_or('?'))
+                .collect();
+            assert_eq!(got, qwerty, "{lang}");
+        }
+    }
+
+    #[test]
+    fn latin_letters_and_shared_symbols_are_never_remapped() {
+        for (lang, _, _) in LAYOUTS {
+            let guess = LayoutGuess::for_locale(lang);
+            for c in ('\0'..='\u{36f}').chain("ẞạ€„“–".chars()) {
+                assert_eq!(guess.latin(c), None, "{lang}: {c:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_guess_follows_letters_only_some_layouts_have() {
+        let mut guess = LayoutGuess::default();
+        assert_eq!(guess.latin('к'), Some('r'));
+        guess.observe('ј');
+        assert_eq!(guess.latin('к'), Some('k'));
+        assert_eq!(guess.latin('з'), Some('y'));
+        guess.observe('ѓ');
+        assert_eq!(guess.latin('з'), Some('z'));
+        guess.observe('ы');
+        assert_eq!(guess.latin('к'), Some('r'));
+        guess.observe('і');
+        assert_eq!(
+            guess.latin('і'),
+            Some('b'),
+            "ы and і together mean Belarusian"
+        );
+        guess.observe('ї');
+        assert_eq!(guess.latin('і'), Some('s'));
+        let mut guess = LayoutGuess::default();
+        assert_eq!(guess.latin('د'), Some(']'));
+        guess.observe('ی');
+        assert_eq!(guess.latin('د'), Some('n'));
+    }
+
+    #[test]
+    fn the_locale_picks_the_layout_before_anything_is_typed() {
+        assert_eq!(LayoutGuess::for_locale("bg_BG.UTF-8").latin('к'), Some('u'));
+        assert_eq!(LayoutGuess::for_locale("sr_RS").latin('к'), Some('k'));
+        assert_eq!(LayoutGuess::for_locale("ru_RU.UTF-8").latin('к'), Some('r'));
+        assert_eq!(
+            LayoutGuess::for_locale("en_US.UTF-8"),
+            LayoutGuess::default()
+        );
+        assert_eq!(LayoutGuess::for_locale("C"), LayoutGuess::default());
+        let mut bg = LayoutGuess::for_locale("bg_BG.UTF-8");
+        bg.observe('ы');
+        assert_eq!(bg.latin('ы'), Some('Q'));
+    }
+
+    #[test]
+    fn layout_fallback_uses_the_guess_only_for_unbound_chars() {
+        let map = Keymap::default();
+        let mut guess = LayoutGuess::default();
+        assert_eq!(map.layout_fallback(&[], key('о'), &guess), key('j'));
+        assert_eq!(map.layout_fallback(&[], key('j'), &guess), key('j'));
+        guess.observe('љ');
+        assert_eq!(map.layout_fallback(&[], key('о'), &guess), key('o'));
+        let mut warnings = Vec::new();
+        let map = Keymap::from_toml("[keymap]\nSelectNext = \"о\"\n", &mut warnings).unwrap();
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(map.layout_fallback(&[], key('о'), &guess), key('о'));
     }
 }

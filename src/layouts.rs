@@ -171,7 +171,7 @@ pub(super) fn compact_block(
     body.extend(forward_line(app, m, ctx.lang, text_w));
     body.extend(reply_strip(app, m, ctx.lang, text_w));
     let mut images = Vec::new();
-    group_content(
+    let mut texts = group_content(
         app,
         msgs,
         range.clone(),
@@ -226,7 +226,15 @@ pub(super) fn compact_block(
         p.line += top;
         p.col += prefix_w as u16;
     }
-    Rendered { lines, images }
+    for t in &mut texts {
+        t.line += top;
+        t.col += prefix_w as u16;
+    }
+    Rendered {
+        lines,
+        images,
+        texts,
+    }
 }
 
 pub(super) fn minimal_block(
@@ -282,7 +290,7 @@ pub(super) fn minimal_block(
     }
     let mut images = Vec::new();
     let before = body.len();
-    group_content(
+    let mut texts = group_content(
         app,
         msgs,
         range.clone(),
@@ -332,7 +340,15 @@ pub(super) fn minimal_block(
         p.line += top;
         p.col += left as u16;
     }
-    Rendered { lines, images }
+    for t in &mut texts {
+        t.line += top;
+        t.col += left as u16;
+    }
+    Rendered {
+        lines,
+        images,
+        texts,
+    }
 }
 
 fn card_footer(
@@ -365,6 +381,7 @@ struct CardPart {
     last: bool,
     body: Vec<Line<'static>>,
     images: Vec<Place>,
+    texts: Vec<TextPlace>,
     title: Option<String>,
 }
 
@@ -381,7 +398,7 @@ fn card_part(
     body.extend(forward_line(app, m, ctx.lang, inner_max));
     body.extend(reply_strip(app, m, ctx.lang, inner_max));
     let mut images = Vec::new();
-    group_content(app, msgs, range, inner_max, true, &mut body, &mut images);
+    let texts = group_content(app, msgs, range, inner_max, true, &mut body, &mut images);
     if body.is_empty() {
         body.push(Line::default());
     }
@@ -391,6 +408,7 @@ fn card_part(
         last: pos.last,
         body,
         images,
+        texts,
         title,
     }
 }
@@ -489,6 +507,7 @@ pub(super) fn cards_block(
         last: is_last,
         body,
         mut images,
+        mut texts,
         title,
     } = part;
     let outer = inner_w + 4;
@@ -554,11 +573,20 @@ pub(super) fn cards_block(
         p.line += body_top;
         p.col += (x + 2) as u16;
     }
+    for t in &mut texts {
+        t.width = t.width.min((inner_w as u16).saturating_sub(t.col));
+        t.line += body_top;
+        t.col += (x + 2) as u16;
+    }
     if avatar_col && first {
         lines[top].spans[0] = Span::raw(" ".repeat(x - CLASSIC_AVATAR_COLS as usize));
         lines[top].spans.insert(0, classic_avatar(app, m.sender));
     }
-    Rendered { lines, images }
+    Rendered {
+        lines,
+        images,
+        texts,
+    }
 }
 
 pub(super) fn split_block(
@@ -615,7 +643,7 @@ pub(super) fn split_block(
     body.extend(reply_strip(app, m, ctx.lang, max_w));
     let before = body.len();
     let mut images = Vec::new();
-    group_content(
+    let mut texts = group_content(
         app,
         msgs,
         range.clone(),
@@ -649,6 +677,7 @@ pub(super) fn split_block(
     let right = width.saturating_sub(margin);
     let mut lines = lead(ctx, &pos, m.date, true);
     let top = lines.len();
+    let mut shifts = Vec::with_capacity(body.len());
     for l in body {
         let l = fit(l, max_w);
         let shift = if outgoing {
@@ -656,9 +685,14 @@ pub(super) fn split_block(
         } else {
             margin
         };
+        shifts.push(shift);
         let mut spans = vec![Span::raw(" ".repeat(shift))];
         spans.extend(l.spans);
         lines.push(selected_if(Line::from(spans), selected, width));
+    }
+    for t in &mut texts {
+        t.col += shifts[t.line] as u16;
+        t.line += top;
     }
     let image_x = if outgoing {
         right.saturating_sub(image_w.min(max_w))
@@ -669,5 +703,9 @@ pub(super) fn split_block(
         p.line += top;
         p.col += image_x as u16;
     }
-    Rendered { lines, images }
+    Rendered {
+        lines,
+        images,
+        texts,
+    }
 }

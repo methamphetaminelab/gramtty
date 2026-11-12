@@ -171,10 +171,22 @@ const OPENER: &str = "xdg-open";
 #[cfg(target_os = "macos")]
 const OPENER: &str = "open";
 
-pub const OPENER_LABEL: &str = if cfg!(windows) {
-    "default app"
+pub const OPEN_LABEL: &str = if cfg!(target_os = "linux") {
+    "Open with xdg-open"
 } else {
-    "xdg-open"
+    "Open in default app"
+};
+
+pub const OPENED_NOTE: &str = if cfg!(target_os = "linux") {
+    "opened with xdg-open"
+} else {
+    "opened in the default app"
+};
+
+pub const OPEN_HINT: &str = if cfg!(target_os = "linux") {
+    "o xdg-open"
+} else {
+    "o open"
 };
 
 #[cfg(windows)]

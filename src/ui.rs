@@ -27,6 +27,7 @@ use crate::media::{self, Input, Key, Look, Media, Src, album_layout, fit_cells, 
 use crate::model::{self, Attachment, ChatKind, Decode, MediaKind, Msg, SendState, Sender, Visual};
 use crate::popups::draw as draw_stage4_popup;
 use crate::qr;
+use crate::textmap::{self, Hit, Join, Zone};
 use crate::theme;
 
 #[path = "layouts.rs"]
@@ -167,6 +168,9 @@ pub fn draw_frame<W: std::io::Write>(
     }
     app.media.anim.finish(terminal.backend_mut())?;
     app.inline.flush(terminal.backend_mut())?;
+    for seq in std::mem::take(&mut app.terminal_out) {
+        std::io::Write::write_all(terminal.backend_mut(), seq.as_bytes())?;
+    }
     execute!(terminal.backend_mut(), EndSynchronizedUpdate)
 }
 
@@ -182,15 +186,23 @@ pub fn image_layout(buf: &Buffer) -> u64 {
 }
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
+    textmap::begin();
+    paint(frame, app);
+    app.text_map = textmap::finish(frame.buffer_mut(), app.selection.as_ref());
+}
+
+fn paint(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     let th = app.frame_theme();
     theme::install(th.clone());
     app.animating = false;
+    app.redraw_due = None;
     let covered = matches!(app.popup, Some(Popup::Viewer { .. } | Popup::Stickers(_)));
     let unfocused = app.settings.media.pause_unfocused && !app.term_focused;
     app.media.anim.begin(covered || unfocused);
     app.visible_msgs.clear();
     app.prune_typing(std::time::Instant::now());
+    app.expire_status(std::time::Instant::now());
     frame.render_widget(Block::default().style(theme::surface()), area);
     if app.auth != Auth::Ready {
         draw_login(frame, area, app);
@@ -199,29 +211,22 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.refresh_lists();
     let [header, main] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
     draw_header(frame, header, app);
-    let width = |visible: bool, w: theme::PaneWidth| {
-        if visible {
-            w.constraint()
-        } else {
-            Constraint::Length(0)
-        }
-    };
-    let l = &th.layout;
+    let [fw, cw, iw] = pane_widths(main.width, app, &th.layout);
     let [folders, chats, messages, info] = Layout::horizontal([
-        width(app.show_folders, l.folders_width),
-        width(app.show_chats, l.chats_width),
-        Constraint::Min(30),
-        width(app.show_info, l.info_width),
+        Constraint::Length(fw),
+        Constraint::Length(cw),
+        Constraint::Min(0),
+        Constraint::Length(iw),
     ])
     .areas(main);
-    if app.show_folders {
+    if fw > 0 {
         draw_folders(frame, folders, app);
     }
-    if app.show_chats {
+    if cw > 0 {
         draw_chats(frame, chats, app);
     }
     draw_messages(frame, messages, app);
-    if app.show_info {
+    if iw > 0 {
         draw_info(frame, info, app);
     }
     if matches!(app.popup, Some(Popup::Viewer { .. })) {
@@ -233,6 +238,49 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_profile_avatar(frame, area, app);
     }
     draw_key_hint(frame, main, app);
+}
+
+const MIN_MESSAGES: u16 = 30;
+const MIN_FOLDERS: u16 = 16;
+const MIN_CHATS: u16 = 24;
+const MIN_INFO: u16 = 24;
+
+fn pane_widths(total: u16, app: &App, l: &theme::LayoutOptions) -> [u16; 3] {
+    let want = |shown: bool, w: theme::PaneWidth| if shown { w.cols(total) } else { 0 };
+    let mut w = [
+        want(app.show_folders, l.folders_width),
+        want(app.show_chats, l.chats_width),
+        want(app.show_info, l.info_width),
+    ];
+    let floor = |w: &[u16; 3]| {
+        [
+            w[0].min(MIN_FOLDERS),
+            w[1].min(MIN_CHATS),
+            w[2].min(MIN_INFO),
+        ]
+    };
+    let need = |w: [u16; 3]| w.iter().sum::<u16>() + MIN_MESSAGES;
+    if app.focus != Pane::Info {
+        let spare = total.saturating_sub(need([w[0], w[1], 0]));
+        w[2] = if spare >= w[2].min(MIN_INFO) {
+            w[2].min(spare)
+        } else {
+            0
+        };
+    }
+    if need(floor(&w)) > total && app.focus != Pane::Folders {
+        w[0] = 0;
+    }
+    let min = floor(&w);
+    for i in [2, 0, 1] {
+        let over = need(w).saturating_sub(total);
+        w[i] -= over.min(w[i] - min[i]);
+    }
+    for i in [2, 0, 1] {
+        let over = w.iter().sum::<u16>().saturating_sub(total);
+        w[i] -= over.min(w[i]);
+    }
+    w
 }
 
 fn pane_block(title: String, focused: bool) -> Block<'static> {
@@ -250,17 +298,12 @@ fn pane_block(title: String, focused: bool) -> Block<'static> {
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
-    let mut spans = vec![Span::styled(
-        format!(" {APP_NAME} - v{} ", env!("CARGO_PKG_VERSION")),
-        theme::header_title(),
-    )];
+    let width = area.width as usize;
+    let g = &theme::get().glyphs;
+    let mut spans = vec![Span::styled(format!(" {APP_NAME} "), theme::header_title())];
     if let Some(state) = app.connection {
         spans.push(Span::styled(format!(" {state} "), theme::warning()));
-    } else if let Some(name) = app.me_name() {
-        spans.push(Span::styled(" Connected as ", theme::muted()));
-        spans.push(Span::styled(format!("{name} "), theme::strong()));
     }
-    let g = &theme::get().glyphs;
     if app.settings.privacy.ghost_mode {
         spans.push(Span::styled(
             format!(" {} ghost ", g.ghost),
@@ -272,19 +315,58 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
             theme::muted(),
         ));
     }
-    if let Some(p) = &app.playing {
-        spans.push(Span::styled(
-            format!(" {} {} ", g.playing, p.label),
-            theme::media(),
-        ));
-    }
-    if let Some((text, error)) = &app.status {
+    let status = app.status.as_ref().map(|(text, error)| {
         let style = if *error {
             theme::error()
         } else {
             theme::status()
         };
-        spans.push(Span::styled(format!(" {} ", format::one_line(text)), style));
+        (crate::td::sentence_case(&format::one_line(text)), style)
+    });
+    let used: usize = spans.iter().map(|s| format::cells(&s.content)).sum();
+    let mut free = width
+        .saturating_sub(used)
+        .saturating_sub(status.as_ref().map_or(0, |(t, _)| format::cells(t) + 2));
+    if app.connection.is_none()
+        && let Some(name) = app.me_name()
+    {
+        let name = format::sanitize(&name);
+        let need = format::cells(&name) + " Connected as  ".len();
+        if need <= free {
+            free -= need;
+            spans.push(Span::styled(" Connected as ", theme::muted()));
+            spans.push(Span::styled(format!("{name} "), theme::strong()));
+        }
+    }
+    if let Some(p) = &app.playing {
+        let label = format::sanitize(&p.label);
+        let need = format::cells(&label) + format::cells(&g.playing) + 3;
+        let label = if need <= free {
+            Some(label)
+        } else if free >= 16 {
+            Some(format::truncate(
+                &label,
+                free - format::cells(&g.playing) - 3,
+            ))
+        } else {
+            None
+        };
+        if let Some(label) = label {
+            spans.push(Span::styled(
+                format!(" {} {label} ", g.playing),
+                theme::media(),
+            ));
+        }
+    }
+    if let Some((text, style)) = status {
+        let used: usize = spans.iter().map(|s| format::cells(&s.content)).sum();
+        let room = width.saturating_sub(used + 2);
+        if room > 0 {
+            spans.push(Span::styled(
+                format!(" {} ", format::truncate(&text, room)),
+                style,
+            ));
+        }
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
@@ -310,7 +392,7 @@ fn draw_filter_bar(frame: &mut Frame, area: Option<Rect>, app: &App, pane: Pane)
         theme::muted()
     };
     let shown = if f.input.is_empty() {
-        Span::styled("search...", theme::muted())
+        Span::styled("Search…", theme::muted())
     } else {
         Span::styled(f.input.text().to_owned(), style)
     };
@@ -369,12 +451,26 @@ fn draw_folders(frame: &mut Frame, area: Rect, app: &App) {
     let block = pane_block(" Folders ".to_owned(), focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    textmap::area(Zone::Pane(Pane::Folders), area);
     let filter_on = app.filter.as_ref().is_some_and(|f| f.pane == Pane::Folders);
     let (list, bar) = split_filter(inner, filter_on);
     let entries = app.folder_entries();
     let h = list.height as usize;
     app.folder_rows.set(h);
+    let none = entries.is_empty();
+    if let Some(f) = app
+        .filter
+        .as_ref()
+        .filter(|f| f.pane == Pane::Folders && none)
+    {
+        let text = format!("No folders match ‘{}’", f.input.text());
+        let wrap = ratatui::widgets::Wrap { trim: true };
+        let pad = Block::default().padding(Padding::horizontal(1));
+        let empty = Paragraph::new(Span::styled(text, theme::muted())).wrap(wrap);
+        frame.render_widget(empty.block(pad), list);
+    }
     let start = list_window(app.folder_sel, entries.len(), h);
+    let mark = theme::selection_marker().width() as u16;
     let lines: Vec<Line> = entries
         .iter()
         .enumerate()
@@ -387,6 +483,9 @@ fn draw_folders(frame: &mut Frame, area: Rect, app: &App) {
                 .map(|n| format!(" {n}"))
                 .unwrap_or_default();
             let title = format::truncate(name, w.saturating_sub(badge.width()));
+            let y = list.y + (i - start) as u16;
+            textmap::hit(Rect::new(list.x, y, list.width, 1), Hit::Folder(i));
+            textmap::row(list.x + mark, y, format::cells(&title) as u16, Join::Line);
             let pad = w.saturating_sub(title.width() + badge.width());
             row_line(
                 vec![
@@ -404,6 +503,49 @@ fn draw_folders(frame: &mut Frame, area: Rect, app: &App) {
     draw_filter_bar(frame, bar, app, Pane::Folders);
 }
 
+const TWO_LINE_MIN_WIDTH: usize = 16;
+const TITLE_MIN: usize = 8;
+
+fn empty_chats_text(app: &App) -> String {
+    let filter = app.filter.as_ref().filter(|f| f.pane == Pane::Chats);
+    if let Some(f) = filter.filter(|f| !f.input.is_empty()) {
+        return format!("No chats match ‘{}’", f.input.text());
+    }
+    let list = app.current_list();
+    if !app.list_complete(list) {
+        return "Loading chats…".to_owned();
+    }
+    match list {
+        model::ListId::Main => "No chats yet",
+        model::ListId::Archive => "Archive is empty",
+        model::ListId::Folder(_) => "No chats in this folder",
+    }
+    .to_owned()
+}
+
+fn rows_window(heights: &[usize], selected: usize, height: usize) -> usize {
+    let Some(last) = heights.len().checked_sub(1).filter(|_| height > 0) else {
+        return 0;
+    };
+    let sel = selected.min(last);
+    let mut tail = heights.len();
+    let mut below = 0;
+    while tail > 0 && below + heights[tail - 1] <= height {
+        tail -= 1;
+        below += heights[tail];
+    }
+    let mut start = sel;
+    let mut above = 0;
+    while start > 0
+        && above + heights[start - 1] <= height / 2
+        && above + heights[start - 1] + heights[sel] <= height
+    {
+        start -= 1;
+        above += heights[start];
+    }
+    start.min(tail)
+}
+
 fn draw_chats(frame: &mut Frame, area: Rect, app: &App) {
     let focused = app.focus == Pane::Chats;
     let title = app
@@ -413,124 +555,274 @@ fn draw_chats(frame: &mut Frame, area: Rect, app: &App) {
     let block = pane_block(format!(" {title} "), focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    textmap::area(Zone::Pane(Pane::Chats), area);
     let filter_on = app.filter.as_ref().is_some_and(|f| f.pane == Pane::Chats);
     let (list, bar) = split_filter(inner, filter_on);
     let rows = app.chat_rows();
-    if rows.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Span::styled(" Loading chats...", theme::muted())),
-            list,
-        );
-    }
     let h = list.height as usize;
-    app.chat_rows.set(h);
     let w = list.width as usize;
-    let sel = app.chat_sel.min(rows.len().saturating_sub(1));
-    let start = list_window(sel, rows.len(), h);
-    let lines: Vec<Line> = rows
+    if rows.is_empty() {
+        app.chat_rows.set(h);
+        let text = Span::styled(empty_chats_text(app), theme::muted());
+        let wrap = ratatui::widgets::Wrap { trim: true };
+        let pad = Block::default().padding(Padding::horizontal(1));
+        frame.render_widget(Paragraph::new(text).wrap(wrap).block(pad), list);
+        draw_filter_bar(frame, bar, app, Pane::Chats);
+        return;
+    }
+    let two = !app.settings.appearance.compact_chat_list && w >= TWO_LINE_MIN_WIDTH;
+    let heights: Vec<usize> = rows
         .iter()
-        .enumerate()
-        .skip(start)
-        .take(h)
-        .filter_map(|(i, row)| {
-            let id = match *row {
-                Row::Chat(id) => id,
-                Row::Topic(chat, t) => {
-                    return Some(topic_line(app, chat, t, i == sel, focused, w));
-                }
-                Row::Loading(_) => {
-                    return Some(row_line(
-                        vec![Span::styled("   loading topics...", theme::muted())],
-                        i == sel,
-                        focused,
-                        w,
-                    ));
-                }
-            };
-            let c = app.chats.get(&id)?;
-            let muted = app.is_muted(c.id);
-            let th = theme::get();
-            let g = &th.glyphs;
-            let mut badge = String::new();
-            let mut badge_style = theme::muted_badge();
-            if c.mentions > 0 {
-                badge = format!(" {}", g.mention_dot);
-                badge_style = theme::mention_badge();
-            }
-            let unread = app.chat_unread(c.id);
-            if unread > 0 {
-                if g.unread_dot.is_empty() {
-                    badge.push_str(&format!(" {}", app.count(i64::from(unread))));
-                } else {
-                    badge.push_str(&format!(
-                        " {} {}",
-                        g.unread_dot,
-                        app.count(i64::from(unread))
-                    ));
-                }
-                if c.mentions == 0 && !muted {
-                    badge_style = theme::unread_badge();
-                }
-            }
-            let mut title_style = if unread > 0 && !muted {
-                theme::unread()
-            } else if muted {
-                theme::muted()
+        .map(|r| {
+            if two && matches!(r, Row::Chat(_)) {
+                2
             } else {
-                theme::normal()
-            };
-            if app.open_chat == Some(c.id) {
-                title_style = title_style.patch(theme::open_chat());
+                1
             }
-            let (prefix, prefix_style) = match c.kind {
-                _ if app.typing.contains_key(&c.id) => (g.typing.as_str(), theme::typing()),
-                ChatKind::Private(uid) | ChatKind::Secret(uid) if app.is_online(uid) => {
-                    (g.online.as_str(), theme::online())
-                }
-                ChatKind::Secret(_) => (g.secret.as_str(), Style::default()),
-                _ if c.forum && app.expanded == Some(c.id) => {
-                    (g.forum_open.as_str(), theme::muted())
-                }
-                _ if c.forum => (g.forum_closed.as_str(), theme::muted()),
-                _ => ("", Style::default()),
-            };
-            let state = app
-                .secret_chat(c.id)
-                .map(|s| s.state.short())
-                .filter(|s| !s.is_empty())
-                .map(|s| format!(" ({s})"))
-                .unwrap_or_default();
-            let prefix = if prefix.is_empty() {
-                String::new()
-            } else {
-                format!("{prefix} ")
-            };
-            let pinned = c.position_in(app.current_list()).is_some_and(|p| p.pinned);
-            let pin_mark = format!(" {}", g.pinned_chat);
-            let avail = w
-                .saturating_sub(theme::selection_marker().width())
-                .saturating_sub(badge.width())
-                .saturating_sub(if pinned { pin_mark.width() } else { 0 });
-            let prefix = format::truncate(&prefix, avail);
-            let room = avail.saturating_sub(prefix.width());
-            let state = format::truncate(&state, room / 2);
-            let title = format::truncate(&c.title, room.saturating_sub(state.width()));
-            let pad = avail.saturating_sub(prefix.width() + title.width() + state.width());
-            let mut spans = vec![
-                Span::styled(prefix, title_style.patch(prefix_style)),
-                Span::styled(title, title_style),
-                Span::styled(state, theme::muted()),
-                Span::raw(" ".repeat(pad)),
-            ];
-            if pinned {
-                spans.push(Span::styled(pin_mark, theme::muted()));
-            }
-            spans.push(Span::styled(badge, badge_style));
-            Some(row_line(spans, i == sel, focused, w))
         })
         .collect();
+    let sel = app.chat_sel.min(rows.len() - 1);
+    let start = rows_window(&heights, sel, h);
+    let now = crate::app::unix_now();
+    let mut lines: Vec<Line> = Vec::with_capacity(h);
+    let mut shown = 0;
+    for (i, row) in rows.iter().enumerate().skip(start) {
+        let room = h.saturating_sub(lines.len());
+        if room == 0 {
+            break;
+        }
+        let selected = i == sel;
+        let (row_lines, text) = match *row {
+            Row::Chat(id) => match app.chats.get(&id) {
+                Some(c) => chat_lines(app, c, selected, focused, w, two, now),
+                None => continue,
+            },
+            Row::Topic(chat, t) => (vec![topic_line(app, chat, t, selected, focused, w)], None),
+            Row::Loading(_) => {
+                let label = vec![Span::styled("   Loading topics…", theme::muted())];
+                (vec![row_line(label, selected, focused, w)], None)
+            }
+        };
+        let n = row_lines.len().min(room);
+        let y = list.y + lines.len() as u16;
+        textmap::hit(Rect::new(list.x, y, list.width, n as u16), Hit::Chat(*row));
+        if let Some((x, width)) = text {
+            textmap::row(list.x + x as u16, y, width as u16, Join::Line);
+        }
+        lines.extend(row_lines.into_iter().take(n));
+        shown += 1;
+    }
+    app.chat_rows.set(shown);
     frame.render_widget(Paragraph::new(lines), list);
     draw_filter_bar(frame, bar, app, Pane::Chats);
+}
+
+fn chat_badge(app: &App, c: &model::ChatInfo, muted: bool) -> (String, Style) {
+    let g = &theme::get().glyphs;
+    let mut badge = String::new();
+    let mut style = theme::muted_badge();
+    if c.mentions > 0 {
+        badge = format!(" {}", g.mention_dot);
+        style = theme::mention_badge();
+    }
+    let unread = app.chat_unread(c.id);
+    if unread > 0 {
+        let n = app.count(i64::from(unread));
+        if g.unread_dot.is_empty() {
+            badge.push_str(&format!(" {n}"));
+        } else {
+            badge.push_str(&format!(" {} {n}", g.unread_dot));
+        }
+        if c.mentions == 0 && !muted {
+            style = theme::unread_badge();
+        }
+    }
+    (badge, style)
+}
+
+fn typing_preview(app: &App, c: &model::ChatInfo) -> Option<String> {
+    let private = matches!(c.kind, ChatKind::Private(_) | ChatKind::Secret(_));
+    if !private {
+        return app.typing_line(c.id, None);
+    }
+    let now = std::time::Instant::now();
+    let entries: Vec<(String, crate::presence::Activity)> = app
+        .typing
+        .get(&c.id)?
+        .iter()
+        .filter(|t| !t.expired(now))
+        .map(|t| (String::new(), t.activity))
+        .collect();
+    crate::presence::typing_text_in(app.lang, &entries, true)
+}
+
+fn media_preview(label: &str) -> (String, bool) {
+    let label = format::one_line(label);
+    match label.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+        Some(inner) => {
+            let mut chars = inner.chars();
+            let head: String = chars
+                .next()
+                .into_iter()
+                .flat_map(char::to_uppercase)
+                .collect();
+            (format!("{head}{}", chars.as_str()), true)
+        }
+        None => (label, false),
+    }
+}
+
+fn chat_preview(app: &App, c: &model::ChatInfo) -> Vec<Span<'static>> {
+    if let Some(text) = typing_preview(app, c) {
+        return vec![Span::styled(text, theme::typing())];
+    }
+    if let Some(draft) = app
+        .drafts
+        .get(&(c.id, None))
+        .filter(|d| !d.text.trim().is_empty())
+    {
+        return vec![
+            Span::styled("Draft: ", theme::error()),
+            Span::styled(format::one_line(&draft.text), theme::muted()),
+        ];
+    }
+    let Some(m) = c.last_message.as_ref() else {
+        return Vec::new();
+    };
+    let mut spans = Vec::new();
+    let who = match c.kind {
+        ChatKind::Channel => None,
+        _ if m.outgoing => Some("You".to_owned()),
+        ChatKind::Group | ChatKind::Supergroup => {
+            let name = app.sender_name(m.sender);
+            Some(name.split(' ').next().unwrap_or(&name).to_owned())
+        }
+        _ => None,
+    };
+    if let Some(who) = who {
+        spans.push(Span::styled(format!("{who}: "), theme::normal()));
+    }
+    let text = format::one_line(&m.body.text);
+    if let Some(label) = m.media.as_deref() {
+        let (label, media) = media_preview(label);
+        let style = if media {
+            theme::media()
+        } else {
+            theme::muted()
+        };
+        spans.push(Span::styled(label, style));
+        if !text.is_empty() {
+            spans.push(Span::styled(format!(" {text}"), theme::muted()));
+        }
+    } else {
+        spans.push(Span::styled(text, theme::muted()));
+    }
+    spans
+}
+
+fn chat_lines(
+    app: &App,
+    c: &model::ChatInfo,
+    selected: bool,
+    focused: bool,
+    w: usize,
+    two: bool,
+    now: i64,
+) -> (Vec<Line<'static>>, Option<(usize, usize)>) {
+    let muted = app.is_muted(c.id);
+    let th = theme::get();
+    let g = &th.glyphs;
+    let (badge, badge_style) = chat_badge(app, c, muted);
+    let mut title_style = if app.chat_unread(c.id) > 0 && !muted {
+        theme::unread()
+    } else if muted {
+        theme::muted()
+    } else {
+        theme::normal()
+    };
+    if app.open_chat == Some(c.id) {
+        title_style = title_style.patch(theme::open_chat());
+    }
+    let (prefix, prefix_style) = match c.kind {
+        _ if app.typing.contains_key(&c.id) => (g.typing.as_str(), theme::typing()),
+        ChatKind::Private(uid) | ChatKind::Secret(uid) if app.is_online(uid) => {
+            (g.online.as_str(), theme::online())
+        }
+        ChatKind::Secret(_) => (g.secret.as_str(), Style::default()),
+        _ if c.forum && app.expanded == Some(c.id) => (g.forum_open.as_str(), theme::muted()),
+        _ if c.forum => (g.forum_closed.as_str(), theme::muted()),
+        _ => ("", Style::default()),
+    };
+    let state = app
+        .secret_chat(c.id)
+        .map(|s| s.state.short())
+        .filter(|s| !s.is_empty())
+        .map(|s| format!(" ({s})"))
+        .unwrap_or_default();
+    let prefix = if prefix.is_empty() {
+        String::new()
+    } else {
+        format!("{prefix} ")
+    };
+    let pinned = c.position_in(app.current_list()).is_some_and(|p| p.pinned);
+    let pin_mark = if pinned {
+        format!(" {}", g.pinned_chat)
+    } else {
+        String::new()
+    };
+    let mark = theme::selection_marker().width();
+    let avail = w.saturating_sub(mark);
+    let head = (format::cells(&prefix) + format::cells(&c.title)).min(TITLE_MIN);
+    let fits = |extra: usize| avail.saturating_sub(extra) >= head;
+    let time = c
+        .last_message
+        .as_ref()
+        .filter(|_| two)
+        .map(|m| format!(" {}", format::list_time(app.lang, m.date, now)))
+        .filter(|t| fits(t.width()))
+        .unwrap_or_default();
+    let mut right = vec![Span::styled(time, theme::time())];
+    let mut extras = vec![
+        Span::styled(pin_mark, theme::muted()),
+        Span::styled(badge, badge_style),
+    ];
+    if !two {
+        right = std::mem::take(&mut extras);
+    }
+    if !fits(spans_width(&right)) {
+        right.remove(0);
+    }
+    if !fits(spans_width(&right)) {
+        right.clear();
+    }
+    let avail_left = avail.saturating_sub(spans_width(&right));
+    let prefix = format::truncate(&prefix, avail_left);
+    let room = avail_left.saturating_sub(prefix.width());
+    let state = format::truncate(&state, room / 2);
+    let title = format::truncate(&c.title, room.saturating_sub(state.width()));
+    let pad = avail_left.saturating_sub(prefix.width() + title.width() + state.width());
+    let text = (mark + format::cells(&prefix), format::cells(&title));
+    let indent = format::cells(&prefix);
+    let mut spans = vec![
+        Span::styled(prefix, title_style.patch(prefix_style)),
+        Span::styled(title, title_style),
+        Span::styled(state, theme::muted()),
+        Span::raw(" ".repeat(pad)),
+    ];
+    spans.extend(right);
+    let mut lines = vec![row_line(spans, selected, focused, w)];
+    if two {
+        let extras_w = spans_width(&extras);
+        let room = avail.saturating_sub(indent + extras_w);
+        let preview = truncate_spans(chat_preview(app, c), room);
+        let pad = room.saturating_sub(spans_width(&preview));
+        let mut spans = vec![Span::raw(" ".repeat(indent))];
+        spans.extend(preview);
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.extend(extras);
+        lines.push(row_line(spans, selected, false, w));
+    }
+    (lines, Some(text))
 }
 
 fn topic_line(
@@ -644,10 +936,37 @@ struct Place {
     pic: Pic,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct TextPlace {
+    line: usize,
+    col: u16,
+    width: u16,
+    join: Join,
+}
+
 #[derive(Clone)]
 struct Rendered {
     lines: Vec<Line<'static>>,
     images: Vec<Place>,
+    texts: Vec<TextPlace>,
+}
+
+fn push_text(
+    body: &mut Vec<Line<'static>>,
+    texts: &mut Vec<TextPlace>,
+    rt: &model::RichText,
+    style: Style,
+    width: usize,
+) {
+    for (line, wrap) in format::render_rows(rt, style, width) {
+        texts.push(TextPlace {
+            line: body.len(),
+            col: wrap.indent as u16,
+            width: wrap.width as u16,
+            join: wrap.join,
+        });
+        body.push(line);
+    }
 }
 
 const PHOTO_COLS: u16 = 60;
@@ -996,7 +1315,7 @@ fn group_block(
     body.extend(forward_line(app, m, ctx.lang, inner));
     body.extend(reply_strip(app, m, ctx.lang, inner));
     let before = body.len();
-    group_content(
+    let mut texts = group_content(
         app,
         msgs,
         range.clone(),
@@ -1020,6 +1339,10 @@ fn group_block(
         p.line += offset;
         p.col += lead as u16;
     }
+    for t in &mut texts {
+        t.line += offset;
+        t.col += lead as u16;
+    }
     lines.extend(body.into_iter().map(|mut l| {
         l.spans.insert(0, Span::raw(" ".repeat(lead)));
         if selected { select_row(l, width) } else { l }
@@ -1034,7 +1357,11 @@ fn group_block(
         lines[offset].spans[0] = Span::raw(" ".repeat(rest));
         lines[offset].spans.insert(0, classic_avatar(app, m.sender));
     }
-    Rendered { lines, images }
+    Rendered {
+        lines,
+        images,
+        texts,
+    }
 }
 
 fn group_content(
@@ -1045,7 +1372,8 @@ fn group_content(
     ticks: bool,
     body: &mut Vec<Line<'static>>,
     images: &mut Vec<Place>,
-) {
+) -> Vec<TextPlace> {
+    let mut texts = Vec::new();
     let group = &msgs[range.clone()];
     let media_w = inner as u16;
     let font = app.media.font();
@@ -1106,16 +1434,18 @@ fn group_content(
         if g.attachments.is_empty()
             && let Some(media) = &g.media
         {
-            body.extend(render_text(
+            push_text(
+                body,
+                &mut texts,
                 &crate::model::RichText::plain(media.clone()),
                 theme::media(),
                 inner,
-            ));
+            );
         }
     }
     for g in group {
         if !g.body.text.is_empty() {
-            body.extend(render_text(&g.body, theme::normal(), inner));
+            push_text(body, &mut texts, &g.body, theme::normal(), inner);
         }
         if g.ttl != 0 {
             let text = format!("{} {}", theme::get().glyphs.timer, format::ttl(g.ttl));
@@ -1162,9 +1492,9 @@ fn group_content(
                     continue;
                 }
                 let text = if up {
-                    "uploading... (Enter → c to cancel)"
+                    "Uploading… (Enter → c to cancel)"
                 } else {
-                    "sending..."
+                    "Sending…"
                 };
                 body.push(Line::from(Span::styled(
                     format::truncate(text, inner),
@@ -1177,6 +1507,7 @@ fn group_content(
             ))),
         }
     }
+    texts
 }
 
 fn button_focus(app: &App, chat_id: i64, msg_id: i64, inline: bool) -> Option<usize> {
@@ -1352,7 +1683,7 @@ fn attachment_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     }
     if c.pasting {
         out.push(Line::from(Span::styled(
-            format!("{} reading clipboard...", theme::get().glyphs.clipboard),
+            format!("{} Reading the clipboard…", theme::get().glyphs.clipboard),
             theme::muted(),
         )));
     }
@@ -1366,7 +1697,7 @@ fn attachment_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         );
         let shown = rows.len().min(MAX_REPLY_KEYBOARD_LINES);
         let hidden = (rows.len() - shown) / 3;
-        let mut label = format!("{} C-k", theme::get().glyphs.keyboard);
+        let mut label = format!("{} <C-k>", theme::get().glyphs.keyboard);
         if !kb.placeholder.is_empty() {
             label = format!("{label} · {}", kb.placeholder);
         }
@@ -1411,12 +1742,14 @@ fn draw_messages(frame: &mut Frame, area: Rect, app: &mut App) {
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    textmap::area(Zone::Pane(Pane::Messages), area);
     let ch = composer_height(app, inner.width as usize);
     let [list, composer] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(ch)]).areas(inner);
     app.msg_view_height = list.height as usize;
     draw_message_list(frame, list, app);
     if ch > 0 {
+        textmap::hit(composer, Hit::Composer);
         draw_composer(frame, composer, app);
         draw_command_suggestions(frame, list, app);
     }
@@ -1472,6 +1805,7 @@ fn draw_command_suggestions(frame: &mut Frame, area: Rect, app: &App) {
         width,
         height,
     };
+    textmap::cover(rect);
     frame.render_widget(Clear, rect);
     let block = theme::popup_block()
         .title(Span::styled(title, theme::popup_title()))
@@ -1822,7 +2156,7 @@ fn bubble_block(
     }
     let mut images = Vec::new();
     let before = body.len();
-    group_content(
+    let mut texts = group_content(
         app,
         msgs,
         range.clone(),
@@ -1930,6 +2264,11 @@ fn bubble_block(
         p.line += top;
         p.col += (x + 1) as u16;
     }
+    for t in &mut texts {
+        t.width = t.width.min((inner_w as u16).saturating_sub(t.col));
+        t.line += top;
+        t.col += (x + 1) as u16;
+    }
     if show_avatar {
         let first_row = lines.len() - avatar_rows;
         let label = initials(&app.sender_name(m.sender));
@@ -1963,7 +2302,11 @@ fn bubble_block(
             pic: Pic::Avatar(m.sender),
         });
     }
-    Rendered { lines, images }
+    Rendered {
+        lines,
+        images,
+        texts,
+    }
 }
 
 fn avatar_cells(t: ImageTarget) -> impl Iterator<Item = (u16, u16, u16, u16)> {
@@ -2091,6 +2434,7 @@ fn draw_profile_avatar(frame: &mut Frame, area: Rect, app: &mut App) {
         cols,
         rows,
     };
+    textmap::cover(Rect::new(inner.x + 1, inner.y, cols, rows));
     draw_avatar(
         frame,
         t,
@@ -2190,9 +2534,25 @@ fn draw_message_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let Some(h) = app.histories.get(&chat_id) else {
         return;
     };
+    if let Some(error) = h.error.as_ref().filter(|_| h.is_empty()) {
+        let lines = vec![
+            Line::from(Span::styled(
+                crate::td::failed("load messages", &format::one_line(error)),
+                theme::error(),
+            )),
+            Line::from(vec![
+                Span::styled("Enter", theme::strong()),
+                Span::styled(" retry", theme::muted()),
+            ]),
+        ];
+        let wrap = ratatui::widgets::Wrap { trim: true };
+        let pad = Block::default().padding(Padding::horizontal(2));
+        frame.render_widget(Paragraph::new(lines).wrap(wrap).block(pad), area);
+        return;
+    }
     if h.is_empty() {
         let text = if h.loading_older {
-            "  Loading..."
+            "  Loading…"
         } else {
             "  No messages yet"
         };
@@ -2268,6 +2628,7 @@ fn draw_message_list(frame: &mut Frame, area: Rect, app: &mut App) {
     app.want_emoji.extend(unknown);
     let mut all: Vec<Line<'static>> = Vec::with_capacity(total);
     let mut sel_span = None;
+    let mut texts: Vec<(usize, TextPlace)> = Vec::new();
     for (g, b) in blocks.into_iter().rev() {
         let base = all.len();
         starts.push((base, g));
@@ -2276,6 +2637,7 @@ fn draw_message_list(frame: &mut Frame, area: Rect, app: &mut App) {
                 .into_iter()
                 .map(|p| (base + p.line, absolute(p, g))),
         );
+        texts.extend(b.texts.into_iter().map(|t| (base + t.line, t)));
         if sel_group == Some(g) {
             sel_span = Some((base, base + b.lines.len()));
         }
@@ -2314,9 +2676,10 @@ fn draw_message_list(frame: &mut Frame, area: Rect, app: &mut App) {
     all.truncate(end);
     lines.extend(all.drain(start..));
     app.layout_cache = cache;
-    if indicator && lines.len() >= height {
+    let covered_top = indicator && lines.len() >= height;
+    if covered_top {
         lines[0] = Line::from(Span::styled(
-            format::separator(" loading older ", width),
+            format::separator(" Loading older… ", width),
             theme::date_separator(),
         ));
     }
@@ -2324,6 +2687,19 @@ fn draw_message_list(frame: &mut Frame, area: Rect, app: &mut App) {
     let mut shown: Vec<Line<'static>> = vec![Line::from(""); pad];
     shown.extend(lines);
     frame.render_widget(Paragraph::new(shown), area);
+    let screen_y = |line: usize| area.y + (pad + line - first_line) as u16;
+    let text_from = first_line + usize::from(covered_top);
+    for (line, t) in texts.iter().filter(|(l, _)| (text_from..end).contains(l)) {
+        textmap::row(area.x + t.col, screen_y(*line), t.width, t.join);
+    }
+    for (i, &(top, g)) in starts.iter().enumerate() {
+        let top = top.max(first_line);
+        let bottom = starts.get(i + 1).map_or(end, |n| n.0).min(end);
+        if top < bottom {
+            let rows = Rect::new(area.x, screen_y(top), area.width, (bottom - top) as u16);
+            textmap::hit(rows, Hit::Message(msgs[groups[g].start].id));
+        }
+    }
     if !app.marked.is_empty() && area.width > 0 {
         let buf = frame.buffer_mut();
         for (i, &(top, g)) in starts.iter().enumerate() {
@@ -2365,6 +2741,9 @@ fn draw_message_list(frame: &mut Frame, area: Rect, app: &mut App) {
         let y = pad as isize + abs as isize - first_line as isize;
         y + rows as isize > 0 && y < height as isize
     });
+    let still = app.media.anim.paused() || (overlay && !app.media.anim.native());
+    let now = app.chat_freeze.at(app.anim_start.elapsed(), still);
+    let mut head = crate::anim::Playhead::new(now, animate.len(), still);
     for (n, (abs, p)) in placed.into_iter().enumerate() {
         let y = pad as isize + abs as isize - first_line as isize;
         if y + p.rows as isize <= 0 || y >= height as isize {
@@ -2383,7 +2762,9 @@ fn draw_message_list(frame: &mut Frame, area: Rect, app: &mut App) {
                 let Some(a) = m.attachments.get(att) else {
                     continue;
                 };
-                if animate.contains(&n) && draw_animation(frame, target, &mut app.media, a) {
+                if animate.contains(&n)
+                    && draw_animation(frame, target, &mut app.media, a, &mut head)
+                {
                     continue;
                 }
                 draw_attachment(
@@ -2394,7 +2775,7 @@ fn draw_message_list(frame: &mut Frame, area: Rect, app: &mut App) {
                     (chat_id, m.id, att),
                     overlay,
                     false,
-                    Duration::ZERO,
+                    None,
                 );
             }
             Pic::Avatar(sender) => {
@@ -2418,12 +2799,17 @@ fn draw_message_list(frame: &mut Frame, area: Rect, app: &mut App) {
             }
         }
     }
+    app.redraw_due = min_due(app.redraw_due, head.due);
     if !at_bottom || app.window_detached() {
         draw_jump_indicator(frame, area, app, chat_id);
     }
     if want_older {
         app.want_older = true;
     }
+}
+
+fn min_due(a: Option<Duration>, b: Option<Duration>) -> Option<Duration> {
+    a.into_iter().chain(b).min()
 }
 
 fn pick_animations(
@@ -2453,14 +2839,24 @@ fn pick_animations(
         })
         .collect();
     picks.sort_by_key(|&(selected, n)| (!selected, std::cmp::Reverse(n)));
-    picks
-        .into_iter()
-        .take(app.settings.media.max_animations())
-        .map(|(_, n)| n)
-        .collect()
+    let cap = if app.media.anim.native() {
+        app.settings.media.max_animations()
+    } else {
+        app.settings
+            .media
+            .max_animations()
+            .min(crate::anim::REDRAW_MAX_VISIBLE)
+    };
+    picks.into_iter().take(cap).map(|(_, n)| n).collect()
 }
 
-fn draw_animation(frame: &mut Frame, t: ImageTarget, media: &mut Media, att: &Attachment) -> bool {
+fn draw_animation(
+    frame: &mut Frame,
+    t: ImageTarget,
+    media: &mut Media,
+    att: &Attachment,
+    head: &mut crate::anim::Playhead,
+) -> bool {
     let Some((file, decode, seconds)) = crate::anim::source(att) else {
         return false;
     };
@@ -2484,11 +2880,52 @@ fn draw_animation(frame: &mut Frame, t: ImageTarget, media: &mut Media, att: &At
             u32::from(t.rows) * u32::from(fh),
         ),
     };
+    if !media.anim.native() {
+        return draw_redrawn(frame, t, media, key, job, head);
+    }
     let Some(id) = media.anim.show(key, job) else {
         return false;
     };
     crate::anim::placeholders(frame.buffer_mut(), t.area, id, (t.x, t.y), (t.cols, t.rows));
     true
+}
+
+fn draw_redrawn(
+    frame: &mut Frame,
+    t: ImageTarget,
+    media: &mut Media,
+    key: crate::anim::Key,
+    job: impl FnOnce() -> crate::anim::Job,
+    head: &mut crate::anim::Playhead,
+) -> bool {
+    let Some(clip) = media.anim.clip(key, job) else {
+        return false;
+    };
+    let mkey = Key {
+        src: Src::Clip(key.file),
+        cols: key.cols,
+        rows: key.rows,
+        shape: None,
+        animate: true,
+    };
+    let error = match media.look(mkey, Input::Clip(clip.clone()), head.paused) {
+        Look::Ready(frames) => {
+            let Some(proto) = frames.at(head.frame(frames.cost)) else {
+                return false;
+            };
+            render_proto(frame, t, proto);
+            return true;
+        }
+        Look::Failed(e) => e.to_owned(),
+        Look::Pending | Look::Hidden => return false,
+    };
+    if clip.exists() {
+        media.anim.report(format!("inline animation: {error}"));
+    } else {
+        media.forget(&mkey);
+        media.anim.forget(key);
+    }
+    false
 }
 
 fn draw_scrollbar(frame: &mut Frame, area: Rect, total: usize, top: usize, visible: usize) {
@@ -2557,6 +2994,7 @@ fn draw_jump_indicator(frame: &mut Frame, area: Rect, app: &App, chat_id: i64) {
         width: w,
         height: 1,
     };
+    textmap::cover(rect);
     frame.render_widget(Clear, rect);
     frame.render_widget(
         Paragraph::new(Span::styled(label, theme::jump_badge())),
@@ -2609,7 +3047,7 @@ fn draw_attachment(
     (chat_id, msg_id, idx): (i64, i64, usize),
     overlay: bool,
     full: bool,
-    elapsed: Duration,
+    elapsed: Option<Duration>,
 ) -> bool {
     let shape = (att.kind == MediaKind::VideoNote).then_some(theme::AvatarShape::Circle);
     let mut note: Option<String> = None;
@@ -2643,11 +3081,11 @@ fn draw_attachment(
             cols: t.cols,
             rows: t.rows,
             shape,
-            animate: full && v.decode == Decode::Tgs,
+            animate: full && v.decode == Decode::Tgs && elapsed.is_some(),
         };
         match media.look(key, input, overlay) {
             Look::Ready(frames) => {
-                if let Some(proto) = frames.at(elapsed) {
+                if let Some(proto) = frames.at(elapsed.unwrap_or_default()) {
                     render_proto(frame, t, proto);
                     animated = frames.animated();
                 }
@@ -2694,6 +3132,28 @@ fn draw_attachment(
     animated
 }
 
+fn viewer_hint(player: bool, file: bool, pos: usize, len: usize) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if player {
+        parts.extend(["space play/pause", "←/→ seek", "↑/↓ volume", "m mute"]);
+    }
+    match (pos > 0, pos + 1 < len) {
+        (true, true) => parts.push("j/k prev/next"),
+        (false, true) => parts.push("j next"),
+        (true, false) => parts.push("k prev"),
+        (false, false) => {}
+    }
+    if file {
+        parts.push(if player { "x mpv" } else { "x play/open" });
+        parts.push("s save");
+        if !player {
+            parts.push(crate::player::OPEN_HINT);
+        }
+    }
+    parts.push("Esc close");
+    format!(" {} ", parts.join(" · "))
+}
+
 fn draw_viewer(frame: &mut Frame, area: Rect, app: &mut App) {
     let Some(Popup::Viewer {
         chat_id,
@@ -2707,6 +3167,7 @@ fn draw_viewer(frame: &mut Frame, area: Rect, app: &mut App) {
     let Some(&(msg_id, idx)) = items.get(pos) else {
         return;
     };
+    textmap::cover(area);
     frame.render_widget(Clear, area);
     let att = app.attachment(chat_id, msg_id, idx).cloned();
     let title = match &att {
@@ -2717,13 +3178,8 @@ fn draw_viewer(frame: &mut Frame, area: Rect, app: &mut App) {
     let player = att.as_ref().is_some_and(|a| {
         live || (crate::video::playable(a.kind) && app.inline.available().is_ok())
     });
-    let hint = if player {
-        " space play/pause · ←/→ seek · ↑/↓ volume · m mute · j/k prev/next · x mpv · s save · Esc close "
-    } else if cfg!(windows) {
-        " j/k prev/next · x play/open · s save · o open · Esc close "
-    } else {
-        " j/k prev/next · x play/open · s save · o xdg-open · Esc close "
-    };
+    let file = att.as_ref().is_some_and(|a| app.file_reachable(&a.file));
+    let hint = viewer_hint(player, file, pos, len);
     let block = theme::popup_block()
         .title(Span::styled(title, theme::popup_title()))
         .title_bottom(Span::styled(hint, theme::muted()));
@@ -2781,13 +3237,21 @@ fn draw_viewer(frame: &mut Frame, area: Rect, app: &mut App) {
             (chat_id, msg_id, idx),
             false,
             true,
-            elapsed,
+            Some(elapsed),
         )
     } else if player {
         box_note(frame, t, &format!("[{}]", kind_label(att.kind)));
         false
     } else {
-        box_note(frame, t, "nothing to preview; x to open");
+        box_note(
+            frame,
+            t,
+            if file {
+                "nothing to preview; x to open"
+            } else {
+                "nothing to preview"
+            },
+        );
         false
     };
     app.animating |= animated;
@@ -2814,7 +3278,7 @@ fn draw_viewer(frame: &mut Frame, area: Rect, app: &mut App) {
         let text = match &status {
             Some(st) => crate::video::progress_line(st, inner.width as usize),
             None if app.inline.requested == Some((msg_id, idx)) && f.local().is_none() => {
-                " ⧗ downloading...".to_owned()
+                " ⧗ Downloading…".to_owned()
             }
             None => " ▶ space to play here".to_owned(),
         };
@@ -2854,7 +3318,7 @@ fn draw_recording(frame: &mut Frame, area: Rect, rec: &crate::app::Recording) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
     let line = if rec.stopping {
-        Line::from(Span::styled("⧗ encoding...", theme::muted()))
+        Line::from(Span::styled("⧗ Encoding…", theme::muted()))
     } else {
         let secs = rec.started.elapsed().as_secs() as i32;
         let levels = rec
@@ -2991,7 +3455,7 @@ fn draw_composer(frame: &mut Frame, area: Rect, app: &App) {
         ))
     } else if c.active {
         block.title_bottom(Span::styled(
-            " C-o file · C-v paste · C-r voice · C-s stickers · C-g GIFs ",
+            " <C-o> file · <C-v> paste · <C-r> voice · <C-s> stickers · <C-g> GIFs ",
             theme::muted(),
         ))
     } else {
@@ -3008,15 +3472,8 @@ fn draw_composer(frame: &mut Frame, area: Rect, app: &App) {
         frame.render_widget(Paragraph::new(att), att_area);
     }
     if c.input.is_empty() && !c.active {
-        let label = app
-            .keymap
-            .label_for(crate::keymap::Action::StartComposer)
-            .unwrap_or_default();
         frame.render_widget(
-            Paragraph::new(Span::styled(
-                format!("press {label} to write"),
-                theme::muted(),
-            )),
+            Paragraph::new(Span::styled(app.composer_hint(), theme::muted())),
             inner,
         );
         return;
@@ -3044,6 +3501,8 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &mut App) {
     let block = pane_block(" Chat info ".to_owned(), app.focus == Pane::Info);
     let inner = block.inner(area);
     frame.render_widget(block, area);
+    textmap::area(Zone::Pane(Pane::Info), area);
+    app.info_height = inner.height as usize;
     let Some(chat) = app.open_chat.and_then(|id| app.chats.get(&id)) else {
         frame.render_widget(
             Paragraph::new(Span::styled(" No chat open", theme::muted())),
@@ -3053,6 +3512,8 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &mut App) {
     };
     let chat_id = chat.id;
     let font = app.media.font();
+    let info = info_lines(app, chat, inner.width as usize);
+    let height = inner.height as usize;
     let avatar = info_avatar_size(inner, font).map(|(cols, rows)| ImageTarget {
         area: inner,
         x: (inner.width - cols) / 2,
@@ -3060,6 +3521,19 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &mut App) {
         cols,
         rows,
     });
+    let lead = avatar.map_or(0, |t| t.rows as usize + 2);
+    let max = match lead {
+        _ if lead + info.len() <= height => 0,
+        0 => info.len() - height,
+        _ => 1 + info.len().saturating_sub(height),
+    };
+    let scroll = app.info_scroll.min(max);
+    let avatar = avatar.filter(|_| scroll == 0);
+    let skip = if lead == 0 {
+        scroll
+    } else {
+        scroll.saturating_sub(1)
+    };
     let mut lines = Vec::new();
     if let Some(t) = avatar {
         let color = match chat.kind {
@@ -3087,8 +3561,27 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &mut App) {
         }
         lines.push(Line::from(""));
     }
-    lines.extend(info_lines(app, chat, inner.width as usize));
+    let shown = info.len().saturating_sub(skip);
+    let text_top = inner.y.saturating_add(lines.len() as u16);
+    for y in (text_top..inner.bottom()).take(shown) {
+        textmap::row(inner.x, y, inner.width, Join::Line);
+    }
+    lines.extend(info.into_iter().skip(skip));
+    app.info_scroll = scroll;
     frame.render_widget(Paragraph::new(lines), inner);
+    if max > 0 && area.width > 2 {
+        let bar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None)
+            .track_symbol(None)
+            .thumb_symbol("┃")
+            .thumb_style(theme::scrollbar_thumb());
+        let mut state = ScrollbarState::new(max)
+            .position(scroll)
+            .viewport_content_length(height);
+        let edge = Rect::new(area.right() - 1, inner.y, 1, inner.height);
+        frame.render_stateful_widget(bar, edge, &mut state);
+    }
     let Some(t) = avatar else {
         return;
     };
@@ -3150,34 +3643,54 @@ fn info_lines(app: &App, chat: &model::ChatInfo, width: usize) -> Vec<Line<'stat
         lines.push(Line::from(spans));
     }
     lines.push(Line::from(""));
-    let kind = match chat.kind {
-        ChatKind::Private(_) => "private chat",
-        ChatKind::Group => "group",
-        ChatKind::Supergroup => "supergroup",
-        ChatKind::Channel => "channel",
-        ChatKind::Secret(_) => "secret chat",
-    };
-    let mut field = |label: &str, value: String| lines.extend(info_field(label, &value, width));
-    field("Type", kind.to_owned());
     let user = match chat.kind {
         ChatKind::Private(uid) | ChatKind::Secret(uid) => Some(uid),
         _ => None,
     };
+    let profile = app.chat_profiles.get(&chat.id);
+    let mut field = |label: &str, value: String| lines.extend(info_field(label, &value, width));
+    if let Some(p) = profile.filter(|p| !p.usernames.is_empty()) {
+        let names: Vec<String> = p.usernames.iter().map(|n| format!("@{n}")).collect();
+        field("Username", names.join(" · "));
+    }
     if let Some(status) = user.and_then(|uid| app.user_status(uid)) {
         field("Status", status);
     }
-    let profile = app.chat_profiles.get(&chat.id);
-    if let Some(p) = profile {
-        if !p.usernames.is_empty() {
-            let names: Vec<String> = p.usernames.iter().map(|n| format!("@{n}")).collect();
-            field("Username", names.join(" · "));
+    if let Some(n) = profile.and_then(|p| p.members).filter(|_| user.is_none()) {
+        field("Members", app.count(i64::from(n)));
+    }
+    if let Some(p) = profile.filter(|p| !p.bio.is_empty()) {
+        let heading = if p.user_id.is_some() {
+            "Bio"
+        } else {
+            "Description"
+        };
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!(" {heading}"),
+            theme::muted(),
+        )));
+        for l in render_text(
+            &model::RichText::plain(p.bio.clone()),
+            theme::normal(),
+            width.saturating_sub(2).max(1),
+        ) {
+            let mut spans = vec![Span::raw(" ")];
+            spans.extend(l.spans);
+            lines.push(Line::from(spans));
         }
+    }
+    let mut details = Vec::new();
+    let mut field = |label: &str, value: String| details.extend(info_field(label, &value, width));
+    match chat.kind {
+        ChatKind::Group | ChatKind::Supergroup => field("Type", "group".to_owned()),
+        ChatKind::Channel => field("Type", "channel".to_owned()),
+        ChatKind::Private(_) | ChatKind::Secret(_) => {}
+    }
+    if let Some(p) = profile {
         let hidden = user.is_some_and(|u| app.my_id == Some(u)) && app.settings.privacy.hide_phone;
         if user.is_some() && !p.phone.is_empty() && !hidden {
             field("Phone", p.phone.clone());
-        }
-        if let Some(n) = p.members.filter(|_| user.is_none()) {
-            field("Members", app.count(i64::from(n)));
         }
         let invites = p.links.iter().filter(|l| {
             !p.usernames
@@ -3214,40 +3727,29 @@ fn info_lines(app: &App, chat: &model::ChatInfo, width: usize) -> Vec<Line<'stat
         }
         field("Topic", format!("{} · {}", t.name, state.join(", ")));
     }
-    field("Unread", app.count(i64::from(app.chat_unread(chat.id))));
-    field(
-        "Muted",
-        if app.is_muted(chat.id) { "yes" } else { "no" }.to_owned(),
-    );
-    field("ID", chat.id.to_string());
-    if let Some(p) = profile.filter(|p| !p.bio.is_empty()) {
-        let heading = if p.user_id.is_some() {
-            "Bio"
-        } else {
-            "Description"
-        };
+    let unread = app.chat_unread(chat.id);
+    if unread > 0 {
+        field("Unread", app.count(i64::from(unread)));
+    }
+    if app.is_muted(chat.id) {
+        field("Notifications", "off".to_owned());
+    }
+    if !details.is_empty() {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            format!(" {heading}"),
-            theme::muted(),
-        )));
-        for l in render_text(
-            &model::RichText::plain(p.bio.clone()),
-            theme::normal(),
-            width.saturating_sub(2).max(1),
-        ) {
-            let mut spans = vec![Span::raw(" ")];
-            spans.extend(l.spans);
-            lines.push(Line::from(spans));
-        }
+        lines.extend(details);
     }
     if !app.settings.appearance.show_ids {
         return lines;
     }
     lines.push(Line::from(""));
     let mut field = |label: &str, value: String| lines.extend(info_field(label, &value, width));
-    if let Some(uid) = user {
-        field("User ID", uid.to_string());
+    match user {
+        Some(uid) if uid == chat.id => field("User ID", uid.to_string()),
+        Some(uid) => {
+            field("Chat ID", chat.id.to_string());
+            field("User ID", uid.to_string());
+        }
+        None => field("Chat ID", chat.id.to_string()),
     }
     if chat.group_id != 0 {
         field("Supergroup ID", chat.group_id.to_string());
@@ -3291,6 +3793,7 @@ pub(crate) fn modal(frame: &mut Frame, rect: Rect, title: &str, lines: Vec<Line<
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     frame.render_widget(Paragraph::new(lines), inner);
+    textmap::panel(rect, inner);
     inner
 }
 
@@ -3299,60 +3802,59 @@ fn draw_popup(frame: &mut Frame, area: Rect, app: &App) {
         return;
     };
     match popup {
-        Popup::Menu { title, items, sel } => {
-            let lines: Vec<Line> = items
-                .iter()
-                .enumerate()
-                .map(|(i, item)| {
-                    let selected = i == *sel;
-                    row_line(
-                        vec![
-                            Span::styled(format!("{} ", item.key), theme::active_field()),
-                            Span::raw(item.label),
-                        ],
-                        selected,
-                        true,
-                        32,
-                    )
-                })
-                .collect();
-            let rect = centered(area, 34, lines.len() as u16 + 2);
-            modal(frame, rect, title, lines);
-        }
         Popup::Viewer { .. } | Popup::Stickers(_) => {}
-        Popup::Profile(_)
+        Popup::Menu { .. }
+        | Popup::Help { .. }
+        | Popup::ConfirmRemoveChat { .. }
+        | Popup::Profile(_)
         | Popup::Reactions(_)
         | Popup::ReactionList { .. }
         | Popup::Search(_)
+        | Popup::Find(_)
         | Popup::Buttons(_)
         | Popup::ConfirmUrl(_)
+        | Popup::Links { .. }
+        | Popup::Files { .. }
+        | Popup::ConfirmStart { .. }
+        | Popup::ConfirmJoin(_)
         | Popup::Options { .. }
         | Popup::Details { .. }
         | Popup::EditHistory { .. }
         | Popup::ConfirmClearDeleted
         | Popup::QuotePick { .. }
         | Popup::TextSelect { .. }
+        | Popup::StatusLog { .. }
         | Popup::SharedMedia { .. }
         | Popup::Translate { .. }
         | Popup::Members(_)
         | Popup::EventLog(_)
         | Popup::Inbox { .. } => draw_stage4_popup(frame, area, app, popup),
         Popup::FilePicker(fp) => draw_file_picker(frame, area, app, fp),
-        Popup::ConfirmDelete { message_ids, .. } => {
+        Popup::ConfirmDelete {
+            message_ids,
+            everyone,
+            me,
+            ..
+        } => {
             let question = if message_ids.len() > 1 {
                 format!(" Delete these {} messages?", message_ids.len())
             } else {
                 " Delete this message?".to_owned()
             };
+            let mut choices = vec![Span::raw(" ")];
+            if *everyone {
+                choices.push(Span::styled("y ", theme::active_field()));
+                choices.push(Span::raw("for everyone   "));
+            }
+            if *me {
+                choices.push(Span::styled("m ", theme::active_field()));
+                choices.push(Span::raw("only for me"));
+                choices.push(Span::styled(" (Enter)", theme::muted()));
+            }
             let lines = vec![
                 Line::from(question),
                 Line::from(""),
-                Line::from(vec![
-                    Span::styled(" y ", theme::active_field()),
-                    Span::raw("for everyone   "),
-                    Span::styled("m ", theme::active_field()),
-                    Span::raw("only for me"),
-                ]),
+                Line::from(choices),
                 Line::from(vec![
                     Span::styled(" n ", theme::active_field()),
                     Span::raw("cancel"),
@@ -3366,7 +3868,7 @@ fn draw_popup(frame: &mut Frame, area: Rect, app: &App) {
                 Line::from(vec![
                     Span::styled("> ", theme::active_field()),
                     if input.is_empty() {
-                        Span::styled("topic name...", theme::muted())
+                        Span::styled("Topic name…", theme::muted())
                     } else {
                         Span::raw(input.text().to_owned())
                     },
@@ -3437,9 +3939,34 @@ fn draw_popup(frame: &mut Frame, area: Rect, app: &App) {
             let rect = centered(area, 50, 5);
             modal(frame, rect, "Secret chat", lines);
         }
+        Popup::ConfirmQuit(work) => {
+            let mut lines = vec![Line::from(" Still in progress:")];
+            for w in work {
+                lines.push(Line::from(Span::styled(
+                    format!(" · {}", crate::td::sentence_case(w)),
+                    theme::warning(),
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                Span::styled(" y ", theme::active_field()),
+                Span::raw("quit anyway   "),
+                Span::styled("n ", theme::active_field()),
+                Span::raw("cancel"),
+            ]));
+            let w = lines
+                .iter()
+                .map(|l| line_width(l))
+                .max()
+                .unwrap_or(0)
+                .max(36) as u16
+                + 3;
+            let rect = centered(area, w, lines.len() as u16 + 2);
+            modal(frame, rect, "Quit", lines);
+        }
         Popup::ConfirmLogout => {
             let lines = vec![
-                Line::from(" Log out of Telegram? y/N"),
+                Line::from(" Log out of Telegram?"),
                 Line::from(""),
                 Line::from(vec![
                     Span::styled(" y ", theme::active_field()),
@@ -3467,7 +3994,7 @@ fn draw_popup(frame: &mut Frame, area: Rect, app: &App) {
                 Line::from(vec![
                     Span::styled("> ", theme::active_field()),
                     if input.is_empty() {
-                        Span::styled("type a chat name...", theme::muted())
+                        Span::styled("Type a chat name…", theme::muted())
                     } else {
                         Span::raw(input.text().to_owned())
                     },
@@ -3502,7 +4029,7 @@ fn draw_popup(frame: &mut Frame, area: Rect, app: &App) {
             );
             let title = match forward {
                 Some(f) => format!(
-                    "Forward to{} · Tab mark · C-t sender name: {}",
+                    "Forward to{} · Tab mark · <C-t> sender name: {}",
                     match f.targets.len() {
                         0 => String::new(),
                         n => format!(" {n} chats"),
@@ -3533,7 +4060,7 @@ fn draw_file_picker(frame: &mut Frame, area: Rect, app: &App, fp: &crate::app::F
         Line::from(vec![
             Span::styled("> ", theme::active_field()),
             if fp.input.is_empty() {
-                Span::styled("type a path (~/ for home)...", theme::muted())
+                Span::styled("Type a path (~/ for home)…", theme::muted())
             } else {
                 Span::raw(fp.input.text().to_owned())
             },
@@ -3553,9 +4080,12 @@ fn draw_file_picker(frame: &mut Frame, area: Rect, app: &App, fp: &crate::app::F
             theme::error(),
         )));
     } else if dir != fp.dir {
-        lines.push(Line::from(Span::styled("⧗ reading...", theme::muted())));
+        lines.push(Line::from(Span::styled("⧗ Reading…", theme::muted())));
     } else if matches.is_empty() {
-        lines.push(Line::from(Span::styled("no matches", theme::muted())));
+        lines.push(Line::from(Span::styled(
+            "No matching files",
+            theme::muted(),
+        )));
     }
     let start = list_window(sel, matches.len(), rows);
     for (i, idx) in matches.iter().enumerate().skip(start).take(rows) {
@@ -3600,6 +4130,7 @@ fn draw_stickers(frame: &mut Frame, area: Rect, app: &mut App) {
         (area.width * 9 / 10).max(30),
         (area.height * 9 / 10).max(12),
     );
+    textmap::cover(rect);
     frame.render_widget(Clear, rect);
     let tab = sp.current_tab(&app.stickers);
     let title = if tab == crate::stickers::Tab::Gifs && sp.query.is_empty() {
@@ -3610,7 +4141,7 @@ fn draw_stickers(frame: &mut Frame, area: Rect, app: &mut App) {
     let block = theme::popup_block()
         .title(Span::styled(title, theme::popup_title()))
         .title_bottom(Span::styled(
-            " Tab/S-Tab section · arrows move · Enter send · C-o big preview · type words or emoji to search · Esc ",
+            " Tab/S-Tab section · arrows move · Enter send · <C-o> big preview · type words or emoji to search · Esc ",
             theme::muted(),
         ));
     let inner = block.inner(rect);
@@ -3630,7 +4161,7 @@ fn draw_stickers(frame: &mut Frame, area: Rect, app: &mut App) {
         Paragraph::new(Line::from(vec![
             Span::styled("> ", theme::active_field()),
             if q.is_empty() {
-                Span::styled("emoji or word to search...", theme::muted())
+                Span::styled("Emoji or word to search…", theme::muted())
             } else {
                 Span::raw(q.clone())
             },
@@ -3694,7 +4225,7 @@ fn draw_stickers(frame: &mut Frame, area: Rect, app: &mut App) {
             app.stickers.items(tab).is_none()
         };
         let text = if loading {
-            "⧗ loading..."
+            "⧗ Loading…"
         } else {
             "nothing here"
         };
@@ -3702,6 +4233,10 @@ fn draw_stickers(frame: &mut Frame, area: Rect, app: &mut App) {
     }
     let animated = app.media.anim.enabled()
         && app.settings.media.animations != crate::config::Animations::Off;
+    let paused = app.settings.media.pause_unfocused && !app.term_focused;
+    app.media.anim.pause(paused);
+    let now = app.picker_freeze.at(app.anim_start.elapsed(), paused);
+    let mut head = crate::anim::Playhead::new(now, 1, paused);
     if sp.preview
         && let Some(item) = items.get(sp.sel)
     {
@@ -3721,7 +4256,7 @@ fn draw_stickers(frame: &mut Frame, area: Rect, app: &mut App) {
             cols: c,
             rows: r,
         };
-        if !(animated && draw_animation(frame, t, &mut app.media, &item.att)) {
+        if !(animated && draw_animation(frame, t, &mut app.media, &item.att, &mut head)) {
             draw_attachment(
                 frame,
                 t,
@@ -3730,9 +4265,10 @@ fn draw_stickers(frame: &mut Frame, area: Rect, app: &mut App) {
                 (0, i64::from(item.file_id), 0),
                 false,
                 true,
-                Duration::ZERO,
+                None,
             );
         }
+        app.redraw_due = min_due(app.redraw_due, head.due);
         app.popup = Some(Popup::Stickers(sp));
         return;
     }
@@ -3740,7 +4276,11 @@ fn draw_stickers(frame: &mut Frame, area: Rect, app: &mut App) {
         .filter(|i| animated && crate::anim::source(&items[*i].att).is_some())
         .collect();
     moving.sort_by_key(|i| i.abs_diff(sp.sel));
-    moving.truncate(app.settings.media.max_animations() * PICKER_ANIMATION_FACTOR);
+    moving.truncate(if app.media.anim.native() {
+        app.settings.media.max_animations() * PICKER_ANIMATION_FACTOR
+    } else {
+        1
+    });
     for (i, item) in items
         .iter()
         .enumerate()
@@ -3779,7 +4319,7 @@ fn draw_stickers(frame: &mut Frame, area: Rect, app: &mut App) {
             cols: c,
             rows: r,
         };
-        if moving.contains(&i) && draw_animation(frame, t, &mut app.media, &item.att) {
+        if moving.contains(&i) && draw_animation(frame, t, &mut app.media, &item.att, &mut head) {
             continue;
         }
         draw_attachment(
@@ -3790,14 +4330,15 @@ fn draw_stickers(frame: &mut Frame, area: Rect, app: &mut App) {
             (0, i64::from(item.file_id), 0),
             false,
             false,
-            Duration::ZERO,
+            None,
         );
     }
+    app.redraw_due = min_due(app.redraw_due, head.due);
     app.popup = Some(Popup::Stickers(sp));
 }
 
 const HINT_GAP: usize = 4;
-const HINT_MIN_WIDTH: u16 = 74;
+const HINT_CANCEL: &str = " Esc cancel ";
 
 fn hint_column(group: crate::keymap::Group, hints: &[crate::keymap::Hint]) -> Vec<Line<'static>> {
     let key_w = hints.iter().map(|h| h.key.width() + 2).max().unwrap_or(3);
@@ -3881,29 +4422,38 @@ fn draw_key_hint(frame: &mut Frame, area: Rect, app: &App) {
     if app.pending.is_empty() {
         return;
     }
-    let groups = app.keymap.grouped_continuations(&app.pending);
+    let groups = app.key_hints();
     if groups.is_empty() {
         return;
     }
     let lines = key_hint_lines(&groups, area.width.saturating_sub(4) as usize);
-    let content_w = lines.iter().map(line_width).max().unwrap_or(0) as u16;
-    let width = (content_w + 4).max(HINT_MIN_WIDTH).min(area.width);
-    let height = (lines.len() as u16 + 2).min(area.height);
-    let rect = Rect {
-        x: area.x + area.width.saturating_sub(width) / 2,
-        y: area.y + area.height.saturating_sub(height),
-        width,
-        height,
-    };
     let title = if app.pending.first() == Some(&app.keymap.leader) && app.pending.len() == 1 {
         "Leader".to_owned()
     } else {
         app.pending.iter().map(|c| c.label()).collect::<String>()
     };
+    let content_w = lines
+        .iter()
+        .map(line_width)
+        .max()
+        .unwrap_or(0)
+        .max(title.width() + 2)
+        .max(HINT_CANCEL.width());
+    let width = (content_w + 4).min(area.width as usize) as u16;
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let lift = u16::from(area.height > height);
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height + lift),
+        width,
+        height,
+    };
+    textmap::cover(rect);
     frame.render_widget(Clear, rect);
     let block = theme::popup_block()
         .padding(Padding::horizontal(1))
-        .title(Span::styled(format!(" {title} "), theme::popup_title()));
+        .title(Span::styled(format!(" {title} "), theme::popup_title()))
+        .title_bottom(Span::styled(HINT_CANCEL, theme::muted()));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     frame.render_widget(Paragraph::new(lines), inner);
@@ -3913,6 +4463,13 @@ fn draw_login(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut cursor_row: Option<(usize, usize)> = None;
     let hint = |text: &str| Line::from(Span::styled(text.to_owned(), theme::muted()));
+    let max_text = (area.width as usize).saturating_sub(5).max(10);
+    let wrapped = |text: &str, style: Style| -> Vec<Line<'static>> {
+        crate::popups::wrap_words(text, max_text)
+            .into_iter()
+            .map(|row| Line::from(Span::styled(row, style)))
+            .collect()
+    };
     let field = |label: &str, value: String| {
         vec![
             Line::from(Span::styled(label.to_owned(), theme::strong())),
@@ -3923,22 +4480,22 @@ fn draw_login(frame: &mut Frame, area: Rect, app: &App) {
         ]
     };
     match &app.auth {
-        Auth::Starting => lines.push(hint("Connecting to Telegram...")),
-        Auth::Closing => lines.push(hint("Closing session...")),
+        Auth::Starting => lines.push(hint("Connecting to Telegram…")),
+        Auth::Closing => lines.push(hint("Closing the session…")),
         Auth::Ready => {}
         Auth::Blocked(text) => {
-            lines.push(Line::from(Span::styled(text.clone(), theme::warning())));
+            lines.extend(wrapped(text, theme::warning()));
             lines.push(Line::from(""));
-            lines.push(hint("q: quit"));
+            lines.push(hint("Enter: log in again · q: quit"));
         }
         Auth::Qr(None) => {
-            lines.push(hint("Requesting QR code..."));
+            lines.push(hint("Requesting a QR code…"));
             lines.push(Line::from(""));
             lines.push(hint("p: log in with phone number · q: quit"));
         }
         Auth::Qr(Some(link)) => match qr::qr_lines(link) {
             Ok(qr) => {
-                let fits = qr.len() + 6 <= area.height as usize
+                let fits = qr.len() + 5 <= area.height as usize
                     && qr.first().map_or(0, |l| l.chars().count()) + 4 <= area.width as usize;
                 if fits {
                     let qr_style = theme::qr();
@@ -3953,7 +4510,7 @@ fn draw_login(frame: &mut Frame, area: Rect, app: &App) {
                         format!(
                             "Terminal too small for the QR code (need {}x{}).",
                             w,
-                            qr.len() + 6
+                            qr.len() + 5
                         ),
                         theme::warning(),
                     )));
@@ -3972,7 +4529,7 @@ fn draw_login(frame: &mut Frame, area: Rect, app: &App) {
             cursor_row = Some((1, 2));
             lines.push(Line::from(""));
             lines.push(hint(
-                "Enter: send code · Esc: back to QR login · Ctrl+C: quit",
+                "Enter: send code · Esc: back to QR login · <C-c>: quit",
             ));
         }
         Auth::Code { phone, via } => {
@@ -3982,7 +4539,7 @@ fn draw_login(frame: &mut Frame, area: Rect, app: &App) {
             ));
             cursor_row = Some((1, 2));
             lines.push(Line::from(""));
-            lines.push(hint("Enter: confirm · Esc: change number · Ctrl+C: quit"));
+            lines.push(hint("Enter: confirm · Esc: change number · <C-c>: quit"));
         }
         Auth::Password { hint: pw_hint } => {
             let masked = "•".repeat(app.login_input.text().chars().count());
@@ -3992,7 +4549,7 @@ fn draw_login(frame: &mut Frame, area: Rect, app: &App) {
                 lines.push(hint(&format!("Hint: {pw_hint}")));
             }
             lines.push(Line::from(""));
-            lines.push(hint("Enter: confirm · Ctrl+C: quit"));
+            lines.push(hint("Enter: confirm · Esc: clear · <C-c>: quit"));
         }
         Auth::Email => {
             lines.extend(field(
@@ -4000,6 +4557,8 @@ fn draw_login(frame: &mut Frame, area: Rect, app: &App) {
                 app.login_input.text().to_owned(),
             ));
             cursor_row = Some((1, 2));
+            lines.push(Line::from(""));
+            lines.push(hint("Enter: send code · Esc: change number · <C-c>: quit"));
         }
         Auth::EmailCode { pattern } => {
             lines.extend(field(
@@ -4007,11 +4566,21 @@ fn draw_login(frame: &mut Frame, area: Rect, app: &App) {
                 app.login_input.text().to_owned(),
             ));
             cursor_row = Some((1, 2));
+            lines.push(Line::from(""));
+            lines.push(hint("Enter: confirm · Esc: change number · <C-c>: quit"));
         }
+    }
+    if app.login_busy && app.auth.takes_text() {
+        let busy = if app.auth == Auth::Phone {
+            "Sending the code…"
+        } else {
+            "Checking…"
+        };
+        lines.push(Line::from(Span::styled(busy, theme::status())));
     }
     if let Some(err) = &app.auth_error {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(err.clone(), theme::error())));
+        lines.extend(wrapped(err, theme::error()));
     }
     let content_w = lines
         .iter()
@@ -4020,7 +4589,11 @@ fn draw_login(frame: &mut Frame, area: Rect, app: &App) {
         .unwrap_or(20);
     let width = (content_w as u16 + 4).max(50).min(area.width.max(1));
     let height = (lines.len() as u16 + 2).min(area.height.max(1));
-    let rect = centered(area, width, height);
+    let mut rect = centered(area, width, height);
+    if rect.height < height {
+        rect.y = area.y;
+        rect.height = height;
+    }
     let block = theme::popup_block().title(Span::styled(
         format!(" {APP_NAME} login "),
         theme::header_title(),
@@ -4150,6 +4723,7 @@ mod tests {
                 auto_delete: 0,
                 perms: crate::model::Rights::default(),
                 protected: false,
+                reactions_off: false,
             },
         );
         let mut h = History::default();
@@ -4307,7 +4881,7 @@ mod tests {
         press(&mut app, K::Char('s'), M::NONE);
         assert!(matches!(app.popup, Some(Popup::Stickers(_))));
         let screen = render(&mut app, 120, 40);
-        assert!(screen.contains("loading"));
+        assert!(screen.contains("Loading"));
         app.handle(Event::Stickers(Data::Recent(
             (1..=30)
                 .map(|i| item(i, if i % 2 == 0 { "🐱" } else { "😀" }))
@@ -4384,7 +4958,7 @@ mod tests {
         assert!(screen.contains("REC 0:07"));
         assert!(screen.contains("Enter · Esc"));
         app.recording.as_mut().unwrap().stopping = true;
-        assert!(render(&mut app, 120, 40).contains("encoding"));
+        assert!(render(&mut app, 120, 40).contains("Encoding"));
         app.recording = None;
         let h = app.histories.get_mut(&10).unwrap();
         let m = h.get_mut(40).unwrap();
@@ -4398,7 +4972,7 @@ mod tests {
         m.outgoing = true;
         let screen = render(&mut app, 120, 40);
         assert!(screen.contains("big.zip · 2 KB ⇡ 25%"), "{screen}");
-        assert!(screen.contains("uploading..."));
+        assert!(screen.contains("Uploading…"));
         app.focus = Pane::Messages;
         app.msg_sel = Some(39);
         press(
@@ -4410,6 +4984,40 @@ mod tests {
             panic!("no menu");
         };
         assert_eq!(items[0].label, "Cancel sending");
+    }
+
+    #[test]
+    fn viewer_hint_lists_only_keys_that_do_something() {
+        assert_eq!(viewer_hint(false, false, 0, 1), " Esc close ");
+        let first = viewer_hint(false, true, 0, 3);
+        assert!(
+            first.starts_with(" j next · x play/open · s save · o "),
+            "{first}"
+        );
+        assert!(!first.contains("prev"), "{first}");
+        let middle = viewer_hint(false, false, 1, 3);
+        assert_eq!(middle, " j/k prev/next · Esc close ");
+        let last = viewer_hint(true, true, 2, 3);
+        assert!(
+            last.ends_with("m mute · k prev · x mpv · s save · Esc close "),
+            "{last}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_popup_shows_only_the_allowed_modes() {
+        let mut app = app();
+        for (everyone, me) in [(true, false), (false, true), (true, true)] {
+            app.popup = Some(Popup::ConfirmDelete {
+                chat_id: 10,
+                message_ids: vec![1],
+                everyone,
+                me,
+            });
+            let screen = render(&mut app, 100, 40);
+            assert_eq!(screen.contains("for everyone"), everyone, "{everyone} {me}");
+            assert_eq!(screen.contains("only for me"), me, "{everyone} {me}");
+        }
     }
 
     fn render(app: &mut App, w: u16, h: u16) -> String {
@@ -5017,7 +5625,7 @@ mod tests {
             assert!(opt.contains(&format!("{tl} Options")), "{opt}");
             assert!(
                 rows.iter()
-                    .any(|r| r.contains(&format!("6 Border style: {}", style.name())))
+                    .any(|r| r.contains(&format!("2 Border style: {}", style.name())))
             );
             app.popup = None;
             app.pending = vec![app.keymap.leader];
@@ -5067,7 +5675,7 @@ mod tests {
             .join(" ");
         assert!(
             flat.contains(
-                "smart: composer if unread fit on screen, else first unread; composer; messages"
+                "Smart: composer if unread fit on screen, else first unread; composer; messages"
             ),
             "{text}"
         );
@@ -5171,15 +5779,26 @@ mod tests {
         assert!(w[4].contains("[p]      profile"), "{w:#?}");
         assert!(
             w[2].trim_end_matches(['│', ' ', '╯', '╮'])
-                .ends_with("[o]  options"),
+                .ends_with("[?]  all key bindings"),
             "{w:#?}"
         );
         assert!(
             w[3].trim_end_matches(['│', ' ', '╯', '╮'])
+                .ends_with("[o]  options"),
+            "{w:#?}"
+        );
+        assert!(
+            w[4].trim_end_matches(['│', ' ', '╯', '╮'])
                 .ends_with("[L]  log out"),
             "{w:#?}"
         );
         assert_eq!(wide.last().map(|l| l.contains('╰')), Some(true));
+        let bottom = &wide[wide.len() - 2];
+        assert!(bottom.contains("╰ Esc cancel ─"), "{wide:#?}");
+        assert!(
+            !wide.last().unwrap().contains("Esc cancel"),
+            "the popup sits above the pane borders instead of cutting through them"
+        );
         let narrow = snapshot(&mut app, 70, 40);
         let n = inner(&narrow);
         assert!(
@@ -5206,6 +5825,204 @@ mod tests {
             buf[(x, y)].fg
         };
         assert_eq!(buf_row(&mut app), Color::Red);
+    }
+
+    fn popup_box(rows: &[String], title: &str) -> Vec<String> {
+        let corner = format!("╭ {title} ");
+        let top = rows.iter().position(|l| l.contains(&corner)).unwrap();
+        let byte = rows[top].find(&corner).unwrap();
+        let left = rows[top][..byte].chars().count();
+        let right = rows[top]
+            .chars()
+            .skip(left + 1)
+            .position(|c| c == '╮')
+            .unwrap()
+            + left
+            + 1;
+        let cut = |l: &String| -> String { l.chars().skip(left).take(right - left + 1).collect() };
+        let end = rows[top..]
+            .iter()
+            .position(|l| cut(l).starts_with('╰'))
+            .unwrap();
+        rows[top..=top + end].iter().map(cut).collect()
+    }
+
+    #[test]
+    fn short_prefix_hints_fit_their_items_and_say_how_to_cancel() {
+        let mut app = app();
+        app.pending = vec![crate::keymap::Chord::new(
+            crossterm::event::KeyCode::Char(']'),
+            crossterm::event::KeyModifiers::NONE,
+        )];
+        let rows = snapshot(&mut app, 120, 30);
+        let hint = popup_box(&rows, "]");
+        let width = hint[0].chars().count();
+        assert!(width < 40, "{hint:#?}");
+        assert!(
+            hint.iter()
+                .any(|l| l.contains("[m]  next unread mention or reply")),
+            "{hint:#?}"
+        );
+        assert!(hint.last().unwrap().contains("Esc cancel"), "{hint:#?}");
+        let bottom = rows.iter().rposition(|l| l.contains("Esc cancel")).unwrap();
+        assert_eq!(bottom, rows.len() - 2, "one row above the pane borders");
+        assert!(!rows.last().unwrap().contains("╰╰"), "{rows:#?}");
+    }
+
+    #[test]
+    fn long_menus_scroll_fit_their_labels_and_name_their_keys() {
+        use crossterm::event::{KeyCode as K, KeyModifiers as M};
+        let mut app = app();
+        app.focus = Pane::Messages;
+        app.msg_sel = Some(39);
+        press(&mut app, K::Enter, M::NONE);
+        let labels: Vec<&str> = match &app.popup {
+            Some(Popup::Menu { items, .. }) => items.iter().map(|i| i.label).collect(),
+            _ => panic!("no menu"),
+        };
+        let n = labels.len();
+        let rows = snapshot(&mut app, 100, 12);
+        let menu = popup_box(&rows, "Message actions");
+        assert_eq!(menu.len(), 10, "{menu:#?}");
+        assert!(
+            menu.last()
+                .unwrap()
+                .contains(&format!("1/{n} · Enter run · Esc close")),
+            "{menu:#?}"
+        );
+        let mark = labels
+            .iter()
+            .position(|l| l.starts_with("Mark / unmark"))
+            .unwrap();
+        for _ in 0..mark {
+            press(&mut app, K::Char('j'), M::NONE);
+        }
+        let menu = popup_box(&snapshot(&mut app, 100, 12), "Message actions");
+        assert!(
+            menu.iter()
+                .any(|l| l.contains("m Mark / unmark (select several) ")),
+            "{menu:#?}"
+        );
+        for _ in mark..n - 1 {
+            press(&mut app, K::Char('j'), M::NONE);
+        }
+        let menu = popup_box(&snapshot(&mut app, 100, 12), "Message actions");
+        assert!(
+            menu[menu.len() - 2].contains(labels[n - 1]),
+            "the last item is on screen when selected: {menu:#?}"
+        );
+        assert!(
+            menu.last().unwrap().contains(&format!("{n}/{n}")),
+            "{menu:#?}"
+        );
+        let tall = snapshot(&mut app, 100, 50);
+        let menu = popup_box(&tall, "Message actions");
+        assert_eq!(menu.len(), n + 2, "everything fits, nothing to scroll");
+        assert!(menu.last().unwrap().contains("╰ Enter run · Esc close"));
+    }
+
+    #[test]
+    fn help_popup_lists_bindings_by_context_and_scrolls() {
+        use crossterm::event::{KeyCode as K, KeyModifiers as M};
+        let mut app = app();
+        press(&mut app, K::Char('?'), M::NONE);
+        let rows = snapshot(&mut app, 100, 30);
+        let help = popup_box(&rows, "Key bindings");
+        assert_eq!(help.len(), 28, "{help:#?}");
+        let text = help.join("\n");
+        for want in [
+            " Global",
+            "?, Space ?",
+            "all key bindings",
+            "ShowKeyBindings",
+            "Space Space",
+            "j, ↓",
+            "action names for keymap.toml",
+            "j/k scroll · ? or Esc close",
+        ] {
+            assert!(text.contains(want), "{want}: {help:#?}");
+        }
+        press(&mut app, K::Char('G'), M::NONE);
+        let help = popup_box(&snapshot(&mut app, 100, 30), "Key bindings");
+        let text = help.join("\n");
+        assert!(
+            text.contains("text selection: move, select, copy"),
+            "{help:#?}"
+        );
+        assert!(text.contains(" Popups, menus and search"), "{help:#?}");
+        let narrow = popup_box(&snapshot(&mut app, 60, 20), "Key bindings");
+        assert!(narrow[0].chars().count() <= 58, "{narrow:#?}");
+        assert!(
+            !narrow.join("\n").contains("ShowKeyBindings"),
+            "action names give way on narrow screens: {narrow:#?}"
+        );
+    }
+
+    #[test]
+    fn read_only_chats_show_why_in_place_of_the_composer_hint() {
+        let mut app = app();
+        assert!(render(&mut app, 120, 30).contains("press i to write"));
+        let c = app.chats.get_mut(&10).unwrap();
+        c.kind = ChatKind::Channel;
+        c.group_id = 7;
+        app.groups.insert(
+            7,
+            crate::model::GroupMeta {
+                forum: false,
+                status: crate::model::Membership::Member,
+            },
+        );
+        let screen = render(&mut app, 120, 30);
+        assert!(
+            screen.contains("only admins can post in this channel"),
+            "{screen}"
+        );
+        assert!(!screen.contains("to write"));
+        app.groups.get_mut(&7).unwrap().status = crate::model::Membership::Left;
+        assert!(render(&mut app, 120, 30).contains("press i to join"));
+    }
+
+    #[test]
+    fn chat_removal_confirmations_name_the_chat_and_the_choices() {
+        let mut app = app();
+        app.popup = Some(Popup::ConfirmRemoveChat {
+            chat_id: 10,
+            leave: true,
+            revoke: false,
+        });
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("Leave Rust чат?"), "{screen}");
+        assert!(screen.contains(" y leave"));
+        assert!(!screen.contains("Enter"));
+        app.chats.insert(
+            20,
+            ChatInfo {
+                id: 20,
+                title: "Alice Longname".to_owned(),
+                kind: ChatKind::Private(2),
+                ..app.chats[&10].clone()
+            },
+        );
+        app.popup = Some(Popup::ConfirmRemoveChat {
+            chat_id: 20,
+            leave: false,
+            revoke: true,
+        });
+        let screen = render(&mut app, 100, 30);
+        assert!(
+            screen.contains("Delete the chat with Alice Longname?"),
+            "{screen}"
+        );
+        assert!(screen.contains(" y for me and Alice Longname"), "{screen}");
+        assert!(screen.contains(" m only for me (Enter)"), "{screen}");
+        app.popup = Some(Popup::ConfirmRemoveChat {
+            chat_id: 20,
+            leave: false,
+            revoke: false,
+        });
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains(" y delete (Enter)"), "{screen}");
+        assert!(!screen.contains("for me and"), "{screen}");
     }
 
     #[test]
@@ -5252,6 +6069,7 @@ mod tests {
                 auto_delete: 0,
                 perms: crate::model::Rights::default(),
                 protected: false,
+                reactions_off: false,
             },
         );
         app.user_meta.insert(
@@ -5450,7 +6268,7 @@ mod tests {
         let screen = render(&mut app, 120, 40);
         assert!(screen.contains("[ ] Don't mark as read"));
         assert!(screen.contains("[x] Ghost mode"));
-        assert!(screen.contains("never online, no typing status"));
+        assert!(screen.contains("Never online, no typing status"));
         let found = |id: i64| {
             let mut m = msg(id, 2, 1_700_000_000, "needle here");
             m.chat_id = 10;
@@ -5468,10 +6286,48 @@ mod tests {
             token: 1,
             loading: false,
             error: None,
+            browse: false,
+            due: None,
+            next: None,
+            total: 2,
+            paging: false,
+            follow: false,
         }));
         let screen = render(&mut app, 120, 40);
         assert!(screen.contains("Search all chats"));
         assert!(screen.contains("Rust чат · Alice Longname: needle here"));
+        let mut hit = found(3);
+        hit.body = RichText::plain("learning Rust today");
+        let mut view = crate::search::FindView::new(crate::search::Scope::All);
+        view.input = crate::input::TextInput::with_text("rust");
+        view.sent = Some("rust".to_owned());
+        view.peers = Some(crate::td::Peers::default());
+        view.msgs = vec![hit];
+        view.total = 12;
+        app.popup = Some(Popup::Find(view));
+        let screen = render(&mut app, 120, 40);
+        for want in [
+            "Chats and contacts",
+            "Rust чат · group",
+            "Messages · 12 found",
+            "Rust чат · Alice Longname: learning Rust today",
+        ] {
+            assert!(screen.contains(want), "{want}: {screen}");
+        }
+        let buf = buffer(&mut app, 120, 40);
+        let (x, y) = find(&buf, "Rust today");
+        let mods = |x: u16| buf[(x, y)].modifier;
+        assert!(mods(x).contains(ratatui::style::Modifier::UNDERLINED));
+        assert!(!mods(x + 5).contains(ratatui::style::Modifier::UNDERLINED));
+        for (w, h) in [(40, 12), (20, 6), (1, 1)] {
+            render(&mut app, w, h);
+        }
+        if let Some(Popup::Find(v)) = &mut app.popup {
+            v.input = crate::input::TextInput::with_text("zzz");
+            v.sent = Some("zzz".to_owned());
+            v.msgs.clear();
+        }
+        assert!(render(&mut app, 120, 40).contains("No results for “zzz”"));
         app.inbox.push_front(crate::model::InboxItem {
             chat_id: 10,
             msg_id: 1,
@@ -5565,6 +6421,72 @@ mod tests {
     }
 
     #[test]
+    fn link_popups_render() {
+        let mut app = app();
+        let link = |url: &str, text: &str, hidden: bool| format::Link {
+            url: url.to_owned(),
+            hidden,
+            text: text.to_owned(),
+        };
+        let links = || {
+            vec![
+                link("https://t.me/rustlang", "@rustlang", false),
+                link("tg://user?id=2", "Alice", false),
+                link("https://evil.example/x", "docs", true),
+            ]
+        };
+        app.popup = Some(Popup::Links {
+            links: links(),
+            sel: 1,
+        });
+        let screen = render(&mut app, 120, 40);
+        assert!(screen.contains("Open link"), "{screen}");
+        assert!(screen.contains("1 @rustlang"), "{screen}");
+        assert!(screen.contains("2 Alice"), "{screen}");
+        assert!(
+            screen.contains("3 docs  https://evil.example/x"),
+            "{screen}"
+        );
+        app.popup = Some(Popup::ConfirmStart {
+            chat_id: 10,
+            bot_id: 2,
+            parameter: "ref42".to_owned(),
+        });
+        let screen = render(&mut app, 120, 40);
+        assert!(screen.contains("Start Rust чат?"), "{screen}");
+        assert!(screen.contains("ref42"), "{screen}");
+        assert!(screen.contains("y start"), "{screen}");
+        app.popup = Some(Popup::ConfirmJoin(crate::td::Invite {
+            link: "https://t.me/+abc".to_owned(),
+            title: "Rustaceans".to_owned(),
+            channel: true,
+            members: 1234,
+            request: true,
+        }));
+        let screen = render(&mut app, 120, 40);
+        assert!(screen.contains("Join Rustaceans?"), "{screen}");
+        assert!(screen.contains("Channel · 1.2K subscribers"), "{screen}");
+        assert!(screen.contains("approve"), "{screen}");
+        assert!(screen.contains("y send request"), "{screen}");
+        for (w, h) in [(30, 8), (80, 24), (200, 60), (4, 3)] {
+            for popup in [
+                Popup::Links {
+                    links: links(),
+                    sel: 2,
+                },
+                Popup::ConfirmStart {
+                    chat_id: 99,
+                    bot_id: 2,
+                    parameter: String::new(),
+                },
+            ] {
+                app.popup = Some(popup);
+                render(&mut app, w, h);
+            }
+        }
+    }
+
+    #[test]
     fn dashboard_renders_at_many_sizes() {
         let mut app = app();
         for (w, h) in [(160, 50), (80, 24), (40, 10), (10, 4), (1, 1)] {
@@ -5599,7 +6521,7 @@ mod tests {
         app.pending.clear();
         app.popup = Some(Popup::ConfirmLogout);
         let screen = render(&mut app, 120, 40);
-        assert!(screen.contains("Log out of Telegram? y/N"));
+        assert!(screen.contains("Log out of Telegram?"));
         app.popup = Some(Popup::Switcher {
             input: crate::input::TextInput::with_text("rust"),
             sel: 0,
@@ -5669,6 +6591,7 @@ mod tests {
                 Duration::ZERO,
             )],
             bytes: 1,
+            cost: 1,
         }
     }
 
@@ -5959,6 +6882,142 @@ mod tests {
         }
         app.auth = Auth::Qr(Some("tg://login?token=abc".to_owned()));
         assert!(render(&mut app, 120, 50).contains("Link Desktop Device"));
+        app.auth = Auth::Qr(Some(format!("tg://login?token={}", "A".repeat(43))));
+        let small = render(&mut app, 80, 24);
+        assert!(small.contains("Link Desktop Device"), "{small}");
+        assert!(small.contains("log in with phone number"), "{small}");
+        assert!(!small.contains("too small"), "{small}");
+    }
+
+    #[test]
+    fn login_screens_show_keys_progress_and_wrap_long_messages() {
+        let mut app = app();
+        app.auth = Auth::Email;
+        assert!(render(&mut app, 100, 30).contains("Enter: send code · Esc: change number"));
+        app.auth = Auth::EmailCode {
+            pattern: "a***@x.com".to_owned(),
+        };
+        let text = render(&mut app, 100, 30);
+        assert!(
+            text.contains("Enter: confirm · Esc: change number · <C-c>: quit"),
+            "{text}"
+        );
+        assert!(!text.contains("Checking"));
+        app.login_busy = true;
+        assert!(render(&mut app, 100, 30).contains("Checking…"));
+        app.auth = Auth::Phone;
+        assert!(render(&mut app, 100, 30).contains("Sending the code…"));
+        app.login_busy = false;
+        app.auth = Auth::Blocked(
+            "This phone number has no Telegram account. Sign up in an official app first, or log in with a QR code."
+                .to_owned(),
+        );
+        let rows = snapshot(&mut app, 80, 24);
+        let text = rows.join("\n");
+        assert!(
+            text.contains("This phone number has no Telegram account."),
+            "{text}"
+        );
+        assert!(
+            text.contains("log in with a QR code."),
+            "wrapped, not cut\n{text}"
+        );
+        assert!(text.contains("Enter: log in again · q: quit"), "{text}");
+        app.auth = Auth::Phone;
+        app.auth_error = Some(format!("Couldn't send the code: {}", "very ".repeat(30)));
+        let text = snapshot(&mut app, 80, 24).join("\n");
+        assert!(text.contains("very very"), "{text}");
+        assert!(
+            !text.contains(
+                "very very very very very very very very very very very very very very very very"
+            ),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn header_has_no_version_and_shortens_what_does_not_fit() {
+        let mut app = app();
+        app.my_id = Some(1);
+        let rows = snapshot(&mut app, 100, 30);
+        assert!(rows[0].contains("gramtty"), "{}", rows[0]);
+        assert!(!rows[0].contains(env!("CARGO_PKG_VERSION")), "{}", rows[0]);
+        assert!(rows[0].contains("Connected as Me"), "{}", rows[0]);
+        app.set_status("saved to ~/Downloads", false);
+        let rows = snapshot(&mut app, 100, 30);
+        assert!(rows[0].contains("Connected as Me"), "{}", rows[0]);
+        assert!(rows[0].contains("Saved to ~/Downloads"), "{}", rows[0]);
+        app.set_status(
+            format!("couldn't load messages: {}", "a long reason ".repeat(20)),
+            true,
+        );
+        let rows = snapshot(&mut app, 100, 30);
+        assert!(rows[0].contains("Couldn't load messages"), "{}", rows[0]);
+        assert!(rows[0].trim_end().ends_with('…'), "{}", rows[0]);
+        assert!(!rows[0].contains("Connected as"), "{}", rows[0]);
+        assert!(rows[0].chars().count() <= 100);
+    }
+
+    #[test]
+    fn status_log_and_quit_confirmation_render() {
+        let mut app = app();
+        app.popup = Some(Popup::StatusLog { scroll: 0 });
+        assert!(render(&mut app, 100, 30).contains("No notices or errors yet"));
+        app.set_status("first notice", false);
+        app.set_status(
+            format!("couldn't load messages: {}", "a long reason ".repeat(12)),
+            true,
+        );
+        let rows = snapshot(&mut app, 100, 30);
+        assert!(rows.iter().any(|r| r.contains("Recent notices and errors")));
+        let error = row_of(&rows, "Couldn't load messages");
+        let notice = row_of(&rows, "First notice");
+        assert!(notice > error + 1, "newest first, long entries wrap");
+        app.popup = Some(Popup::ConfirmQuit(vec![
+            "a file is still uploading".to_owned(),
+        ]));
+        let text = render(&mut app, 100, 30);
+        assert!(text.contains("Still in progress"), "{text}");
+        assert!(text.contains("A file is still uploading"), "{text}");
+        assert!(text.contains("y quit anyway"), "{text}");
+    }
+
+    #[test]
+    fn profile_hint_offers_their_messages_only_once_loaded() {
+        let mut app = app();
+        app.popup = Some(Popup::Profile(crate::app::ProfileView {
+            target: crate::model::ProfileTarget::User(2),
+            data: None,
+            error: None,
+            scroll: 0,
+        }));
+        let text = render(&mut app, 120, 40);
+        assert!(text.contains("Loading profile…"), "{text}");
+        assert!(!text.contains("their messages"), "{text}");
+    }
+
+    #[test]
+    fn terminal_clipboard_sequences_are_written_with_the_frame() {
+        use crate::ui::repaint_tests::Sink;
+        let mut app = app();
+        app.terminal_out.push(crate::upload::osc52("hi", false));
+        let sink = Sink::default();
+        let area = Rect::new(0, 0, 80, 24);
+        let mut term = Terminal::with_options(
+            Resync(CrosstermBackend::new(sink.clone())),
+            ratatui::TerminalOptions {
+                viewport: ratatui::Viewport::Fixed(area),
+            },
+        )
+        .unwrap();
+        let mut layout = image_layout(&Buffer::empty(area));
+        draw_frame(&mut term, &mut app, &mut layout, |_| {}).unwrap();
+        let out = String::from_utf8_lossy(&sink.0.borrow()).into_owned();
+        assert!(out.contains("\x1b]52;c;aGk=\x07"));
+        assert!(app.terminal_out.is_empty());
+        sink.0.borrow_mut().clear();
+        draw_frame(&mut term, &mut app, &mut layout, |_| {}).unwrap();
+        assert!(!String::from_utf8_lossy(&sink.0.borrow()).contains("]52;"));
     }
 
     const COLOUR_ONLY: [&str; 10] = [
@@ -6264,6 +7323,147 @@ mod tests {
         assert!(!text.contains("Phone"), "{text}");
     }
 
+    fn group_profile() -> crate::model::Profile {
+        crate::model::Profile {
+            usernames: vec!["rust_ru".to_owned()],
+            bio: "Everything about Rust. ".repeat(30),
+            members: Some(1234),
+            links: vec![
+                "https://t.me/rust_ru".to_owned(),
+                "https://t.me/+AbCdEf".to_owned(),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn chat_info_puts_who_first_then_about_then_details_and_hides_ids_unless_asked() {
+        let mut app = info_app();
+        app.open_chat = Some(10);
+        app.chat_profiles.insert(10, group_profile());
+        let rows = info_rows(&buffer(&mut app, 120, 80));
+        let text = rows.join("\n");
+        let at = |needle: &str| {
+            rows.iter()
+                .position(|r| r.contains(needle))
+                .unwrap_or_else(|| panic!("{needle}:\n{text}"))
+        };
+        let members = format!("Members: {}", app.count(1234));
+        let order = [
+            at("Rust чат"),
+            at("Username: @rust_ru"),
+            at(&members),
+            at(" Description"),
+            at("Type: group"),
+            at("Link: https://t.me/+AbCdEf"),
+            at("Unread: 3"),
+        ];
+        assert!(order.windows(2).all(|w| w[0] < w[1]), "{order:?}\n{text}");
+        for absent in ["supergroup", "ID:", "Muted", "Notifications"] {
+            assert!(!text.contains(absent), "{absent}:\n{text}");
+        }
+        app.chats.get_mut(&10).unwrap().muted = true;
+        app.settings.appearance.show_ids = true;
+        let text = info_rows(&buffer(&mut app, 120, 80)).join("\n");
+        assert!(text.contains("Notifications: off"), "{text}");
+        assert!(
+            text.contains("Chat ID: 10") && !text.contains("User ID"),
+            "{text}"
+        );
+
+        let mut own = app.chats[&20].clone();
+        own.id = 2;
+        app.chats.insert(2, own);
+        app.histories.insert(2, History::default());
+        app.open_chat = Some(2);
+        let text = info_rows(&buffer(&mut app, 120, 40)).join("\n");
+        assert_eq!(text.matches("ID: 2").count(), 1, "{text}");
+        assert!(
+            text.contains("User ID: 2") && !text.contains("Chat ID"),
+            "{text}"
+        );
+        assert!(!text.contains("Type:"), "people need no type line:\n{text}");
+    }
+
+    #[test]
+    fn focused_chat_info_scrolls_with_the_navigation_keys() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = info_app();
+        app.open_chat = Some(10);
+        app.chat_profiles.insert(10, group_profile());
+        let top = |rows: &[String]| rows.iter().position(|r| r.contains("Rust чат"));
+        let thumb = |rows: &[String]| rows.iter().any(|r| r.ends_with('┃'));
+        let rows = info_rows(&buffer(&mut app, 120, 80));
+        assert!(!thumb(&rows), "everything fits, no scroll thumb");
+        let rows = info_rows(&buffer(&mut app, 120, 24));
+        let first = top(&rows).unwrap();
+        assert!(first > 4, "avatar above the title");
+        assert!(thumb(&rows), "{}", rows.join("\n"));
+        assert!(!rows.iter().any(|r| r.contains("Unread: 3")));
+        app.focus = Pane::Info;
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        let rows = info_rows(&buffer(&mut app, 120, 24));
+        assert_eq!(top(&rows), Some(2), "the avatar folds away first");
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        let rows = info_rows(&buffer(&mut app, 120, 24));
+        assert_eq!(top(&rows), None, "then the text moves line by line");
+        press(&mut app, KeyCode::PageDown, KeyModifiers::NONE);
+        press(&mut app, KeyCode::End, KeyModifiers::NONE);
+        let rows = info_rows(&buffer(&mut app, 120, 24));
+        assert!(
+            rows.iter().any(|r| r.contains("Unread: 3")),
+            "{}",
+            rows.join("\n")
+        );
+        let bottom = app.info_scroll;
+        press(&mut app, KeyCode::Char('j'), KeyModifiers::NONE);
+        buffer(&mut app, 120, 24);
+        assert_eq!(app.info_scroll, bottom, "stops at the end");
+        press(&mut app, KeyCode::Char('k'), KeyModifiers::NONE);
+        buffer(&mut app, 120, 24);
+        assert_eq!(app.info_scroll, bottom - 1);
+        press(&mut app, KeyCode::Home, KeyModifiers::NONE);
+        let rows = info_rows(&buffer(&mut app, 120, 24));
+        assert_eq!(top(&rows), Some(first));
+        app.open_chat = None;
+        app.open(20);
+        assert_eq!(app.info_scroll, 0, "another chat starts at the top");
+    }
+
+    #[test]
+    fn profile_popup_shows_each_id_once_and_only_with_show_ids() {
+        use crate::app::ProfileView;
+        let mut app = app();
+        app.show_info = false;
+        let profile = |id: i64| crate::model::Profile {
+            title: "Alice Longname".to_owned(),
+            kind: "user".to_owned(),
+            id,
+            user_id: Some(2),
+            ..Default::default()
+        };
+        let show = |app: &mut App, id: i64| {
+            app.popup = Some(Popup::Profile(ProfileView {
+                target: crate::model::ProfileTarget::User(2),
+                data: Some(profile(id)),
+                error: None,
+                scroll: 0,
+            }));
+            render(app, 120, 40)
+        };
+        let screen = show(&mut app, 2);
+        assert!(!screen.contains("ID "), "{screen}");
+        app.settings.appearance.show_ids = true;
+        let screen = show(&mut app, 2);
+        assert_eq!(screen.matches("User ID").count(), 1, "{screen}");
+        assert!(!screen.contains("Chat ID"), "{screen}");
+        let screen = show(&mut app, 77);
+        assert!(
+            screen.contains("Chat ID") && screen.contains("User ID"),
+            "{screen}"
+        );
+    }
+
     fn themed_classic() -> (App, std::rc::Rc<theme::Theme>) {
         let mut app = classic_app();
         app.my_id = Some(1);
@@ -6362,6 +7562,8 @@ mod tests {
             Popup::ConfirmDelete {
                 chat_id: 10,
                 message_ids: vec![1],
+                everyone: true,
+                me: true,
             },
             Popup::Switcher {
                 input: crate::input::TextInput::default(),
@@ -6376,7 +7578,7 @@ mod tests {
         }
         app.popup = Some(Popup::Options { sel: 6 });
         let buf = buffer(&mut app, 160, 40);
-        let (x, y) = find(&buf, "❯ 7");
+        let (x, y) = find(&buf, &format!("❯ {}", crate::app::option_key(6)));
         assert_eq!(buf[(x, y)].fg, c.selection.0.fg.unwrap());
         app.popup = None;
 
@@ -6435,12 +7637,13 @@ mod tests {
         let (x, y) = find_in(&buf, "Rust чат", 0..48);
         assert_eq!(x, ox);
         assert_eq!(buf[(x, y)].fg, c.unread_title.0.fg.unwrap());
+        let badge_y = y + 1;
         let badge_x = (x..47)
             .rev()
-            .find(|i| buf[(*i, y)].symbol() != " ")
+            .find(|i| buf[(*i, badge_y)].symbol() != " ")
             .unwrap();
-        assert_eq!(buf[(badge_x, y)].symbol(), "2");
-        assert_eq!(buf[(badge_x, y)].fg, c.unread_badge.0.fg.unwrap());
+        assert_eq!(buf[(badge_x, badge_y)].symbol(), "2");
+        assert_eq!(buf[(badge_x, badge_y)].fg, c.unread_badge.0.fg.unwrap());
         app.open_chat = Some(10);
         let buf = buffer(&mut app, 160, 40);
         assert_all_themed(&buf, "formatted text");
@@ -6670,7 +7873,7 @@ mod tests {
             assert!(text.contains("Message details"), "{text}");
             assert!(text.contains("Message ID"), "{text}");
             assert!(text.contains("Sender ID        2 (user)"), "{text}");
-            assert!(text.contains("checking..."), "{text}");
+            assert!(text.contains("Checking…"), "{text}");
         }
 
         #[test]
@@ -6695,7 +7898,7 @@ mod tests {
                 scroll: 0,
             });
             let text = snapshot(&mut app, 100, 40).join("\n");
-            assert!(text.contains("translating to ru via Telegram"), "{text}");
+            assert!(text.contains("Translating to ru via Telegram"), "{text}");
             app.popup = Some(Popup::Translate {
                 chat_id: 10,
                 msg_id: 2,
@@ -8489,7 +9692,7 @@ mod tests {
         h.start_older();
         let quiet = snapshot(&mut app, 100, 30);
         assert!(
-            !quiet.iter().any(|r| r.contains("loading older")),
+            !quiet.iter().any(|r| r.contains("Loading older")),
             "{}",
             quiet.join("\n")
         );
@@ -8500,7 +9703,7 @@ mod tests {
         let changed: Vec<usize> = (0..30).filter(|y| quiet[*y] != slow[*y]).collect();
         assert_eq!(changed.len(), 1, "{}", slow.join("\n"));
         assert!(
-            slow[changed[0]].contains("loading older"),
+            slow[changed[0]].contains("Loading older"),
             "{}",
             slow[changed[0]]
         );
@@ -8508,7 +9711,7 @@ mod tests {
         let row = changed[0];
         for _ in 0..3 {
             let again = snapshot(&mut app, 100, 30);
-            assert!(again[row].contains("loading older"));
+            assert!(again[row].contains("Loading older"));
         }
         app.handle(Event::History {
             chat_id: 10,
@@ -8517,7 +9720,7 @@ mod tests {
             epoch: app.histories[&10].epoch,
         });
         let done = snapshot(&mut app, 100, 30);
-        assert!(!done.iter().any(|r| r.contains("loading older")));
+        assert!(!done.iter().any(|r| r.contains("Loading older")));
     }
 
     #[test]
@@ -8564,7 +9767,11 @@ mod tests {
         list.merge_page(vec![topic], None, 1);
         app.topics.insert(10, list);
         app.refresh_lists();
-        for width in [60u16, 80, 100, 140] {
+        for (compact, width) in [false, true]
+            .into_iter()
+            .flat_map(|c| [60u16, 80, 100, 140].map(|w| (c, w)))
+        {
+            app.settings.appearance.compact_chat_list = compact;
             let mut term = Terminal::new(TestBackend::new(width, 30)).unwrap();
             term.draw(|f| draw(f, &mut app)).unwrap();
             let buf = term.backend().buffer().clone();
@@ -8577,6 +9784,7 @@ mod tests {
             let mut seen = std::collections::HashSet::new();
             for (pane, right) in corners.iter().take(2).enumerate() {
                 let left = lefts[pane];
+                let mut texts = Vec::new();
                 for y in 2..29u16 {
                     assert_eq!(
                         buf[(*right, y)].symbol(),
@@ -8598,7 +9806,9 @@ mod tests {
                         text.push_str(sym);
                         x += cw;
                     }
-                    let text = text.trim_end().to_owned();
+                    texts.push(text.trim_end().to_owned());
+                }
+                for (i, text) in texts.iter().enumerate() {
                     for (needle, badge) in [
                         ("Writers", "120"),
                         ("🇺🇸", "7"),
@@ -8608,9 +9818,11 @@ mod tests {
                         ("Тема", "9"),
                     ] {
                         if text.contains(needle) {
+                            let two_lines = !compact && needle != "Тема";
+                            let row = if two_lines { &texts[i + 1] } else { text };
                             assert!(
-                                text.ends_with(badge),
-                                "{width}: [{text}] should end with {badge}"
+                                row.ends_with(badge),
+                                "{width}: [{row}] under [{text}] should end with {badge}"
                             );
                             seen.insert(needle);
                         }
@@ -8629,6 +9841,384 @@ mod tests {
                 assert!(seen.contains(needle), "{width}: {needle} not drawn");
             }
         }
+    }
+
+    fn chat_list_app() -> App {
+        let mut app = app();
+        app.lang = format::Lang::En;
+        app.my_id = Some(1);
+        app.show_info = false;
+        app.focus = Pane::Chats;
+        app.users.insert(3, "Bob Stone".to_owned());
+        let now = crate::app::unix_now();
+        let base = app.chats[&10].clone();
+        let mut last = msg(100, 2, now, "new build is out");
+        last.edited = false;
+        app.chats.get_mut(&10).unwrap().last_message = Some(last);
+        let mut add = |id: i64, title: &str, kind: ChatKind, m: Option<Msg>| {
+            let mut c = base.clone();
+            c.id = id;
+            c.title = title.to_owned();
+            c.kind = kind;
+            c.unread = 0;
+            c.mentions = 0;
+            c.positions[0].order = 100 - id;
+            c.positions[0].pinned = false;
+            c.last_message = m;
+            app.chats.insert(id, c);
+        };
+        add(
+            11,
+            "Bob Stone",
+            ChatKind::Private(3),
+            Some(msg(101, 1, now - 2 * 86_400, "see you tomorrow")),
+        );
+        let mut photo = msg(5, 9, 1_740_909_600, "Release notes");
+        photo.chat_id = 12;
+        add(12, "Rust News", ChatKind::Channel, Some(photo));
+        add(13, "Carol", ChatKind::Private(4), None);
+        add(14, "Dave", ChatKind::Private(5), None);
+        let news = app.chats.get_mut(&12).unwrap();
+        news.unread = 120;
+        news.muted = true;
+        app.drafts.insert(
+            (13, None),
+            model::Draft {
+                text: "half-written reply".to_owned(),
+                ..model::Draft::default()
+            },
+        );
+        app.typing.insert(
+            14,
+            vec![crate::presence::Typing::new(
+                Sender::User(5),
+                crate::presence::Activity::Typing,
+                None,
+            )],
+        );
+        app
+    }
+
+    fn pane_text(rows: &[String], from: usize, to: usize) -> Vec<String> {
+        rows.iter()
+            .map(|r| {
+                let cells: Vec<char> = r.chars().collect();
+                cells[from.min(cells.len())..to.min(cells.len())]
+                    .iter()
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rows_window_matches_list_window_and_keeps_two_line_rows_whole() {
+        for len in 0..12 {
+            for h in 0..8 {
+                for sel in 0..len {
+                    let ones = vec![1; len];
+                    assert_eq!(
+                        rows_window(&ones, sel, h),
+                        list_window(sel, len, h),
+                        "{len} {h} {sel}"
+                    );
+                }
+            }
+        }
+        let mixed = [2, 2, 1, 1, 2, 2, 2, 1, 2, 2];
+        for h in 2..12 {
+            for sel in 0..mixed.len() {
+                let start = rows_window(&mixed, sel, h);
+                let used: usize = mixed[start..=sel].iter().sum();
+                assert!(start <= sel && used <= h, "{h} {sel} {start}");
+            }
+        }
+    }
+
+    #[test]
+    fn chat_rows_show_time_preview_sender_draft_and_typing_on_two_lines() {
+        let mut app = chat_list_app();
+        let rows = screen_rows(&mut app, 100, 30);
+        let chats = pane_text(&rows, 19, 47);
+        let i = chats.iter().position(|r| r.contains("Rust чат")).unwrap();
+        let now = crate::app::unix_now();
+        let clock = format::list_time(format::Lang::En, now, now);
+        assert!(chats[i].ends_with(&clock), "{}", chats.join("\n"));
+        assert!(
+            chats[i + 1].contains("Alice: new build"),
+            "{}",
+            chats.join("\n")
+        );
+        assert!(chats[i + 1].ends_with("▴ @ 3"), "{}", chats.join("\n"));
+        let row = |needle: &str| chats.iter().position(|r| r.contains(needle)).unwrap();
+        let bob = row("Bob Stone");
+        assert!(
+            chats[bob + 1].contains("You: see you tomorrow"),
+            "{}",
+            chats.join("\n")
+        );
+        let weekday = format::list_time(
+            format::Lang::En,
+            crate::app::unix_now() - 2 * 86_400,
+            crate::app::unix_now(),
+        );
+        assert!(chats[bob].ends_with(&weekday), "{}", chats.join("\n"));
+        let news = row("Rust News");
+        let old = format::list_time(format::Lang::En, 1_740_909_600, crate::app::unix_now());
+        assert!(chats[news].ends_with(&old), "{}", chats.join("\n"));
+        assert!(
+            chats[news + 1].contains("Photo Release notes"),
+            "{}",
+            chats.join("\n")
+        );
+        assert!(!chats[news + 1].contains(':'), "no sender in channels");
+        assert!(chats[news + 1].ends_with("120"), "{}", chats.join("\n"));
+        assert!(chats[row("Carol") + 1].contains("Draft: half-written reply"));
+        assert!(
+            chats[row("Dave") + 1].contains("typing…"),
+            "{}",
+            chats.join("\n")
+        );
+
+        app.settings.appearance.compact_chat_list = true;
+        let rows = screen_rows(&mut app, 100, 30);
+        let chats = pane_text(&rows, 19, 47);
+        let i = chats.iter().position(|r| r.contains("Rust чат")).unwrap();
+        assert!(chats[i].ends_with("▴ @ 3"), "{}", chats.join("\n"));
+        let row = |needle: &str| chats.iter().position(|r| r.contains(needle)).unwrap();
+        assert_eq!(
+            row("Rust News"),
+            row("Bob Stone") + 1,
+            "{}",
+            chats.join("\n")
+        );
+        assert!(
+            chats[row("Rust News")].ends_with("120"),
+            "{}",
+            chats.join("\n")
+        );
+        assert!(!chats.iter().any(|r| r.contains("new build")));
+    }
+
+    #[test]
+    fn a_draft_left_in_the_composer_shows_in_the_chat_row_until_it_is_cleared() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = chat_list_app();
+        let bob_preview = |app: &mut App| {
+            let rows = screen_rows(app, 100, 30);
+            let chats = pane_text(&rows, 19, 47);
+            let bob = chats.iter().position(|r| r.contains("Bob Stone")).unwrap();
+            chats[bob + 1].clone()
+        };
+        assert!(bob_preview(&mut app).contains("You: see you tomorrow"));
+        app.open(11);
+        press(&mut app, KeyCode::Char('i'), KeyModifiers::NONE);
+        for c in "at five".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(app.composer.input.text(), "at five");
+        app.open(12);
+        assert!(app.composer.input.text().is_empty());
+        let preview = bob_preview(&mut app);
+        assert!(preview.contains("Draft: at five"), "{preview}");
+
+        app.open(11);
+        assert_eq!(app.composer.input.text(), "at five");
+        app.composer.input = crate::input::TextInput::with_text("");
+        app.open(12);
+        let preview = bob_preview(&mut app);
+        assert!(preview.contains("You: see you tomorrow"), "{preview}");
+        assert!(!preview.contains("Draft"), "{preview}");
+    }
+
+    #[test]
+    fn two_line_rows_keep_selection_scrolling_and_title_selection_in_step() {
+        let mut app = chat_list_app();
+        let base = app.chats[&11].clone();
+        for id in 20..40 {
+            let mut c = base.clone();
+            c.id = id;
+            c.title = format!("Chat number {id}");
+            c.positions[0].order = 100 - id;
+            app.chats.insert(id, c);
+        }
+        app.chat_sel = 18;
+        let rows = screen_rows(&mut app, 100, 24);
+        let sel = rows
+            .iter()
+            .position(|r| r.contains("❯ Chat number 34"))
+            .unwrap();
+        assert!(sel > 2 && sel < 21, "{}", rows.join("\n"));
+        assert!(rows[sel + 1].contains("You: see you tomorrow"));
+        assert!(app.chat_rows.get() >= 9, "page moves by visible chats");
+        let below = ratatui::layout::Position::new(25, sel as u16 + 1);
+        let hit = app.text_map.hit_at(below);
+        assert_eq!(
+            hit,
+            Some(Hit::Chat(Row::Chat(34))),
+            "both lines are the same chat"
+        );
+        for n in 0..app.chat_rows().len() {
+            app.chat_sel = n;
+            let rows = screen_rows(&mut app, 100, 24);
+            assert!(
+                rows.iter().any(|r| r.contains('❯')),
+                "selection {n} on screen"
+            );
+        }
+    }
+
+    #[test]
+    fn narrow_terminals_hide_the_info_pane_but_keep_chat_titles() {
+        let mut app = chat_list_app();
+        app.show_info = true;
+        app.focus = Pane::Messages;
+        for (w, h) in [(80u16, 24u16), (70, 24), (60, 24), (100, 30)] {
+            let rows = screen_rows(&mut app, w, h);
+            let screen = rows.join("\n");
+            for title in ["Rust чат", "Bob Stone", "Rust News"] {
+                assert!(screen.contains(title), "{w}x{h}: {title}\n{screen}");
+            }
+            assert!(
+                !screen.contains("Chat info"),
+                "{w}x{h}: info auto-hidden\n{screen}"
+            );
+        }
+        assert!(app.show_info, "the setting itself is untouched");
+        let rows = screen_rows(&mut app, 120, 30);
+        assert!(rows.join("\n").contains("Chat info"), "fits at 120 columns");
+        app.focus = Pane::Info;
+        let rows = screen_rows(&mut app, 80, 24);
+        let screen = rows.join("\n");
+        assert!(
+            screen.contains("Chat info"),
+            "focusing it shows it\n{screen}"
+        );
+        assert!(
+            screen.contains("Rust чат") && screen.contains("Bob Sto"),
+            "{screen}"
+        );
+        let l = theme::Theme::default().layout;
+        let mut app = chat_list_app();
+        app.show_info = true;
+        assert_eq!(pane_widths(80, &app, &l), [18, 30, 0]);
+        assert_eq!(pane_widths(100, &app, &l), [18, 30, 0]);
+        assert_eq!(pane_widths(104, &app, &l), [18, 30, 26]);
+        assert_eq!(pane_widths(140, &app, &l), [18, 30, 30]);
+        assert_eq!(pane_widths(70, &app, &l), [16, 24, 0]);
+        assert_eq!(pane_widths(60, &app, &l), [0, 30, 0]);
+        assert_eq!(pane_widths(40, &app, &l), [0, 24, 0]);
+        app.focus = Pane::Info;
+        assert_eq!(pane_widths(80, &app, &l), [0, 26, 24]);
+        app.focus = Pane::Folders;
+        assert_eq!(pane_widths(60, &app, &l), [16, 24, 0]);
+
+        let mut app = chat_list_app();
+        let mut t = classic_rounded();
+        t.layout.chats_width = theme::PaneWidth::Cols(14);
+        app.set_theme(t);
+        let rows = screen_rows(&mut app, 100, 30);
+        let chats = pane_text(&rows, 19, 31);
+        assert!(
+            chats.iter().any(|r| r == "  Rust чат"),
+            "{}",
+            chats.join("\n")
+        );
+        assert!(
+            chats.iter().any(|r| r == "❯ Bob Stone"),
+            "{}",
+            chats.join("\n")
+        );
+    }
+
+    #[test]
+    fn empty_chat_lists_say_why_instead_of_loading_forever() {
+        let mut app = chat_list_app();
+        app.filter = Some(crate::app::Filter {
+            pane: Pane::Chats,
+            input: crate::input::TextInput::with_text("zzz"),
+            active: false,
+        });
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("No chats match ‘zzz’"), "{screen}");
+        assert!(!screen.contains("Loading chats"));
+        app.filter = None;
+        app.folders = vec![(7, "Work".to_owned())];
+        app.folder_sel = 1;
+        assert_eq!(app.current_list(), ListId::Folder(7));
+        app.refresh_lists();
+        assert!(render(&mut app, 100, 30).contains("Loading chats…"));
+        app.handle(Event::ChatListLoaded(ListId::Folder(7)));
+        assert!(render(&mut app, 100, 30).contains("No chats in this folder"));
+        app.folder_sel = 2;
+        app.refresh_lists();
+        app.handle(Event::ChatListLoaded(ListId::Archive));
+        assert!(render(&mut app, 100, 30).contains("Archive is empty"));
+        app.filter = Some(crate::app::Filter {
+            pane: Pane::Folders,
+            input: crate::input::TextInput::with_text("qqq"),
+            active: false,
+        });
+        let screen = render(&mut app, 100, 30);
+        assert!(
+            screen.contains("No folders") && screen.contains("‘qqq’"),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn failed_history_shows_the_reason_and_enter_retries() {
+        let mut app = app();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (td, log) = crate::td::Td::recording(tx);
+        app.td = td;
+        app.show_info = false;
+        app.histories.clear();
+        app.open_chat = None;
+        app.open(10);
+        app.composer.active = true;
+        app.handle(Event::HistoryFailed {
+            chat_id: 10,
+            epoch: 0,
+            error: "network is unreachable".to_owned(),
+        });
+        assert!(
+            !app.composer.active,
+            "an empty composer steps aside for the retry key"
+        );
+        let screen = render(&mut app, 120, 30);
+        assert!(
+            screen.contains("Couldn't load messages: network is unreachable"),
+            "{screen}"
+        );
+        assert!(screen.contains("Enter retry"), "{screen}");
+        assert!(!screen.contains("No messages yet"));
+        let loads = || {
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter(|e| *e == "load history")
+                .count()
+        };
+        let before = loads();
+        app.focus = Pane::Messages;
+        press(
+            &mut app,
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        );
+        assert_eq!(loads(), before + 1);
+        let screen = render(&mut app, 120, 30);
+        assert!(screen.contains("Loading…"), "{screen}");
+        app.handle(Event::History {
+            chat_id: 10,
+            msgs: vec![msg(1, 2, 1_700_000_000, "finally here")],
+            initial: true,
+            epoch: 0,
+        });
+        assert!(app.histories[&10].error.is_none());
+        assert!(render(&mut app, 120, 30).contains("finally here"));
     }
 
     #[test]
@@ -8718,6 +10308,7 @@ mod tests {
                 auto_delete: 30,
                 perms: crate::model::Rights::default(),
                 protected: false,
+                reactions_off: false,
             },
         );
         app.secret_chats.insert(
@@ -8777,6 +10368,219 @@ mod tests {
         assert!(rows.iter().any(|r| r.contains("> Ideas")));
         for w in [40u16, 60, 90] {
             screen_rows(&mut app, w, 12);
+        }
+    }
+
+    mod mouse_selection {
+        use super::*;
+        use crossterm::event::{
+            Event as TermEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        };
+        use ratatui::layout::Position;
+        use ratatui::style::Modifier;
+
+        const LONG: &str = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau upsilon phi chi psi omega";
+        const W: u16 = 90;
+        const H: u16 = 30;
+
+        fn scene(layout: MessageLayout) -> (App, crate::td::RequestLog) {
+            let mut app = app();
+            let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+            let (td, log) = crate::td::Td::recording(tx);
+            app.td = td;
+            app.settings.appearance.layout = Some(layout);
+            app.show_info = false;
+            let plain = |id: i64, sender: i64, date: i64, text: &str| {
+                let mut m = msg(id, sender, date, text);
+                m.body = RichText::plain(text);
+                m.edited = false;
+                m.reply_to = None;
+                m.media = None;
+                m
+            };
+            let mut h = History::default();
+            h.reached_start = true;
+            h.merge_older(vec![
+                plain(1, 2, 1_700_000_000, LONG),
+                plain(2, 1, 1_700_000_100, "second message"),
+            ]);
+            app.histories.insert(10, h);
+            (app, log)
+        }
+
+        fn find(buf: &Buffer, needle: &str) -> Position {
+            let chars: Vec<String> = needle.chars().map(String::from).collect();
+            let (w, h) = (buf.area.width, buf.area.height);
+            (0..h)
+                .flat_map(|y| (0..w).map(move |x| Position::new(x, y)))
+                .find(|p| {
+                    chars.iter().enumerate().all(|(i, c)| {
+                        let x = p.x + i as u16;
+                        x < w && buf[(x, p.y)].symbol() == c
+                    })
+                })
+                .unwrap_or_else(|| panic!("{needle} not on screen"))
+        }
+
+        fn end_of(buf: &Buffer, needle: &str) -> Position {
+            let p = find(buf, needle);
+            Position::new(p.x + needle.chars().count() as u16 - 1, p.y)
+        }
+
+        fn mouse(app: &mut App, kind: MouseEventKind, at: Position, modifiers: KeyModifiers) {
+            app.handle(Event::Input(TermEvent::Mouse(MouseEvent {
+                kind,
+                column: at.x,
+                row: at.y,
+                modifiers,
+            })));
+        }
+
+        fn drag(app: &mut App, from: Position, to: Position) {
+            let left = MouseButton::Left;
+            mouse(app, MouseEventKind::Down(left), from, KeyModifiers::NONE);
+            mouse(app, MouseEventKind::Drag(left), to, KeyModifiers::NONE);
+            mouse(app, MouseEventKind::Up(left), to, KeyModifiers::NONE);
+        }
+
+        fn click(app: &mut App, at: Position) {
+            drag(app, at, at);
+        }
+
+        fn copies(log: &crate::td::RequestLog) -> Vec<String> {
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter_map(|e| e.strip_prefix("copy "))
+                .map(str::to_owned)
+                .collect()
+        }
+
+        #[test]
+        fn dragging_copies_message_text_without_chrome_in_every_layout() {
+            for (layout, sel) in MessageLayout::ALL
+                .into_iter()
+                .flat_map(|l| [None, Some(0), Some(1)].map(|s| (l, s)))
+            {
+                let (mut app, log) = scene(layout);
+                app.msg_sel = sel;
+                let buf = buffer(&mut app, W, H);
+                let from = find(&buf, "alpha");
+                let to = end_of(&buf, "second message");
+                let (left, none) = (MouseButton::Left, KeyModifiers::NONE);
+                mouse(&mut app, MouseEventKind::Down(left), from, none);
+                mouse(&mut app, MouseEventKind::Drag(left), to, none);
+                let lit = buffer(&mut app, W, H);
+                let reversed = |p: Position| lit[p].modifier.contains(Modifier::REVERSED);
+                assert!(reversed(from) && reversed(to), "{layout:?}");
+                assert!(!reversed(Position::new(from.x - 1, from.y)), "{layout:?}");
+                mouse(&mut app, MouseEventKind::Up(left), to, none);
+                assert_eq!(
+                    copies(&log),
+                    vec![format!("{LONG}\nsecond message")],
+                    "{layout:?}"
+                );
+                assert!(app.selection.is_none());
+                let after = buffer(&mut app, W, H);
+                assert!(!after[from].modifier.contains(Modifier::REVERSED));
+            }
+        }
+
+        #[test]
+        fn dragging_past_the_pane_is_clipped_to_the_pane_it_started_in() {
+            let (mut app, log) = scene(MessageLayout::Bubbles);
+            let buf = buffer(&mut app, W, H);
+            drag(&mut app, find(&buf, "beta"), Position::new(0, H - 1));
+            let rest = LONG.strip_prefix("alpha ").unwrap();
+            assert_eq!(copies(&log), vec![format!("{rest}\nsecond message")]);
+            let last = end_of(&buf, "second message");
+            drag(&mut app, last, Position::new(W - 1, 0));
+            assert_eq!(copies(&log)[1..], [format!("{LONG}\nsecond message")]);
+        }
+
+        #[test]
+        fn chat_titles_and_popups_are_selectable_too() {
+            let (mut app, log) = scene(MessageLayout::Classic);
+            let buf = buffer(&mut app, W, H);
+            let title = find(&buf, "❯ Rust чат");
+            let border = Position::new(title.x - 1, title.y);
+            drag(&mut app, border, Position::new(W - 1, title.y));
+            app.popup = Some(Popup::ConfirmLogout);
+            let buf = buffer(&mut app, W, H);
+            let question = find(&buf, "Log out of Telegram");
+            let cancel = end_of(&buf, "cancel");
+            drag(&mut app, question, cancel);
+            assert_eq!(
+                copies(&log),
+                vec![
+                    "Rust чат".to_owned(),
+                    "Log out of Telegram?\n\ny log out   n cancel".to_owned()
+                ]
+            );
+        }
+
+        #[test]
+        fn shift_drag_and_plain_clicks_copy_nothing() {
+            let (mut app, log) = scene(MessageLayout::Classic);
+            let buf = buffer(&mut app, W, H);
+            let from = find(&buf, "alpha");
+            let to = end_of(&buf, "second message");
+            let shift = KeyModifiers::SHIFT;
+            let left = MouseButton::Left;
+            mouse(&mut app, MouseEventKind::Down(left), from, shift);
+            mouse(&mut app, MouseEventKind::Drag(left), to, shift);
+            assert!(app.selection.is_none());
+            mouse(&mut app, MouseEventKind::Up(left), to, shift);
+            click(&mut app, from);
+            assert!(copies(&log).is_empty());
+        }
+
+        #[test]
+        fn clicks_focus_and_select_what_is_under_the_cursor() {
+            let (mut app, log) = scene(MessageLayout::Bubbles);
+            let mut other = app.chats[&10].clone();
+            other.id = 20;
+            other.title = "Second chat".to_owned();
+            other.positions = vec![crate::model::Position {
+                list: ListId::Main,
+                order: 4,
+                pinned: false,
+            }];
+            app.chats.insert(20, other);
+            app.focus = Pane::Chats;
+            let buf = buffer(&mut app, W, H);
+            click(&mut app, find(&buf, "second message"));
+            assert_eq!((app.focus, app.msg_sel), (Pane::Messages, Some(1)));
+            click(&mut app, find(&buf, "gamma"));
+            assert_eq!(app.msg_sel, Some(0));
+            let folders = find(&buf, "Folders");
+            click(&mut app, Position::new(folders.x, folders.y + 1));
+            assert_eq!(app.focus, Pane::Folders);
+            click(&mut app, find(&buf, "Second chat"));
+            assert_eq!((app.open_chat, app.chat_sel), (Some(20), 1));
+            assert!(copies(&log).is_empty());
+        }
+
+        #[test]
+        fn wheel_scrolls_the_pane_under_the_cursor() {
+            let mut app = app();
+            app.msg_sel = None;
+            app.focus = Pane::Chats;
+            let buf = buffer(&mut app, 120, 40);
+            let text = find(&buf, "hello there");
+            let none = KeyModifiers::NONE;
+            mouse(&mut app, MouseEventKind::ScrollUp, text, none);
+            assert_eq!((app.bottom_offset, app.focus), (3, Pane::Chats));
+            buffer(&mut app, 120, 40);
+            mouse(&mut app, MouseEventKind::ScrollDown, text, none);
+            assert_eq!(app.bottom_offset, 0);
+            app.msg_sel = Some(39);
+            mouse(&mut app, MouseEventKind::ScrollUp, text, none);
+            assert_eq!(app.msg_sel, Some(38));
+            app.popup = Some(Popup::ConfirmLogout);
+            buffer(&mut app, 120, 40);
+            mouse(&mut app, MouseEventKind::ScrollUp, text, none);
+            assert_eq!(app.msg_sel, Some(38));
         }
     }
 }
@@ -9036,6 +10840,10 @@ mod repaint_tests {
 
     impl Rig {
         fn new(w: u16, h: u16) -> Self {
+            Self::with_protocol(w, h, ratatui_image::picker::ProtocolType::Kitty)
+        }
+
+        fn with_protocol(w: u16, h: u16, protocol: ratatui_image::picker::ProtocolType) -> Self {
             let dir = std::env::temp_dir().join(format!("gramtty-repaint-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -9051,7 +10859,7 @@ mod repaint_tests {
                     width: 10,
                     height: 20,
                 });
-            picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+            picker.set_protocol_type(protocol);
             let mut app = App::new(
                 crate::td::Td::recording(tx).0,
                 ApiCredentials {
@@ -9274,6 +11082,7 @@ mod repaint_tests {
                 auto_delete: 0,
                 perms: crate::model::Rights::default(),
                 protected: false,
+                reactions_off: false,
             },
         );
         rig.app.show_info = true;
@@ -9572,7 +11381,16 @@ mod repaint_tests {
     }
 
     fn sticker_rig(w: u16, h: u16, n: i64) -> (Rig, std::path::PathBuf) {
-        let mut rig = Rig::new(w, h);
+        sticker_rig_on(ratatui_image::picker::ProtocolType::Kitty, w, h, n)
+    }
+
+    fn sticker_rig_on(
+        protocol: ratatui_image::picker::ProtocolType,
+        w: u16,
+        h: u16,
+        n: i64,
+    ) -> (Rig, std::path::PathBuf) {
+        let mut rig = Rig::with_protocol(w, h, protocol);
         let dir = scratch_dir("rig");
         let tgs = dir.join("s.tgs");
         std::fs::write(&tgs, crate::anim::test_lottie(30, 30)).unwrap();
@@ -9583,12 +11401,25 @@ mod repaint_tests {
         }
         rig.app.histories.insert(10, history);
         rig.app.msg_sel = Some(n as usize - 1);
-        rig.app.media.anim.enable(dir.join("cache"));
+        if protocol == ratatui_image::picker::ProtocolType::Kitty {
+            rig.app.media.anim.enable(dir.join("cache"));
+        } else {
+            rig.app.media.anim.enable_redraw(dir.join("cache"));
+        }
         (rig, dir)
     }
 
     async fn run_until(rig: &mut Rig, log: &mut Vec<u8>, done: impl Fn(&App) -> bool) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        run_within(rig, log, Duration::from_secs(20), done).await;
+    }
+
+    async fn run_within(
+        rig: &mut Rig,
+        log: &mut Vec<u8>,
+        limit: Duration,
+        done: impl Fn(&App) -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + limit;
         loop {
             log.extend(rig.frame());
             if done(&rig.app) {
@@ -9762,6 +11593,435 @@ mod repaint_tests {
         let ids = rig.app.media.anim.live_ids();
         assert!(ids.iter().all(|id| text.contains(&crate::anim::start(*id))));
         assert!(!ids.iter().any(|id| text.contains(&crate::anim::stop(*id))));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn picker_items(atts: &[Attachment]) -> Vec<crate::stickers::Item> {
+        atts.iter()
+            .map(|a| crate::stickers::Item {
+                kind: if a.kind == MediaKind::Animation {
+                    crate::stickers::ItemKind::Animation
+                } else {
+                    crate::stickers::ItemKind::Sticker
+                },
+                file_id: a.file.id,
+                emoji: String::new(),
+                width: a.width,
+                height: a.height,
+                duration: a.duration,
+                att: a.clone(),
+            })
+            .collect()
+    }
+
+    fn open_picker(rig: &mut Rig, atts: &[Attachment], preview: bool) {
+        rig.app.stickers.recent = Some(picker_items(atts));
+        let mut sp = crate::stickers::Picker::new(0);
+        sp.preview = preview;
+        rig.app.popup = Some(Popup::Stickers(sp));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sticker_picker_animations_play_in_kitty_while_the_chat_behind_pauses() {
+        let (mut rig, dir) = sticker_rig(100, 40, 2);
+        let mut log = Vec::new();
+        run_until(&mut rig, &mut log, |app| {
+            app.media.anim.live_files() == vec![700, 701]
+        })
+        .await;
+        let chat = rig.app.media.anim.live_ids();
+        let tgs = dir.join("s.tgs");
+        let atts: Vec<Attachment> = (0..3).map(|i| tgs_sticker(750 + i, &tgs)).collect();
+        open_picker(&mut rig, &atts, true);
+        log.clear();
+        run_until(&mut rig, &mut log, |app| {
+            app.media.anim.live_id(750).is_some()
+        })
+        .await;
+        log.extend(rig.frame());
+        let preview = rig.app.media.anim.live_id(750).unwrap();
+        let text = String::from_utf8_lossy(&log).into_owned();
+        for id in &chat {
+            assert!(
+                text.contains(&crate::anim::stop(*id)),
+                "the chat behind pauses"
+            );
+        }
+        assert!(
+            text.contains(&crate::anim::start(preview)),
+            "the preview plays"
+        );
+        assert!(!text.contains(&crate::anim::stop(preview)));
+        assert!(placed_ids(&rig.buf, &[preview])[0] > 0);
+        if let Some(Popup::Stickers(sp)) = &mut rig.app.popup {
+            sp.preview = false;
+        }
+        log.clear();
+        run_until(&mut rig, &mut log, |app| {
+            (751..=752).all(|f| app.media.anim.live_id(f).is_some())
+        })
+        .await;
+        log.extend(rig.frame());
+        let text = String::from_utf8_lossy(&log).into_owned();
+        for f in 750..=752 {
+            let id = rig.app.media.anim.live_id(f).unwrap();
+            assert!(
+                text.contains(&crate::anim::start(id)) || id == preview,
+                "grid cell {f} plays"
+            );
+            assert!(!text.contains(&crate::anim::stop(id)));
+        }
+        rig.app.popup = None;
+        log.clear();
+        run_until(&mut rig, &mut log, |app| {
+            app.media.anim.live_files() == vec![700, 701]
+        })
+        .await;
+        let text = String::from_utf8_lossy(&log).into_owned();
+        for id in &chat {
+            assert!(text.contains(&crate::anim::start(*id)), "the chat resumes");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    struct Playback {
+        changes: usize,
+        bytes: usize,
+        biggest: usize,
+        most_images: usize,
+        span: Duration,
+    }
+
+    fn sixels(out: &[u8]) -> usize {
+        String::from_utf8_lossy(out).matches("\x1bP").count()
+    }
+
+    fn play(rig: &mut Rig, steps: usize, step: Duration) -> Playback {
+        let start = rig.app.anim_start.elapsed();
+        let mut prev = rig.buf.clone();
+        let mut p = Playback {
+            changes: 0,
+            bytes: 0,
+            biggest: 0,
+            most_images: 0,
+            span: Duration::ZERO,
+        };
+        for _ in 0..steps {
+            rig.app.anim_start = rig.app.anim_start.checked_sub(step).unwrap();
+            let out = rig.frame();
+            p.bytes += out.len();
+            p.most_images = p.most_images.max(sixels(&out));
+            if rig.buf != prev {
+                p.changes += 1;
+                p.biggest = p.biggest.max(out.len());
+                prev = rig.buf.clone();
+            }
+        }
+        p.span = rig.app.anim_start.elapsed() - start;
+        p
+    }
+
+    fn assert_within_budget(p: &Playback, what: &str) {
+        let floor = crate::anim::frame_gap(0, 1);
+        let most = (p.span.as_secs_f64() / floor.as_secs_f64()).ceil() as usize + 1;
+        assert!(p.changes >= 4, "{what}: it plays ({} changes)", p.changes);
+        assert!(
+            p.changes <= most,
+            "{what}: {} changes in {:?}, at most {most}",
+            p.changes,
+            p.span
+        );
+        let rate = p.bytes as f64 / p.span.as_secs_f64();
+        assert!(
+            rate <= crate::anim::REDRAW_BYTES_PER_SEC as f64,
+            "{what}: {rate} bytes/s"
+        );
+        eprintln!(
+            "{what}: {} frame changes in {:?}, {} bytes per change at most, {:.0} bytes/s",
+            p.changes, p.span, p.biggest, rate
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redraw_terminals_animate_the_sticker_picker_within_the_budget() {
+        use ratatui_image::picker::ProtocolType;
+        for protocol in [
+            ProtocolType::Sixel,
+            ProtocolType::Iterm2,
+            ProtocolType::Halfblocks,
+        ] {
+            let what = format!("{protocol:?} preview");
+            let mut rig = Rig::with_protocol(60, 24, protocol);
+            let dir = scratch_dir("redraw-picker");
+            let tgs = dir.join("s.tgs");
+            std::fs::write(&tgs, crate::anim::test_lottie(30, 30)).unwrap();
+            rig.app.media.anim.enable_redraw(dir.join("cache"));
+            let atts: Vec<Attachment> = (0..3).map(|i| tgs_sticker(750 + i, &tgs)).collect();
+            open_picker(&mut rig, &atts, true);
+            let mut log = Vec::new();
+            run_until(&mut rig, &mut log, |app| app.redraw_due.is_some()).await;
+            assert!(rig.app.tick_interval().unwrap() <= crate::anim::frame_gap(0, 1));
+            assert!(rig.app.media.anim.live_ids().is_empty());
+            let p = play(&mut rig, 150, Duration::from_millis(10));
+            assert_within_budget(&p, &what);
+            if protocol == ProtocolType::Sixel {
+                assert_eq!(p.most_images, 1, "{what}: one animation at a time");
+            }
+            assert!(
+                !String::from_utf8_lossy(&log).contains("\x1b_Ga=a"),
+                "{what}: no kitty animation commands"
+            );
+            rig.app
+                .handle(Event::Input(crossterm::event::Event::FocusLost));
+            rig.frame();
+            assert_eq!(rig.app.redraw_due, None, "{what}: paused while unfocused");
+            let p = play(&mut rig, 20, Duration::from_millis(50));
+            assert_eq!(p.changes, 0, "{what}: frozen while unfocused");
+            rig.app
+                .handle(Event::Input(crossterm::event::Event::FocusGained));
+            if let Some(Popup::Stickers(sp)) = &mut rig.app.popup {
+                sp.preview = false;
+                sp.sel = 1;
+            }
+            run_until(&mut rig, &mut log, |app| {
+                app.redraw_due.is_some() && app.media.clips_ready() >= 2
+            })
+            .await;
+            let p = play(&mut rig, 150, Duration::from_millis(10));
+            assert_within_budget(&p, &format!("{protocol:?} grid"));
+            if protocol == ProtocolType::Sixel {
+                assert_eq!(p.most_images, 1, "{what}: only the selected cell moves");
+            }
+            rig.app.settings.media.animations = crate::config::Animations::Off;
+            rig.frame();
+            assert_eq!(rig.app.redraw_due, None);
+            assert_eq!(play(&mut rig, 10, Duration::from_millis(50)).changes, 0);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redraw_terminals_animate_few_chat_stickers_and_freeze_under_popups() {
+        use ratatui_image::picker::ProtocolType;
+        let (mut rig, dir) = sticker_rig_on(ProtocolType::Sixel, 100, 60, 12);
+        let mut log = Vec::new();
+        run_until(&mut rig, &mut log, |app| {
+            app.redraw_due.is_some() && app.media.clips_ready() == crate::anim::REDRAW_MAX_VISIBLE
+        })
+        .await;
+        let p = play(&mut rig, 150, Duration::from_millis(10));
+        assert_within_budget(&p, "Sixel chat");
+        assert!(
+            p.most_images <= crate::anim::REDRAW_MAX_VISIBLE,
+            "{}",
+            p.most_images
+        );
+        assert!(p.most_images >= 1);
+        assert!(rig.app.media.anim.live_ids().is_empty());
+        rig.app.popup = Some(Popup::Options { sel: 0 });
+        rig.frame();
+        assert_eq!(rig.app.redraw_due, None);
+        let mut written = 0;
+        for _ in 0..10 {
+            rig.app.anim_start = rig
+                .app
+                .anim_start
+                .checked_sub(Duration::from_millis(50))
+                .unwrap();
+            written += sixels(&rig.frame());
+        }
+        assert_eq!(written, 0, "frozen under a popup");
+        rig.app.popup = None;
+        rig.frame();
+        assert!(rig.app.redraw_due.is_some(), "plays again");
+        rig.app.settings.media.animations = crate::config::Animations::Selected;
+        rig.frame();
+        let p = play(&mut rig, 100, Duration::from_millis(10));
+        assert!(p.changes >= 4 && p.most_images == 1, "{}", p.most_images);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redraw_terminals_keep_a_still_preview_when_decoding_fails() {
+        let mut rig = Rig::with_protocol(100, 40, ratatui_image::picker::ProtocolType::Sixel);
+        let dir = scratch_dir("redraw-broken");
+        let bad = dir.join("bad.webm");
+        std::fs::write(&bad, b"not a video").unwrap();
+        let thumb = dir.join("t.png");
+        image::RgbaImage::from_pixel(64, 64, image::Rgba([20, 90, 200, 255]))
+            .save(&thumb)
+            .unwrap();
+        let f = local_file(760, &bad);
+        let mut a = Attachment::new(MediaKind::Sticker, f.clone());
+        a.width = 512;
+        a.height = 512;
+        a.full = Some(Visual {
+            file: f,
+            decode: Decode::Video,
+            width: 512,
+            height: 512,
+        });
+        a.preview = Some(Visual {
+            file: local_file(761, &thumb),
+            decode: Decode::Raster,
+            width: 64,
+            height: 64,
+        });
+        rig.app.media.anim.enable_redraw(dir.join("cache"));
+        open_picker(&mut rig, &[a], true);
+        let mut log = Vec::new();
+        run_until(&mut rig, &mut log, |app| {
+            app.status
+                .as_ref()
+                .is_some_and(|(s, e)| *e && s.contains("inline animation"))
+        })
+        .await;
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while rig.images_on_screen() == 0 && std::time::Instant::now() < deadline {
+            if let Ok(Some(ev)) =
+                tokio::time::timeout(Duration::from_millis(100), rig.rx.recv()).await
+            {
+                rig.app.handle(ev);
+            }
+            rig.frame();
+        }
+        assert!(rig.images_on_screen() > 0, "the still thumbnail is shown");
+        assert_eq!(rig.app.redraw_due, None);
+        assert_eq!(rig.app.media.clips_ready(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn redraw_terminals_animate_gif_previews() {
+        let dir = scratch_dir("redraw-gif");
+        let mp4 = dir.join("g.mp4");
+        let made = std::process::Command::new("ffmpeg")
+            .args([
+                "-v",
+                "error",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "testsrc2=size=160x120:rate=25:duration=2",
+                "-pix_fmt",
+                "yuv420p",
+            ])
+            .arg(&mp4)
+            .status();
+        match made {
+            Ok(s) => assert!(s.success()),
+            Err(e)
+                if e.kind() == std::io::ErrorKind::NotFound
+                    && std::env::var_os("GRAMTTY_REQUIRE_FIXTURES").is_none() =>
+            {
+                return;
+            }
+            Err(e) => panic!("ffmpeg: {e}"),
+        }
+        let mut rig = Rig::with_protocol(100, 40, ratatui_image::picker::ProtocolType::Sixel);
+        let mut gif = Attachment::new(MediaKind::Animation, local_file(800, &mp4));
+        gif.width = 160;
+        gif.height = 120;
+        gif.duration = 2;
+        rig.app.media.anim.enable_redraw(dir.join("cache"));
+        rig.app.stickers.gifs = Some(picker_items(&[gif]));
+        let mut sp = crate::stickers::Picker::new(2);
+        sp.preview = true;
+        rig.app.popup = Some(Popup::Stickers(sp));
+        let mut log = Vec::new();
+        run_until(&mut rig, &mut log, |app| app.redraw_due.is_some()).await;
+        let p = play(&mut rig, 150, Duration::from_millis(10));
+        assert_within_budget(&p, "Sixel GIF preview");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn redraw_animation_budget() {
+        use ratatui_image::picker::ProtocolType;
+        let dir = scratch_dir("redraw-budget");
+        let mp4 = dir.join("busy.mp4");
+        let ok = std::process::Command::new("ffmpeg")
+            .args(["-v", "error", "-y", "-f", "lavfi", "-i"])
+            .arg("testsrc2=size=512x512:rate=30:duration=3")
+            .args(["-pix_fmt", "yuv420p"])
+            .arg(&mp4)
+            .status()
+            .unwrap()
+            .success();
+        assert!(ok);
+        let thumb = dir.join("t.png");
+        image::RgbaImage::from_pixel(512, 512, image::Rgba([20, 90, 200, 255]))
+            .save(&thumb)
+            .unwrap();
+        let gif = |id: i32| {
+            let mut a = Attachment::new(MediaKind::Animation, local_file(id, &mp4));
+            a.width = 512;
+            a.height = 512;
+            a.duration = 3;
+            a.preview = Some(Visual {
+                file: local_file(id + 100, &thumb),
+                decode: Decode::Raster,
+                width: 512,
+                height: 512,
+            });
+            a.full = a.preview.clone();
+            a
+        };
+        for protocol in [
+            ProtocolType::Sixel,
+            ProtocolType::Iterm2,
+            ProtocolType::Halfblocks,
+        ] {
+            let mut rig = Rig::with_protocol(160, 50, protocol);
+            rig.app
+                .media
+                .anim
+                .enable_redraw(dir.join(format!("cache-{protocol:?}")));
+            rig.app.stickers.gifs = Some(picker_items(&[gif(800)]));
+            let mut sp = crate::stickers::Picker::new(2);
+            sp.preview = true;
+            rig.app.popup = Some(Popup::Stickers(sp));
+            let mut log = Vec::new();
+            let started = std::time::Instant::now();
+            run_within(&mut rig, &mut log, Duration::from_secs(600), |app| {
+                app.redraw_due.is_some()
+            })
+            .await;
+            let ready = started.elapsed();
+            let (_, _, cpu0) = proc_stats();
+            let p = play(&mut rig, 300, Duration::from_millis(10));
+            let (_, _, cpu1) = proc_stats();
+            assert_within_budget(&p, &format!("{protocol:?} big GIF preview"));
+            eprintln!(
+                "  ready after {ready:?}; {:.1} ms CPU per draw",
+                (cpu1 - cpu0) as f64 / 300.0
+            );
+            let mut history = History::default();
+            history.reached_start = true;
+            for i in 0..4 {
+                history.upsert(media_msg(i + 1, gif(810 + i as i32)));
+            }
+            rig.app.popup = None;
+            rig.app.histories.insert(10, history);
+            rig.app.msg_sel = Some(3);
+            rig.frame();
+            run_within(&mut rig, &mut log, Duration::from_secs(600), |app| {
+                app.redraw_due.is_some()
+            })
+            .await;
+            let (_, _, cpu0) = proc_stats();
+            let p = play(&mut rig, 300, Duration::from_millis(10));
+            let (_, _, cpu1) = proc_stats();
+            assert_within_budget(&p, &format!("{protocol:?} chat GIFs"));
+            eprintln!(
+                "  {:.1} ms CPU per draw, {} images at most per draw",
+                (cpu1 - cpu0) as f64 / 300.0,
+                p.most_images
+            );
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -261,7 +261,7 @@ async fn wl_paste(args: &[&str]) -> Result<Vec<u8>, String> {
         .spawn()
         .map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
-                "Ctrl+V needs wl-paste (install wl-clipboard); terminal paste still works for text"
+                "<C-v> needs wl-paste (install wl-clipboard); terminal paste still works for text"
                     .to_owned()
             } else {
                 format!("wl-paste: {e}")
@@ -308,7 +308,7 @@ pub fn ensure_dir(dir: &Path) -> Result<(), String> {
 pub async fn read_clipboard(uploads: PathBuf) -> Result<Clip, String> {
     if std::env::var_os("WAYLAND_DISPLAY").is_none_or(|v| v.is_empty()) {
         return Err(
-            "Ctrl+V reads the Wayland clipboard, but WAYLAND_DISPLAY is not set; use terminal paste"
+            "<C-v> reads the Wayland clipboard, but WAYLAND_DISPLAY is not set; use terminal paste"
                 .to_owned(),
         );
     }
@@ -347,9 +347,32 @@ pub async fn read_clipboard(uploads: PathBuf) -> Result<Clip, String> {
     Err("clipboard has nothing to paste".to_owned())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Copied {
+    System,
+    Terminal,
+}
+
+pub fn osc52(text: &str, tmux: bool) -> String {
+    use base64::Engine as _;
+    let data = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let seq = format!("\x1b]52;c;{data}\x07");
+    if tmux {
+        format!("\x1bPtmux;{}\x1b\\", seq.replace('\x1b', "\x1b\x1b"))
+    } else {
+        seq
+    }
+}
+
 #[cfg(target_os = "linux")]
-pub async fn copy_text(text: String) -> Result<(), String> {
-    wl_copy(text.into_bytes(), None).await
+pub async fn copy_text(text: String) -> Result<Copied, String> {
+    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty());
+    if !wayland || crate::config::find_in_path("wl-copy").is_none() {
+        return Ok(Copied::Terminal);
+    }
+    wl_copy(text.into_bytes(), None)
+        .await
+        .map(|()| Copied::System)
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -513,13 +536,13 @@ pub async fn read_clipboard(uploads: PathBuf) -> Result<Clip, String> {
 }
 
 #[cfg(windows)]
-pub async fn copy_text(text: String) -> Result<(), String> {
+pub async fn copy_text(text: String) -> Result<Copied, String> {
     use base64::Engine as _;
     let script = "$ErrorActionPreference='Stop'\n\
         Add-Type -AssemblyName System.Windows.Forms\n\
         [System.Windows.Forms.Clipboard]::SetText([Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([Console]::In.ReadToEnd().Trim())))\n";
     let data = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-    powershell(script, Some(data)).await.map(|_| ())
+    powershell(script, Some(data)).await.map(|_| Copied::System)
 }
 
 #[cfg(windows)]
@@ -567,7 +590,7 @@ pub async fn read_clipboard(_uploads: PathBuf) -> Result<Clip, String> {
 }
 
 #[cfg(target_os = "macos")]
-pub async fn copy_text(text: String) -> Result<(), String> {
+pub async fn copy_text(text: String) -> Result<Copied, String> {
     use tokio::io::AsyncWriteExt;
     let mut child = tokio::process::Command::new("pbcopy")
         .stdin(Stdio::piped())
@@ -590,7 +613,7 @@ pub async fn copy_text(text: String) -> Result<(), String> {
         .map_err(|_| "pbcopy did not finish within 5 s".to_owned())?
         .map_err(|e| format!("pbcopy: {e}"))?;
     if status.success() {
-        Ok(())
+        Ok(Copied::System)
     } else {
         Err(format!("pbcopy failed ({status})"))
     }

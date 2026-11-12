@@ -6,6 +6,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::model::{EntityKind, RichText};
+use crate::textmap::Join;
 use crate::theme;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,7 +45,9 @@ pub fn styled_cells(rt: &RichText, base: Style) -> Vec<Cell> {
                     block = Block::Pre;
                 }
                 EntityKind::Link(_) => style = style.patch(theme::link()),
-                EntityKind::Mention => style = style.patch(theme::mention()),
+                EntityKind::Mention | EntityKind::MentionName(_) => {
+                    style = style.patch(theme::mention())
+                }
                 EntityKind::Quote => {
                     style = style.add_modifier(Modifier::ITALIC);
                     if block == Block::None {
@@ -107,17 +110,42 @@ fn block_prefix(block: Block) -> Option<Span<'static>> {
 }
 
 pub fn wrap_cells(cells: &[Cell], width: usize) -> Vec<Line<'static>> {
+    wrap_rows(cells, width)
+        .into_iter()
+        .map(|(l, _)| l)
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Wrap {
+    pub indent: usize,
+    pub width: usize,
+    pub join: Join,
+}
+
+pub fn wrap_rows(chars: &[Cell], width: usize) -> Vec<(Line<'static>, Wrap)> {
     let mut out = Vec::new();
-    for logical in cells.split(|c| c.ch == '\n') {
+    for logical in chars.split(|c| c.ch == '\n') {
         let block = logical.first().map_or(Block::None, |c| c.block);
         let prefix = block_prefix(block);
         let avail = width
             .saturating_sub(prefix.as_ref().map_or(0, |p| p.content.width()))
             .max(1);
+        let indent = prefix.as_ref().map_or(0, |p| cells(&p.content));
+        let row = |part: &[Cell], join: Join| {
+            let text: String = part.iter().map(|c| c.ch).collect();
+            let wrap = Wrap {
+                indent,
+                width: cells(&text),
+                join,
+            };
+            (cells_to_line(prefix.clone(), part), wrap)
+        };
         if logical.is_empty() {
-            out.push(cells_to_line(prefix, &[]));
+            out.push(row(&[], Join::Line));
             continue;
         }
+        let mut join = Join::Line;
         let mut start = 0usize;
         let mut line_w = 0usize;
         let mut last_space: Option<usize> = None;
@@ -130,7 +158,8 @@ pub fn wrap_cells(cells: &[Cell], width: usize) -> Vec<Line<'static>> {
                     Some(sp) if sp > start => (sp, sp + 1),
                     _ => (i, i),
                 };
-                out.push(cells_to_line(prefix.clone(), &logical[start..end]));
+                out.push(row(&logical[start..end], join));
+                join = if next > end { Join::Space } else { Join::Glue };
                 start = next;
                 i = next;
                 line_w = 0;
@@ -143,13 +172,17 @@ pub fn wrap_cells(cells: &[Cell], width: usize) -> Vec<Line<'static>> {
             line_w += w;
             i += 1;
         }
-        out.push(cells_to_line(prefix.clone(), &logical[start..]));
+        out.push(row(&logical[start..], join));
     }
     out
 }
 
 pub fn render_text(rt: &RichText, base: Style, width: usize) -> Vec<Line<'static>> {
     wrap_cells(&styled_cells(rt, base), width)
+}
+
+pub fn render_rows(rt: &RichText, base: Style, width: usize) -> Vec<(Line<'static>, Wrap)> {
+    wrap_rows(&styled_cells(rt, base), width)
 }
 
 pub fn utf16_slice(text: &str, offset: usize, length: usize) -> String {
@@ -167,30 +200,66 @@ pub fn utf16_slice(text: &str, offset: usize, length: usize) -> String {
     out
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Link {
     pub url: String,
     pub hidden: bool,
+    pub text: String,
 }
 
 pub fn links(rt: &RichText) -> Vec<Link> {
+    let mut seen = std::collections::HashSet::new();
     rt.entities
         .iter()
         .filter_map(|e| {
             let shown = utf16_slice(&rt.text, e.offset, e.length);
-            match &e.kind {
-                EntityKind::Link(Some(url)) => Some(Link {
-                    hidden: normalize_url(shown.trim()) != normalize_url(url),
-                    url: url.clone(),
-                }),
-                EntityKind::Link(None) => Some(Link {
-                    url: shown,
-                    hidden: false,
-                }),
-                _ => None,
-            }
+            let (url, hidden) = match &e.kind {
+                EntityKind::Link(Some(url)) => (
+                    url.clone(),
+                    normalize_url(shown.trim()) != normalize_url(url),
+                ),
+                EntityKind::Link(None) => (shown.clone(), false),
+                EntityKind::Mention => {
+                    let name = shown.strip_prefix('@').filter(|n| !n.is_empty())?;
+                    (format!("https://t.me/{name}"), false)
+                }
+                EntityKind::MentionName(id) => (format!("tg://user?id={id}"), false),
+                _ => return None,
+            };
+            Some(Link {
+                url,
+                hidden,
+                text: shown,
+            })
         })
-        .filter(|l| !l.url.is_empty())
+        .filter(|l| !l.url.is_empty() && seen.insert(l.url.clone()))
         .collect()
+}
+
+pub fn telegram_link(url: &str) -> bool {
+    let url = url.trim().to_ascii_lowercase();
+    if url.starts_with("tg:") {
+        return true;
+    }
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))
+        .unwrap_or(&url);
+    let host = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let host = host.strip_prefix("www.").unwrap_or(host);
+    matches!(host, "t.me" | "telegram.me" | "telegram.dog") || host.ends_with(".t.me")
+}
+
+pub fn user_link(url: &str) -> Option<i64> {
+    let lower = url.trim().to_ascii_lowercase();
+    let query = lower
+        .strip_prefix("tg://user?")
+        .or_else(|| lower.strip_prefix("tg:user?"))?;
+    query
+        .split('&')
+        .find_map(|p| p.strip_prefix("id="))?
+        .parse()
+        .ok()
 }
 
 pub fn normalize_url(url: &str) -> String {
@@ -291,7 +360,7 @@ pub enum Lang {
 impl Lang {
     pub fn from_locale(value: Option<&str>) -> Lang {
         match value {
-            Some(v) if v.to_ascii_lowercase().starts_with("en") => Lang::En,
+            Some(v) if !v.to_ascii_lowercase().starts_with("ru") => Lang::En,
             _ => Lang::Ru,
         }
     }
@@ -301,8 +370,22 @@ impl Lang {
             .iter()
             .filter_map(|k| std::env::var(k).ok())
             .find(|v| !v.is_empty());
+        #[cfg(windows)]
+        let value = value.or_else(windows_locale);
         Lang::from_locale(value.as_deref())
     }
+}
+
+#[cfg(windows)]
+fn windows_locale() -> Option<String> {
+    let mut name = [0u16; 85];
+    let len = unsafe {
+        windows_sys::Win32::Globalization::GetUserDefaultLocaleName(
+            name.as_mut_ptr(),
+            name.len() as i32,
+        )
+    };
+    (len > 1).then(|| String::from_utf16_lossy(&name[..len as usize - 1]))
 }
 
 const MONTHS_RU: [&str; 12] = [
@@ -360,6 +443,43 @@ pub fn day_label(lang: Lang, ts: i64, now: i64) -> String {
         (Lang::Ru, false) => format!("{} {} {}", day.day(), MONTHS_RU[month], day.year()),
         (Lang::En, true) => format!("{} {}", MONTHS_EN[month], day.day()),
         (Lang::En, false) => format!("{} {}, {}", MONTHS_EN[month], day.day(), day.year()),
+    }
+}
+
+const MONTHS_SHORT_RU: [&str; 12] = [
+    "янв", "фев", "мар", "апр", "мая", "июн", "июл", "авг", "сен", "окт", "ноя", "дек",
+];
+const MONTHS_SHORT_EN: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+const WEEKDAYS_RU: [&str; 7] = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"];
+const WEEKDAYS_EN: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+
+pub fn list_time(lang: Lang, ts: i64, now: i64) -> String {
+    let (Some(t), Some(n)) = (local(ts), local(now)) else {
+        return String::new();
+    };
+    let (day, today) = (t.date_naive(), n.date_naive());
+    if day == today {
+        let pattern = match theme::get().layout.clock {
+            theme::Clock::H24 => "%H:%M",
+            theme::Clock::H12 => "%-I:%M %p",
+        };
+        return t.format(pattern).to_string();
+    }
+    let weekday = day.weekday().num_days_from_monday() as usize;
+    let month = day.month0() as usize;
+    match (lang, (today - day).num_days()) {
+        (Lang::Ru, 1..=6) => WEEKDAYS_RU[weekday].to_owned(),
+        (Lang::En, 1..=6) => WEEKDAYS_EN[weekday].to_owned(),
+        (Lang::Ru, _) if day.year() == today.year() => {
+            format!("{} {}", day.day(), MONTHS_SHORT_RU[month])
+        }
+        (Lang::En, _) if day.year() == today.year() => {
+            format!("{} {}", MONTHS_SHORT_EN[month], day.day())
+        }
+        (Lang::Ru, _) => t.format("%d.%m.%y").to_string(),
+        (Lang::En, _) => t.format("%m/%d/%y").to_string(),
     }
 }
 
@@ -629,6 +749,29 @@ mod tests {
         assert_eq!(Lang::from_locale(Some("en_US.UTF-8")), Lang::En);
         assert_eq!(Lang::from_locale(Some("ru_RU.UTF-8")), Lang::Ru);
         assert_eq!(Lang::from_locale(None), Lang::Ru);
+        assert_eq!(Lang::from_locale(Some("ru-RU")), Lang::Ru);
+        assert_eq!(Lang::from_locale(Some("de_DE.UTF-8")), Lang::En);
+        assert_eq!(Lang::from_locale(Some("C.UTF-8")), Lang::En);
+    }
+
+    #[test]
+    fn list_times_show_the_clock_today_the_weekday_this_week_and_a_date_before() {
+        let at = |y, m, d, h| {
+            Local
+                .with_ymd_and_hms(y, m, d, h, 5, 0)
+                .single()
+                .unwrap()
+                .timestamp()
+        };
+        let now = at(2026, 11, 12, 15);
+        assert_eq!(list_time(Lang::En, at(2026, 11, 12, 9), now), "09:05");
+        assert_eq!(list_time(Lang::En, at(2026, 11, 11, 9), now), "Wed");
+        assert_eq!(list_time(Lang::Ru, at(2026, 11, 6, 9), now), "Пт");
+        assert_eq!(list_time(Lang::En, at(2026, 11, 5, 9), now), "Nov 5");
+        assert_eq!(list_time(Lang::Ru, at(2026, 11, 5, 9), now), "5 ноя");
+        assert_eq!(list_time(Lang::Ru, at(2025, 3, 2, 9), now), "02.03.25");
+        assert_eq!(list_time(Lang::En, at(2025, 3, 2, 9), now), "03/02/25");
+        assert_eq!(list_time(Lang::En, at(2026, 11, 13, 9), now), "Nov 13");
     }
 
     fn ent(offset: usize, length: usize, kind: EntityKind) -> Entity {
@@ -718,6 +861,36 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_rows_report_where_the_text_sits_and_how_it_joins() {
+        let rt = RichText {
+            text: "hello brave\nabcdefgh\n\nquoted text".to_owned(),
+            entities: vec![ent(22, 11, EntityKind::Quote)],
+        };
+        let rows: Vec<(String, Wrap)> = render_rows(&rt, Style::default(), 7)
+            .iter()
+            .map(|(l, w)| (text_of(l), *w))
+            .collect();
+        let wrap = |indent, width, join| Wrap {
+            indent,
+            width,
+            join,
+        };
+        assert_eq!(
+            rows,
+            vec![
+                ("hello".to_owned(), wrap(0, 5, Join::Line)),
+                ("brave".to_owned(), wrap(0, 5, Join::Space)),
+                ("abcdefg".to_owned(), wrap(0, 7, Join::Line)),
+                ("h".to_owned(), wrap(0, 1, Join::Glue)),
+                (String::new(), wrap(0, 0, Join::Line)),
+                ("▎ quote".to_owned(), wrap(2, 5, Join::Line)),
+                ("▎ d".to_owned(), wrap(2, 1, Join::Glue)),
+                ("▎ text".to_owned(), wrap(2, 4, Join::Space)),
+            ]
+        );
+    }
+
+    #[test]
     fn urls_from_entities() {
         let rt = RichText {
             text: "see example.com and docs".to_owned(),
@@ -741,6 +914,62 @@ mod tests {
         assert!(!links(&same)[0].hidden);
         assert_eq!(normalize_url("example.com"), "https://example.com");
         assert_eq!(normalize_url("https://a.b"), "https://a.b");
+    }
+
+    #[test]
+    fn mentions_become_telegram_links_in_text_order() {
+        let rt = RichText {
+            text: "@durov, Alice #tag @ t.me/rust @durov".to_owned(),
+            entities: vec![
+                ent(0, 6, EntityKind::Mention),
+                ent(8, 5, EntityKind::MentionName(42)),
+                ent(14, 4, EntityKind::Mention),
+                ent(19, 1, EntityKind::Mention),
+                ent(21, 9, EntityKind::Link(None)),
+                ent(31, 6, EntityKind::Mention),
+            ],
+        };
+        let found = links(&rt);
+        let urls: Vec<&str> = found.iter().map(|l| l.url.as_str()).collect();
+        assert_eq!(
+            urls,
+            vec!["https://t.me/durov", "tg://user?id=42", "t.me/rust"]
+        );
+        let texts: Vec<&str> = found.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts, vec!["@durov", "Alice", "t.me/rust"]);
+        assert!(found.iter().all(|l| !l.hidden));
+    }
+
+    #[test]
+    fn telegram_links_are_told_apart_from_the_web() {
+        for url in [
+            "t.me/rust",
+            "https://t.me/+AbCdEf",
+            "http://telegram.me/durov",
+            "https://telegram.dog/durov",
+            "https://www.t.me/s/rust",
+            "https://durov.t.me",
+            "tg://resolve?domain=durov",
+            "TG:resolve?domain=durov",
+            " https://T.ME/rust ",
+        ] {
+            assert!(telegram_link(url), "{url}");
+        }
+        for url in [
+            "https://example.com/t.me/rust",
+            "https://telegra.ph/page",
+            "https://nott.me/x",
+            "https://t.me.evil.example/x",
+            "https://telegram.org/faq",
+            "mailto:a@t.me",
+        ] {
+            assert!(!telegram_link(url), "{url}");
+        }
+        assert_eq!(user_link("tg://user?id=42"), Some(42));
+        assert_eq!(user_link("tg:user?id=7&x=1"), Some(7));
+        assert_eq!(user_link("tg://user?id=abc"), None);
+        assert_eq!(user_link("tg://resolve?domain=durov"), None);
+        assert_eq!(user_link("https://t.me/durov"), None);
     }
 
     #[test]

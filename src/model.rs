@@ -9,6 +9,7 @@ pub enum EntityKind {
     Pre,
     Link(Option<String>),
     Mention,
+    MentionName(i64),
     Quote,
 }
 
@@ -86,6 +87,7 @@ pub struct MsgMeta {
     pub via_bot: i64,
     pub signature: String,
     pub story: bool,
+    pub reactors_visible: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -381,6 +383,7 @@ pub struct History {
     pub epoch: u64,
     pub topic: Option<i32>,
     pub general: bool,
+    pub error: Option<String>,
 }
 
 pub const PRELOAD_MARGIN: usize = 8;
@@ -471,6 +474,7 @@ impl History {
     pub fn merge_older(&mut self, batch: Vec<Msg>) -> usize {
         self.finish_older();
         self.older_retry_at = None;
+        self.error = None;
         let before = self.msgs.len();
         if batch.is_empty() {
             self.reached_start = true;
@@ -633,6 +637,7 @@ pub struct ChatInfo {
     pub auto_delete: i32,
     pub perms: Rights,
     pub protected: bool,
+    pub reactions_off: bool,
 }
 
 impl ChatInfo {
@@ -689,6 +694,7 @@ pub struct Rights {
     pub create_topics: bool,
     pub pin: bool,
     pub change_info: bool,
+    pub no_send: bool,
 }
 
 impl Rights {
@@ -697,6 +703,7 @@ impl Rights {
         create_topics: true,
         pin: true,
         change_info: true,
+        no_send: false,
     };
 
     pub fn can_create_topic(self) -> bool {
@@ -728,6 +735,7 @@ pub fn effective_rights(status: Membership, chat: Rights) -> Rights {
             create_topics: r.manage_topics || chat.create_topics,
             pin: r.pin || chat.pin,
             change_info: r.change_info || chat.change_info,
+            no_send: false,
         },
         Membership::Member => Rights {
             manage_topics: false,
@@ -738,6 +746,7 @@ pub fn effective_rights(status: Membership, chat: Rights) -> Rights {
             create_topics: r.create_topics && chat.create_topics,
             pin: r.pin && chat.pin,
             change_info: r.change_info && chat.change_info,
+            no_send: r.no_send || chat.no_send,
         },
         Membership::Left => Rights::default(),
     }
@@ -836,6 +845,19 @@ pub fn topic_perms(t: &Topic, r: Rights) -> TopicPerms {
         pin: r.manage_topics,
         close: !t.general && (r.manage_topics || t.outgoing),
         hide: t.general && r.manage_topics,
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Draft {
+    pub text: String,
+    pub reply_to: Option<i64>,
+    pub quote: Option<(String, i32)>,
+}
+
+impl Draft {
+    pub fn is_empty(&self) -> bool {
+        self.text.trim().is_empty() && self.reply_to.is_none()
     }
 }
 
@@ -1171,6 +1193,7 @@ mod tests {
             auto_delete: 0,
             perms: Rights::default(),
             protected: false,
+            reactions_off: false,
         };
         let mut chats = [mk(1, 10), mk(2, 30), mk(3, 20)];
         assert_eq!(sorted_chat_ids(chats.iter(), ListId::Main), vec![2, 3, 1]);

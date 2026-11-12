@@ -361,6 +361,7 @@ pub struct Appearance {
     pub folder_counter: FolderCounter,
     pub folder_counter_unmuted_only: bool,
     pub hide_all_chats: bool,
+    pub compact_chat_list: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Deserialize, serde::Serialize)]
@@ -766,11 +767,13 @@ mod tests {
         assert_eq!(d.appearance.folder_counter, FolderCounter::Chats);
         assert!(!d.appearance.folder_counter_unmuted_only);
         assert!(!d.appearance.hide_all_chats);
+        assert!(!d.appearance.compact_chat_list);
         let s = Settings::parse(
-            "[chats]\ntranslate_to = \"de\"\nphotos_as_files = true\nsave_to_chat = -100123\n[appearance]\nfolder_counter = \"messages\"\nfolder_counter_unmuted_only = true\nhide_all_chats = true\n",
+            "[chats]\ntranslate_to = \"de\"\nphotos_as_files = true\nsave_to_chat = -100123\n[appearance]\nfolder_counter = \"messages\"\nfolder_counter_unmuted_only = true\nhide_all_chats = true\ncompact_chat_list = true\n",
             &mut Vec::new(),
         )
         .unwrap();
+        assert!(s.appearance.compact_chat_list);
         assert_eq!(s.chats.translate_to, "de");
         assert_eq!(s.chats.save_to_chat, -100123);
         assert_eq!(s.appearance.folder_counter, FolderCounter::Messages);

@@ -24,6 +24,9 @@ pub const MAX_FRAME_PIXELS: u64 = 320 * 240;
 pub const MAX_CLIP_BYTES: u64 = 24 * 1024 * 1024;
 pub const CACHE_BYTES: u64 = 128 * 1024 * 1024;
 pub const MAX_SOURCE_BYTES: u64 = 16 * 1024 * 1024;
+pub const REDRAW_FPS: u32 = 12;
+pub const REDRAW_BYTES_PER_SEC: u64 = 1024 * 1024;
+pub const REDRAW_MAX_VISIBLE: usize = 2;
 const DECODE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RUNNING: usize = 1;
 const MAX_STATES: usize = 512;
@@ -111,14 +114,15 @@ enum State {
 
 pub struct Anim {
     dir: Option<PathBuf>,
+    native: bool,
     tx: UnboundedSender<Event>,
     states: HashMap<Key, State>,
     queue: Vec<(Key, Job)>,
     running: usize,
     live: HashMap<Key, u32>,
-    touched: HashSet<Key>,
+    touched: HashMap<Key, bool>,
+    playing: HashSet<u32>,
     pending: Vec<Op>,
-    paused: bool,
     want_paused: bool,
     next_id: u32,
     epoch: u64,
@@ -134,14 +138,15 @@ impl Anim {
             ^ std::process::id().wrapping_mul(2_654_435_761);
         Self {
             dir: None,
+            native: true,
             tx,
             states: HashMap::new(),
             queue: Vec::new(),
             running: 0,
             live: HashMap::new(),
-            touched: HashSet::new(),
+            touched: HashMap::new(),
+            playing: HashSet::new(),
             pending: Vec::new(),
-            paused: false,
             want_paused: false,
             next_id: seed & ID_MASK,
             epoch: 0,
@@ -152,10 +157,20 @@ impl Anim {
 
     pub fn enable(&mut self, dir: PathBuf) {
         self.dir = Some(dir);
+        self.native = true;
+    }
+
+    pub fn enable_redraw(&mut self, dir: PathBuf) {
+        self.dir = Some(dir);
+        self.native = false;
     }
 
     pub fn enabled(&self) -> bool {
         self.dir.is_some()
+    }
+
+    pub fn native(&self) -> bool {
+        self.native
     }
 
     pub fn begin(&mut self, paused: bool) {
@@ -163,10 +178,37 @@ impl Anim {
         self.want_paused = paused;
     }
 
+    pub fn pause(&mut self, paused: bool) {
+        self.want_paused = paused;
+    }
+
+    pub fn paused(&self) -> bool {
+        self.want_paused
+    }
+
+    pub fn clip(&mut self, key: Key, job: impl FnOnce() -> Job) -> Option<PathBuf> {
+        self.dir.as_ref()?;
+        match self.states.get(&key) {
+            None => {
+                if !self.queue.iter().any(|(k, _)| *k == key) {
+                    self.queue.push((key, job()));
+                }
+                None
+            }
+            Some(State::Ready(path)) => Some(path.clone()),
+            Some(State::Decoding | State::Still | State::Failed) => None,
+        }
+    }
+
+    pub fn forget(&mut self, key: Key) {
+        self.states.remove(&key);
+    }
+
     pub fn show(&mut self, key: Key, job: impl FnOnce() -> Job) -> Option<u32> {
         self.dir.as_ref()?;
+        let run = !self.want_paused;
         if let Some(&id) = self.live.get(&key) {
-            self.touched.insert(key);
+            *self.touched.entry(key).or_insert(run) |= run;
             return Some(id);
         }
         let path = match self.states.get(&key) {
@@ -200,10 +242,13 @@ impl Anim {
             id,
             cells: (key.cols, key.rows),
             clip,
-            run: !self.want_paused,
+            run,
         });
+        if run {
+            self.playing.insert(id);
+        }
         self.live.insert(key, id);
-        self.touched.insert(key);
+        self.touched.insert(key, run);
         Some(id)
     }
 
@@ -211,21 +256,31 @@ impl Anim {
         let mut gone: Vec<(u32, Key)> = self
             .live
             .iter()
-            .filter(|(k, _)| !self.touched.contains(k))
+            .filter(|(k, _)| !self.touched.contains_key(k))
             .map(|(k, id)| (*id, *k))
             .collect();
         gone.sort_unstable_by_key(|(id, _)| *id);
         for (id, key) in gone {
             self.live.remove(&key);
+            self.playing.remove(&id);
             self.pending.push(Op::Cmd(delete(id)));
         }
-        if self.want_paused != self.paused {
-            self.paused = self.want_paused;
-            let mut ids: Vec<u32> = self.live.values().copied().collect();
-            ids.sort_unstable();
-            for id in ids {
-                let cmd = if self.paused { stop(id) } else { start(id) };
-                self.pending.push(Op::Cmd(cmd));
+        let mut flips: Vec<(u32, bool)> = self
+            .live
+            .iter()
+            .filter_map(|(k, id)| {
+                let run = *self.touched.get(k)?;
+                (run != self.playing.contains(id)).then_some((*id, run))
+            })
+            .collect();
+        flips.sort_unstable();
+        for (id, run) in flips {
+            if run {
+                self.playing.insert(id);
+                self.pending.push(Op::Cmd(start(id)));
+            } else {
+                self.playing.remove(&id);
+                self.pending.push(Op::Cmd(stop(id)));
             }
         }
         for op in std::mem::take(&mut self.pending) {
@@ -300,6 +355,7 @@ impl Anim {
         self.reported.clear();
         let mut ids: Vec<u32> = self.live.drain().map(|(_, id)| id).collect();
         ids.sort_unstable();
+        self.playing.clear();
         self.pending.retain(|op| matches!(op, Op::Cmd(_)));
         for id in ids {
             self.pending.push(Op::Cmd(delete(id)));
@@ -308,7 +364,6 @@ impl Anim {
 
     pub fn shutdown(&mut self, w: &mut impl Write) -> std::io::Result<()> {
         self.touched.clear();
-        self.want_paused = self.paused;
         self.finish(w)
     }
 
@@ -329,6 +384,14 @@ impl Anim {
         let mut files: Vec<i32> = self.live.keys().map(|k| k.file).collect();
         files.sort_unstable();
         files
+    }
+
+    #[cfg(test)]
+    pub fn live_id(&self, file: i32) -> Option<u32> {
+        self.live
+            .iter()
+            .find(|(k, _)| k.file == file)
+            .map(|(_, id)| *id)
     }
 
     #[cfg(test)]
@@ -354,7 +417,7 @@ impl Anim {
         }
     }
 
-    fn report(&mut self, msg: String) {
+    pub fn report(&mut self, msg: String) {
         if self.reported.len() >= MAX_REPORTED {
             self.reported.clear();
         }
@@ -445,6 +508,99 @@ pub fn lottie_pick(source_frames: usize, duration: f32, w: u32, h: u32) -> Vec<(
             (index, Duration::from_millis((gap as u64).max(1)))
         })
         .collect()
+}
+
+pub fn redraw_picks(gaps: &[u32]) -> Vec<(usize, u32)> {
+    let total: u64 = gaps.iter().map(|g| u64::from((*g).max(1))).sum();
+    let mut out: Vec<(usize, u32)> = Vec::new();
+    let (mut at, mut start, mut i, mut k) = (0u64, 0u64, 0usize, 0usize);
+    while at < total {
+        while i + 1 < gaps.len() && start + u64::from(gaps[i].max(1)) <= at {
+            start += u64::from(gaps[i].max(1));
+            i += 1;
+        }
+        let next = (at + u64::from(gap_ms(k, REDRAW_FPS))).min(total);
+        let len = (next - at) as u32;
+        match out.last_mut() {
+            Some((last, d)) if *last == i => *d += len,
+            _ => out.push((i, len)),
+        }
+        at = next;
+        k += 1;
+    }
+    out
+}
+
+pub fn frame_gap(cost: u64, share: usize) -> Duration {
+    let floor = Duration::from_secs(1) / REDRAW_FPS;
+    let ms = cost
+        .saturating_mul(share.max(1) as u64)
+        .saturating_mul(1000)
+        .div_ceil(REDRAW_BYTES_PER_SEC);
+    floor.max(Duration::from_millis(ms))
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Playhead {
+    pub now: Duration,
+    pub share: usize,
+    pub paused: bool,
+    pub due: Option<Duration>,
+}
+
+impl Playhead {
+    pub fn new(now: Duration, share: usize, paused: bool) -> Self {
+        Self {
+            now,
+            share,
+            paused,
+            due: None,
+        }
+    }
+
+    pub fn frame(&mut self, cost: u64) -> Duration {
+        let gap = frame_gap(cost, self.share).as_nanos().max(1);
+        let now = self.now.as_nanos();
+        let into = now % gap;
+        if !self.paused {
+            let left = Duration::from_nanos((gap - into).min(u128::from(u64::MAX)) as u64);
+            self.due = Some(self.due.map_or(left, |d| d.min(left)));
+        }
+        Duration::from_nanos((now - into + gap / 2).min(u128::from(u64::MAX)) as u64)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Freeze(Duration);
+
+impl Freeze {
+    pub fn at(&mut self, now: Duration, paused: bool) -> Duration {
+        if !paused {
+            self.0 = now;
+        }
+        self.0
+    }
+}
+
+pub fn frame_image(clip: &Clip, i: usize) -> Result<image::RgbaImage, String> {
+    let f = clip
+        .frames
+        .get(i)
+        .ok_or_else(|| format!("animation frame {i} is missing"))?;
+    let want = clip.w as usize * clip.h as usize * 4;
+    let mut raw = Vec::with_capacity(want);
+    flate2::read::ZlibDecoder::new(f.data.as_slice())
+        .take(want as u64 + 1)
+        .read_to_end(&mut raw)
+        .map_err(|e| format!("animation frame {i}: {e}"))?;
+    if raw.len() != want {
+        return Err(format!(
+            "animation frame {i} has {} bytes, expected {want}",
+            raw.len()
+        ));
+    }
+    image::RgbaImage::from_raw(clip.w, clip.h, raw)
+        .ok_or_else(|| format!("animation frame {i}: bad size"))
 }
 
 struct Builder {
@@ -1562,6 +1718,155 @@ mod tests {
             result: Ok(Outcome::Ready(dir.join("x"))),
         });
         assert!(a.is_empty(), "results from before a reset are dropped");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn redraw_playback_caps_the_frame_rate_and_keeps_the_timeline() {
+        let floor = 1000 / REDRAW_FPS;
+        let fast: Vec<u32> = (0..90).map(|i| gap_ms(i, 30)).collect();
+        let picks = redraw_picks(&fast);
+        assert_eq!(picks.iter().map(|p| p.1).sum::<u32>(), 3000);
+        assert_eq!(picks.len(), 3 * REDRAW_FPS as usize);
+        assert!(picks.iter().all(|(_, ms)| *ms >= floor), "{picks:?}");
+        assert_eq!(picks[0].0, 0);
+        assert!(picks.windows(2).all(|w| w[0].0 < w[1].0));
+        assert!(picks.last().unwrap().0 >= 85);
+        let slow = redraw_picks(&[200; 10]);
+        assert_eq!(
+            slow.iter().map(|p| p.0).collect::<Vec<_>>(),
+            (0..10).collect::<Vec<_>>()
+        );
+        assert_eq!(slow.iter().map(|p| p.1).sum::<u32>(), 2000);
+        assert!(slow.iter().all(|(_, ms)| *ms >= 2 * floor));
+        assert_eq!(redraw_picks(&[40]), vec![(0, 40)]);
+        assert_eq!(redraw_picks(&[0, 0]), vec![(0, 2)]);
+        assert!(redraw_picks(&[]).is_empty());
+    }
+
+    #[test]
+    fn redraw_gap_keeps_the_terminal_under_the_byte_budget() {
+        let floor = Duration::from_secs(1) / REDRAW_FPS;
+        assert_eq!(frame_gap(0, 1), floor);
+        assert_eq!(frame_gap(20_000, 2), floor);
+        for (cost, share) in [
+            (200_000u64, 1usize),
+            (137_226, 1),
+            (27_003, 2),
+            (900_000, 3),
+        ] {
+            let gap = frame_gap(cost, share);
+            assert!(gap >= floor);
+            let rate = cost as f64 * share as f64 / gap.as_secs_f64();
+            assert!(
+                rate <= REDRAW_BYTES_PER_SEC as f64,
+                "{cost} {share} {gap:?}"
+            );
+        }
+        assert!(frame_gap(200_000, 2) > frame_gap(200_000, 1));
+        assert!(frame_gap(u64::MAX, usize::MAX) >= floor);
+    }
+
+    #[test]
+    fn playhead_steps_on_frame_boundaries_and_asks_for_the_next_one() {
+        let gap = frame_gap(0, 1);
+        let mut h = Playhead::new(gap + Duration::from_millis(10), 1, false);
+        let t = h.frame(0);
+        assert!(t > gap && t < gap * 2, "{t:?}");
+        assert_eq!(h.frame(0), t, "the same quantum shows the same frame");
+        assert_eq!(h.due, Some(gap - Duration::from_millis(10)));
+        let slow = h.frame(500_000);
+        assert_eq!(
+            slow,
+            frame_gap(500_000, 1) / 2,
+            "a costly frame stays on its first, longer quantum"
+        );
+        assert_eq!(h.due, Some(gap - Duration::from_millis(10)));
+        let mut paused = Playhead::new(gap * 3, 1, true);
+        paused.frame(0);
+        assert_eq!(paused.due, None, "paused animations ask for no ticks");
+        let mut f = Freeze::default();
+        assert_eq!(f.at(Duration::from_secs(5), false), Duration::from_secs(5));
+        assert_eq!(f.at(Duration::from_secs(6), true), Duration::from_secs(5));
+        assert_eq!(f.at(Duration::from_secs(7), true), Duration::from_secs(5));
+        assert_eq!(f.at(Duration::from_secs(8), false), Duration::from_secs(8));
+    }
+
+    #[test]
+    fn redraw_mode_decodes_clips_without_kitty_commands() {
+        let dir = scratch("redraw");
+        let file = dir.join("a.anim");
+        let c = clip(4, 3, &[(1, 40), (2, 40), (3, 40)]);
+        write_clip(&file, &c).unwrap();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut a = Anim::new(tx);
+        a.enable_redraw(dir.clone());
+        assert!(a.enabled() && !a.native());
+        let k = Key {
+            file: 1,
+            cols: 4,
+            rows: 2,
+        };
+        a.begin(false);
+        assert_eq!(a.clip(k, job), None);
+        assert_eq!(a.clip(k, job), None);
+        assert_eq!(a.queued(), 1, "queued once");
+        a.mark_ready(k, file.clone());
+        assert_eq!(a.clip(k, job), Some(file.clone()));
+        assert!(flush(&mut a).is_empty());
+        assert!(a.live_ids().is_empty());
+        a.forget(k);
+        assert_eq!(a.clip(k, job), None, "a forgotten clip is decoded again");
+        assert_eq!(a.queued(), 1);
+        let back = read_clip(&file).unwrap();
+        assert_eq!(
+            frame_image(&back, 1).unwrap().get_pixel(3, 2).0,
+            [2, 0, 0, 255]
+        );
+        assert!(frame_image(&back, 3).is_err());
+        let mut broken = back.clone();
+        broken.frames[0].data.truncate(4);
+        assert!(frame_image(&broken, 0).is_err());
+        let mut off = Anim::new(tokio::sync::mpsc::unbounded_channel().0);
+        assert_eq!(off.clip(k, job), None);
+        assert_eq!(off.queued(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn layers_pause_and_play_their_own_clips() {
+        let dir = scratch("layers");
+        let file = dir.join("a.anim");
+        write_clip(&file, &clip(8, 8, &[(1, 40), (2, 40)])).unwrap();
+        let mut a = manager(&dir);
+        let chat = Key {
+            file: 1,
+            cols: 4,
+            rows: 2,
+        };
+        let picker = Key { file: 2, ..chat };
+        a.mark_ready(chat, file.clone());
+        a.mark_ready(picker, file.clone());
+        a.begin(false);
+        let c = a.show(chat, job).unwrap();
+        flush(&mut a);
+        a.begin(true);
+        assert!(a.paused());
+        a.show(chat, job);
+        a.pause(false);
+        let p = a.show(picker, job).unwrap();
+        let out = flush(&mut a);
+        assert!(out.contains(&format!("a=T,U=1,i={p},")));
+        assert!(out.contains(&start(p)), "the top layer plays");
+        assert!(out.ends_with(&stop(c)), "the layer below pauses");
+        a.begin(true);
+        a.show(chat, job);
+        a.pause(false);
+        a.show(picker, job);
+        assert!(flush(&mut a).is_empty());
+        a.begin(false);
+        a.show(chat, job);
+        assert_eq!(flush(&mut a), format!("{}{}", delete(p), start(c)));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

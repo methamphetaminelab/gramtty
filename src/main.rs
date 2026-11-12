@@ -15,10 +15,12 @@ mod player;
 mod popups;
 mod presence;
 mod qr;
+mod search;
 mod stickers;
 mod td;
 mod termcolors;
 mod termprobe;
+mod textmap;
 mod theme;
 mod ui;
 mod upload;
@@ -29,9 +31,9 @@ use std::process::ExitCode;
 use std::time::Duration;
 
 use crossterm::event::{
-    DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
-    EventStream, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, EventStream, KeyboardEnhancementFlags, MouseEvent,
+    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use futures::StreamExt;
@@ -44,10 +46,19 @@ use crate::td::{Event, Td};
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> ExitCode {
+    #[cfg(windows)]
+    if winconsole::relaunch_in_terminal() {
+        return ExitCode::SUCCESS;
+    }
     match run().await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("{}: {e}", config::APP_NAME);
+            #[cfg(windows)]
+            if winconsole::owned() {
+                eprintln!("Press Enter to close this window");
+                let _ = std::io::stdin().read_line(&mut String::new());
+            }
             ExitCode::FAILURE
         }
     }
@@ -108,17 +119,64 @@ fn print_theme(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+fn help_text() -> String {
+    let name = config::APP_NAME;
+    let prefix = config::env_prefix();
+    let dir = |d: Result<std::path::PathBuf, String>| {
+        d.map_or_else(|e| format!("({e})"), |p| p.display().to_string())
+    };
+    format!(
+        "{name} {version}: a terminal Telegram client\n\n\
+         Usage: {name} [option]\n\n\
+         Options:\n  \
+         -h, --help                 show this help\n  \
+         -V, --version              show the version\n  \
+         --print-theme [preset]     print a theme as TOML (terminal, default, high-contrast, light, mono, custom)\n  \
+         --print-keymap             print every key binding with its action name\n\n\
+         Environment:\n  \
+         {keys:<34} your own Telegram API keys\n  \
+         {data_var:<34} where the session and data live\n  \
+         {proto_var:<34} auto, kitty, sixel, iterm2 or halfblocks\n\n\
+         Config: {config}\n\
+         Data:   {data}\n\n\
+         Inside the app press ? to see all key bindings, Space for the leader menu.\n",
+        version = env!("CARGO_PKG_VERSION"),
+        keys = format!("{prefix}_API_ID, {prefix}_API_HASH"),
+        data_var = format!("{prefix}_DATA_DIR"),
+        proto_var = format!("{prefix}_IMAGE_PROTOCOL"),
+        config = dir(config::config_dir()),
+        data = dir(config::data_dir()),
+    )
+}
+
 async fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.split_first() {
         None => {}
+        Some((flag, _)) if flag == "--version" || flag == "-V" => {
+            println!("{} {}", config::APP_NAME, env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some((flag, _)) if flag == "--help" || flag == "-h" => {
+            print!("{}", help_text());
+            return Ok(());
+        }
         Some((flag, rest)) if flag == "--print-theme" => {
             probe_terminal(false)?;
             return print_theme(rest);
         }
+        Some((flag, _)) if flag == "--print-keymap" => {
+            let mut warnings = Vec::new();
+            let keymap = load_keymap(&mut warnings)?;
+            for warning in warnings {
+                eprintln!("{warning}");
+            }
+            print!("{}", keymap.help_text());
+            return Ok(());
+        }
         Some((other, _)) => {
             return Err(format!(
-                "unknown argument {other:?}; usage: {} [--print-theme [preset]]",
+                "unknown argument {other:?}; see {} --help",
                 config::APP_NAME
             ));
         }
@@ -140,6 +198,7 @@ async fn run() -> Result<(), String> {
     td.start();
 
     drop(ratatui::init());
+    release_mouse_on_panic();
     let mut terminal = match ratatui::Terminal::new(ui::Resync(
         ratatui::backend::CrosstermBackend::new(std::io::stdout()),
     )) {
@@ -153,6 +212,7 @@ async fn run() -> Result<(), String> {
         std::io::stdout(),
         EnableBracketedPaste,
         EnableFocusChange,
+        EnableMouseCapture,
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
     );
     let tmux = probe.image.as_ref().is_some_and(|i| i.tmux);
@@ -163,10 +223,15 @@ async fn run() -> Result<(), String> {
             std::env::var("TERM").ok().as_deref(),
             std::env::var("KITTY_WINDOW_ID").ok().as_deref(),
         );
+    let redrawn_animation = matches!(
+        picker.protocol_type(),
+        ProtocolType::Sixel | ProtocolType::Iterm2 | ProtocolType::Halfblocks
+    );
     let mut app = App::new(td, creds, data_dir, keymap, picker);
-    if native_animation {
+    if native_animation || redrawn_animation {
         match config::cache_dir() {
-            Ok(dir) => app.media.anim.enable(dir.join("anim")),
+            Ok(dir) if native_animation => app.media.anim.enable(dir.join("anim")),
+            Ok(dir) => app.media.anim.enable_redraw(dir.join("anim")),
             Err(e) => warnings.push(format!("inline animations are off: {e}")),
         }
     }
@@ -186,12 +251,17 @@ async fn run() -> Result<(), String> {
     if let Err(e) = upload::prune_uploads(app.uploads_dir()) {
         warnings.push(e);
     }
-    if !warnings.is_empty() {
-        app.set_status(warnings.join("; "), true);
-    } else if let Some(w) = picker_warning {
-        app.set_status(w, true);
+    #[cfg(windows)]
+    if winconsole::classic() {
+        warnings.push(
+            "this console window shows pictures as blocks; run gramtty in Windows Terminal (wt gramtty)"
+                .to_owned(),
+        );
     }
+    warnings.extend(picker_warning);
+    app.startup_warnings(warnings);
     let result = event_loop(&mut terminal, &mut app, &mut rx).await;
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
     let settled = input_barrier().and_then(|()| {
         termprobe::settle_stdio().map_err(|e| format!("cannot drain terminal input: {e}"))
     });
@@ -211,6 +281,24 @@ async fn run() -> Result<(), String> {
     );
     ratatui::restore();
     result.and(settled).and(cleared)
+}
+
+fn release_mouse_on_panic() {
+    let restore = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        restore(info);
+    }));
+}
+
+fn hover(ev: &crossterm::event::Event) -> bool {
+    matches!(
+        ev,
+        crossterm::event::Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            ..
+        })
+    )
 }
 
 struct Probed {
@@ -343,6 +431,42 @@ fn image_picker(probe: Probed) -> (Picker, Option<String>) {
     (picker, probe.warning)
 }
 
+#[cfg(windows)]
+mod winconsole {
+    use windows_sys::Win32::System::Console::{GetConsoleProcessList, GetConsoleWindow};
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetClassNameW;
+
+    pub fn owned() -> bool {
+        let mut pids = [0u32; 2];
+        unsafe { GetConsoleProcessList(pids.as_mut_ptr(), 2) == 1 }
+    }
+
+    pub fn classic() -> bool {
+        let window = unsafe { GetConsoleWindow() };
+        if window.is_null() {
+            return false;
+        }
+        let mut name = [0u16; 64];
+        let len = unsafe { GetClassNameW(window, name.as_mut_ptr(), name.len() as i32) };
+        String::from_utf16_lossy(&name[..len.max(0) as usize]) == "ConsoleWindowClass"
+    }
+
+    pub fn relaunch_in_terminal() -> bool {
+        if !classic() || !owned() {
+            return false;
+        }
+        let Ok(exe) = std::env::current_exe() else {
+            return false;
+        };
+        std::process::Command::new("wt.exe")
+            .arg("--")
+            .arg(exe)
+            .args(std::env::args_os().skip(1))
+            .spawn()
+            .is_ok()
+    }
+}
+
 #[cfg(not(unix))]
 struct NoSignal;
 
@@ -369,9 +493,13 @@ async fn event_loop(
     let mut deadline: Option<tokio::time::Instant> = None;
     let mut late = termprobe::LateReplies::default();
     let mut layout = ui::image_layout(&ratatui::buffer::Buffer::empty(terminal.get_frame().area()));
+    let mut idle = false;
     loop {
-        ui::draw_frame(terminal, app, &mut layout, |_| {}).map_err(|e| format!("terminal: {e}"))?;
-        app.after_draw();
+        if !std::mem::take(&mut idle) {
+            ui::draw_frame(terminal, app, &mut layout, |_| {})
+                .map_err(|e| format!("terminal: {e}"))?;
+            app.after_draw();
+        }
         if app.exit_ready {
             return Ok(());
         }
@@ -399,7 +527,9 @@ async fn event_loop(
             ev = input.next() => match ev {
                 Some(Ok(ev)) => {
                     let mut next = Some(ev);
+                    idle = true;
                     while let Some(ev) = next {
+                        idle &= hover(&ev);
                         if !late.swallow(&ev, std::time::Instant::now()) {
                             app.handle(Event::Input(ev));
                         }
@@ -427,6 +557,7 @@ async fn event_loop(
             }
         }
         while let Ok(ev) = rx.try_recv() {
+            idle = false;
             app.handle(ev);
         }
     }

@@ -19,12 +19,14 @@ Terminal Telegram client in Rust on TDLib.
 
 - Login by QR code, phone number, login code, email code and 2FA password
 - Chats, folders, forum topics, secret chats
-- Inline media in the terminal: photos, albums, video, video notes, stickers, voice, files (kitty graphics; sixel, iTerm2 and half-block fallbacks); animated stickers and GIFs play right in the chat in kitty; video, video notes, GIFs, voice and music play with sound inside the viewer in kitty (libmpv), or in a separate mpv window
+- Chat list in two lines per chat, as in Telegram: the last message with its sender and time, drafts and who is typing; one line per chat with `appearance.compact_chat_list`. On a narrow terminal the chat info pane steps aside until you focus it (`4`), and `j` `k` scroll it when it is focused
+- Inline media in the terminal: photos, albums, video, video notes, stickers, voice, files (kitty graphics; sixel, iTerm2 and half-block fallbacks); animated stickers and GIFs play right in the chat and in the sticker/GIF picker (natively in kitty; in sixel, iTerm2 and half-block terminals they are redrawn at up to 12 fps, at most 2 at a time in the chat, within about 1 MB/s of terminal output); video, video notes, GIFs, voice and music play with sound inside the viewer in kitty (libmpv), or in a separate mpv window
 - Sending: files, albums, clipboard paste, voice messages, stickers and GIFs; upload progress and cancel
 - Reactions, replies, edit, delete, forward, pin, copy, translate, save to Saved Messages
-- Message search, pinned messages, notification inbox
+- Search like in Telegram: chats, contacts, public channels and messages in one box; search in a chat with highlighted matches, media filters, jump to a date and `n`/`N` stepping; pinned messages, notification inbox
 - Jumps to the next unread chat, mention or reply, reaction
 - Bot commands and inline keyboard buttons
+- t.me links and @mentions open users, bots, channels, groups and messages right in gramtty; joining by an invite link and sending /start from a bot link ask first
 - Desktop notifications and a notification sound
 - Privacy: "don't mark as read", ghost mode (no online status, typing or read receipts)
 - Opt-in, local-only history of messages deleted by others and earlier versions of edited ones (not kept for protected or secret chats)
@@ -64,7 +66,7 @@ Downloads the latest release, verifies its SHA-256 checksum, puts `gramtty.exe` 
 
 Or take the installer `gramtty-<version>-x86_64-windows-setup.exe` from the [releases page](https://github.com/methamphetaminelab/gramtty/releases/latest). It installs for the current user without administrator rights, adds a Start menu entry and `PATH`, can install the same dependencies, and is removed in Settings > Apps. The installer is not code-signed, so SmartScreen may ask for confirmation: More info > Run anyway.
 
-Run `gramtty` in Windows Terminal: images use sixel there, the classic console only shows half-block pictures. Dependencies installed later only show up in a new terminal window.
+Run `gramtty` in Windows Terminal: images use sixel there, the classic console only shows half-block pictures. Started from the Start menu or by double-click in the classic console, gramtty reopens itself in Windows Terminal; the installer and the install script install Windows Terminal or update it to 1.22 or newer. Dependencies installed later only show up in a new terminal window.
 
 ### Homebrew (macOS, Linux)
 
@@ -115,7 +117,7 @@ All optional, looked up on `PATH`; a missing one only disables its feature.
 | Recording voice messages | `pw-record` (PipeWire) and `opusenc` or `ffmpeg` with libopus | `ffmpeg` (the terminal needs microphone permission) | `ffmpeg` with libopus; records from the first DirectShow microphone |
 | Desktop notifications | `notify-send` (libnotify) | `osascript` (built in) | Windows PowerShell (built in) |
 | Notification sound | `pw-play` or `canberra-gtk-play` | `afplay` (built in) | `mpv` |
-| Clipboard copy and `Ctrl+V` paste | `wl-copy`, `wl-paste` (wl-clipboard); Wayland only | `pbcopy`, `pbpaste` (built in); text only | Windows PowerShell (built in); files, images and text |
+| Clipboard copy and `Ctrl+V` paste | `wl-copy`, `wl-paste` (wl-clipboard) on Wayland; elsewhere (X11, SSH, tmux) copied text goes to the terminal clipboard (OSC 52), paste is Wayland only | `pbcopy`, `pbpaste` (built in); text only | Windows PowerShell (built in); files, images and text |
 | Opening files and links externally | `xdg-open` | `open` (built in) | built in |
 
 ## Telegram API credentials
@@ -135,25 +137,30 @@ A QR code is shown. In Telegram open Settings > Devices > Link Desktop Device an
 
 ## Key bindings
 
-Vim-style. `Space` is the leader key: press it and a popup lists every continuation.
+Vim-style. `?` lists every key binding by context, your remaps included. `Space` is the leader key: press it and a popup lists every continuation (so do `g` and `]`).
 
 | Key | Action |
 |---|---|
+| `?`, `Space ?` | all key bindings |
 | `1` `2` `3` `4` | focus folders, chats, messages, chat info |
 | `Tab` `h` `l` | next or previous pane |
-| `j` `k`, arrows | move |
+| `j` `k`, arrows, `Ctrl-n` `Ctrl-p` | move |
 | `Ctrl-d` `Ctrl-u`, `PgDn` `PgUp` | scroll |
+| `J` `K` | scroll the messages without moving the selection |
 | `gg` `G` | top, bottom |
-| `/` | filter the pane |
+| `/` | filter the pane; in messages, search the chat |
 | `Enter` | open chat or topic; on a message, its action menu |
-| `Space Space` | find chat |
-| `Space /` | search all chats |
-| `i` | compose |
+| `Space Space` | search: chats, contacts, public channels and bots, messages |
+| `Space /` | search messages in all chats |
+| `n` `N` | next (older) / previous (newer) result of the chat search |
+| `i` | compose; in a group or channel you haven't joined, join it. Where you can't write, the composer says why |
 | `Enter` / `Shift-Enter` or `Alt-Enter` or `Ctrl-j` | send / newline (in the composer) |
-| `Esc` | leave the composer |
+| `Esc` | leave the composer; the text and the reply stay as a draft, synced with Telegram when you switch chats. Outside it, clear marks, drop the reply, close the filter or deselect the message |
 | `R` `e` `d` | reply, edit, delete |
 | `r` `f` `y` `P` | react, forward, copy text, pin or unpin |
-| `o` | open URL in the message |
+| `m` | mark or unmark a message; `f` `y` `d` then act on all marked ones |
+| `V` | select part of the message text to copy |
+| `o` | open a link or @mention from the message (with several, pick one from a list); t.me links and mentions open inside gramtty, other links in the browser |
 | `v` / `x` | view attachment (media plays inside it) / play in mpv or open |
 | in the viewer: `Space` `←` `→` `↑` `↓` `m` | pause, seek ∓5 s, volume ±5, mute |
 | `Space u` | attach file (composer: `Ctrl-o`) |
@@ -165,21 +172,36 @@ Vim-style. `Space` is the leader key: press it and a popup lists every continuat
 | `Space n` | notification inbox |
 | `Space m` | mark chat read |
 | `Space p` | profile |
-| `Space a` | actions for the selected chat or message |
+| `Space g` | shared media: photos, videos, files, links, voice, GIFs, music |
+| `Space a` | actions for the selected message, or for the selected chat: mute, pin, archive, leave or delete it and more |
 | `Space 1` `2` `4` | toggle folders, chats, info panes |
 | `Space r` | redraw |
+| `Space M` | recent notices and errors |
 | `Space o` | options |
 | `Space L` | log out |
-| `q` | quit |
+| `q` | quit (asks first while files upload or a voice message records); in a popup, close it |
+| `Ctrl-c` | quit |
 
-Keys are remapped in `~/.config/gramtty/keymap.toml`, under `[keymap]`: `leader = "<C-x>"`, `ReplyMessage = "<leader>R"`, `Quit = false` to unbind. Action names are the ones in the source (`src/keymap.rs`).
+Keys are remapped in `~/.config/gramtty/keymap.toml`, under `[keymap]`: `leader = "<C-x>"`, `ReplyMessage = "<leader>R"`, `Quit = false` to unbind. `?` shows every action with its name for this file, and `gramtty --print-keymap` prints the same list in the terminal.
+
+### Search
+
+`Space Space` opens one search box, as in Telegram. While you type it shows:
+
+- **Chats and contacts**: your chats (archived ones too) and contacts, by name or @username. Case and accents don't matter, `ё` and `е` are the same, every word can be typed from its start in any order, and a query typed in the wrong keyboard layout (`ghbdtn` for `привет`) still finds the chat
+- **Global search**: public channels, groups, bots and people you haven't talked to yet
+- **Messages**: messages from all chats, newest first, with the match highlighted; more load as you scroll down
+
+With an empty query it shows recently found chats and the top of the chat list. `↑` `↓` move, `Tab` `Shift-Tab` jump between sections, `Enter` opens the chat, starts a chat with a contact or jumps to the message. A public channel or group you haven't joined opens as a preview; `Alt-Enter` joins it. `Space /` opens the same box for messages only.
+
+`/` in the messages pane searches the open chat as you type. `Tab` `Shift-Tab` pick a media type (photos, videos, files, links, voice, GIFs, music), `Backspace` on an empty query drops the media or sender filter, and a date like `2024-05-01` or `01.05.2024` offers to go to that day. `Enter` jumps to the selected message and keeps the search: `n` `N` step to the next (older) and previous (newer) result right in the chat, `/` reopens the list where you left it, `Esc` in the list ends the search. In the lists of shared media and of messages from a member (`a` in a profile), `/` starts a text search inside that list.
 
 ## Configuration
 
 Files in `~/.config/gramtty/` (`$XDG_CONFIG_HOME` is honoured):
 
 - `api.toml`: API credentials
-- `config.toml`: settings; `Space o` edits and saves it. Sections: `[notifications]`, `[privacy]`, `[appearance]`, `[navigation]`, `[chats]`, `[media]`. Unknown keys are rejected
+- `config.toml`: settings; `Space o` edits and saves it. Sections: `[notifications]`, `[privacy]`, `[appearance]`, `[navigation]`, `[chats]`, `[media]`. Unknown keys are rejected. In `[media]`, `animations = "all" | "selected" | "off"` chooses which stickers and GIFs move (`"off"` keeps them still, useful on slow terminals), `max_animations` caps how many play at once in the chat, `pause_unfocused` stops them while the terminal is not focused
 - `theme.toml`: custom theme, used when `appearance.theme = "custom"`. Reloaded on save, no restart needed
 - `keymap.toml`: key bindings
 
@@ -198,7 +220,7 @@ Main options:
 - `appearance.theme`: `terminal` (default), `default`, `high-contrast`, `light`, `mono`, `custom`
 - `appearance.layout`: `classic`, `cards`, `compact`, `minimal`, `split`, `bubbles` (default)
 - `appearance.border_style`, `avatar_shape`, `seconds`, `show_ids`, `exact_numbers`
-- `appearance.folder_counter` (`chats`, `messages`, `off`), `folder_counter_unmuted_only`, `hide_all_chats`
+- `appearance.folder_counter` (`chats`, `messages`, `off`), `folder_counter_unmuted_only`, `hide_all_chats`, `compact_chat_list` (one line per chat, without the last message)
 - `navigation.open_chat_focus` (`smart`, `composer`, `messages`), `after_send_next_unread`, `skip_muted`
 - `chats.translate_to`, `photos_as_files`, `save_to_chat`
 
