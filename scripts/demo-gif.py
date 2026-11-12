@@ -33,8 +33,6 @@ LINE = 1
 DIM = 0.55
 TICK = 30
 ART_TICK = 60
-POP_MS = 150
-FADE_MS = 330
 BLINK_MS = 1080
 ANIMATED = {"sticker": 1.2, "clip": 2.4}
 SUPER = 3
@@ -444,23 +442,6 @@ def art_clip(w, h, t, _spec, _fonts):
     return s.done()
 
 
-def art_avatar(w, h, _t, spec, fonts):
-    side = min(w, h)
-    tint = rgb(spec["tint"])
-    plate = Image.new("RGB", (side * SUPER, side * SUPER))
-    pen = ImageDraw.Draw(plate)
-    for i in range(side * SUPER):
-        pen.line((0, i, side * SUPER, i), fill=mix(mix(tint, (255, 255, 255), 0.22), mix(tint, (20, 20, 40), 0.3), i / (side * SUPER)))
-    mask = Image.new("L", plate.size, 0)
-    ImageDraw.Draw(mask).rounded_rectangle((0, 0, side * SUPER - 1, side * SUPER - 1), radius=side * SUPER * 0.3, fill=255)
-    font = fonts.sized("b", round(side * SUPER * 0.4))
-    pen.text((side * SUPER / 2, side * SUPER / 2), spec["label"], font=font, fill=(24, 25, 38), anchor="mm")
-    plate.putalpha(mask)
-    out = Image.new("RGBA", (w, h), (0, 0, 0, 0))
-    out.paste(plate.resize((side, side), Image.LANCZOS), ((w - side) // 2, (h - side) // 2))
-    return out
-
-
 ARTISTS = {
     "mountains": art_mountains,
     "forest": art_forest,
@@ -468,7 +449,6 @@ ARTISTS = {
     "camp": art_camp,
     "sticker": art_sticker,
     "clip": art_clip,
-    "avatar": art_avatar,
 }
 
 
@@ -646,7 +626,6 @@ def frames(steps, meta, fonts):
     first = steps[0]["rows"]
     stage = Stage(meta, fonts, (len(first[0]) * CELL_W, len(first) * CELL_H))
     clock = 0
-    before = None
     pointer_at = None
     pointer_alpha = 0.0
     cursor_seen = (None, 0)
@@ -659,13 +638,11 @@ def frames(steps, meta, fonts):
             stage.origin[1] + cell[1] * CELL_H + CELL_H / 2,
         )
 
-    for step in steps:
+    for index, step in enumerate(steps):
         scene = Scene(step, meta, fonts, cache)
         count = max(1, round(step["ms"] / TICK))
         target = spot(step["pointer"]) if step["pointer"] else None
         origin = pointer_at if pointer_at and target else target
-        enter = step.get("enter")
-        span = {"pop": POP_MS, "fade": FADE_MS}.get(enter, 0)
         cursor = step["cursor"]
         if cursor != cursor_seen[0]:
             cursor_seen = (cursor, clock)
@@ -673,10 +650,6 @@ def frames(steps, meta, fonts):
             local = i * TICK
             t = clock / 1000
             term = scene.image(t)
-            blend = None
-            if span and before is not None and local < span:
-                blend = ease((local + TICK) / (span + TICK))
-                term = Image.blend(before.image(t), term, blend)
             if target:
                 progress = (i + 1) / count
                 glide = step.get("glide")
@@ -707,13 +680,12 @@ def frames(steps, meta, fonts):
                 "pointer": (pointer_at, pointer_alpha) if pointer_at and pointer_alpha > 0 else None,
                 "chip": (chip_text, chip_alpha) if chip_text and chip_alpha > 0 else None,
             }
-            token = (id(scene), blend, repr(look), int(clock / ART_TICK) if scene.moving or (blend and before.moving) else None)
+            token = (index, repr(look), int(clock / ART_TICK) if scene.moving else None)
             if token != last_token:
                 last_frame = stage.compose(term, look)
                 last_token = token
             yield last_frame
             clock += TICK
-        before = scene
 
 
 def load(source):

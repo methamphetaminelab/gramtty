@@ -84,8 +84,6 @@ const LANDSCAPE: i32 = 1;
 const ALBUM: [i32; 3] = [2, 3, 4];
 const STICKER: i32 = 5;
 const CLIP: i32 = 6;
-const AVATAR_BASE: i32 = 8;
-
 const ART: [(i32, &str, u32, u32); 6] = [
     (LANDSCAPE, "mountains", 380, 260),
     (ALBUM[0], "forest", 220, 280),
@@ -93,16 +91,6 @@ const ART: [(i32, &str, u32, u32); 6] = [
     (ALBUM[2], "camp", 220, 280),
     (STICKER, "sticker", 192, 192),
     (CLIP, "clip", 380, 220),
-];
-
-const FACES: [(i64, &str, usize); 7] = [
-    (MAYA, "ML", 3),
-    (TOBIAS, "TR", 4),
-    (CLARA, "CM", 5),
-    (ETHAN, "EB", 6),
-    (PRIYA, "PN", 1),
-    (JONAS, "JW", 2),
-    (BOT, "TB", 8),
 ];
 
 static KEYS: OnceLock<PathBuf> = OnceLock::new();
@@ -130,18 +118,6 @@ fn write_meta(out: &std::path::Path) {
     for (id, name, w, h) in ART {
         write_key(id, w, h);
         art.insert(id.to_string(), serde_json::json!({ "name": name }));
-    }
-    for (user, label, tint) in FACES {
-        let id = AVATAR_BASE + user as i32;
-        write_key(id, 64, 64);
-        art.insert(
-            id.to_string(),
-            serde_json::json!({
-                "name": "avatar",
-                "label": label,
-                "tint": plain_hex(PALETTE.ansi[tint]),
-            }),
-        );
     }
     let meta = serde_json::json!({
         "fg": plain_hex(PALETTE.fg),
@@ -281,14 +257,6 @@ impl Demo {
 
     fn shot(&mut self, ms: u64) {
         self.step(ms, serde_json::json!({}));
-    }
-
-    fn pop(&mut self, ms: u64) {
-        self.step(ms, serde_json::json!({ "enter": "pop" }));
-    }
-
-    fn fade(&mut self, ms: u64) {
-        self.step(ms, serde_json::json!({ "enter": "fade" }));
     }
 
     fn glide(&mut self, x: u16, y: u16, ms: u64) {
@@ -1033,10 +1001,7 @@ fn account(now: i64) -> (App, tokio::sync::mpsc::UnboundedReceiver<Event>) {
                 status,
                 bot: id == BOT,
                 usernames: Vec::new(),
-                photo: FACES
-                    .iter()
-                    .any(|(user, ..)| *user == id)
-                    .then(|| picture(MediaKind::Photo, AVATAR_BASE + id as i32, 64, 64).file),
+                photo: None,
             },
         );
     }
@@ -1195,9 +1160,9 @@ fn demo_frames() {
     d.glide(x + 12, y - 5, 450);
     d.click(360);
     d.press(KeyCode::Char('v'));
-    d.pop(1700);
+    d.shot(1700);
     d.press(KeyCode::Esc);
-    d.pop(300);
+    d.shot(300);
 
     d.caption = "React and reply";
     d.hide_pointer();
@@ -1206,7 +1171,7 @@ fn demo_frames() {
         r.loading = false;
         r.emojis = EMOJIS.iter().map(|e| (*e).to_owned()).collect();
     }
-    d.pop(600);
+    d.shot(600);
     d.keys(KeyCode::Char('l'), 4, 120);
     d.shot(350);
     d.press(KeyCode::Enter);
@@ -1214,7 +1179,7 @@ fn demo_frames() {
     if let Some(m) = d.app.histories.get_mut(&HIKERS).and_then(|h| h.get_mut(13)) {
         m.reactions = vec![reaction("😍", 1, true)];
     }
-    d.pop(700);
+    d.shot(700);
     d.press(KeyCode::Char('R'));
     d.shot(400);
     d.type_text(REPLY);
@@ -1247,16 +1212,16 @@ fn demo_frames() {
     d.caption = "Search across everything";
     d.hide_pointer();
     d.press(KeyCode::Char(' '));
-    d.pop(1000);
+    d.shot(1000);
     d.press(KeyCode::Char(' '));
     d.settle_search();
-    d.pop(500);
+    d.shot(500);
     d.type_text("lantern");
     d.shot(1000);
     d.press(KeyCode::Enter);
     d.press(KeyCode::Esc);
     d.read(LANTERN);
-    d.pop(1200);
+    d.shot(1200);
 
     d.caption = "Links and mentions open in-app";
     let (x, y) = d.find_from("Docs preview", 48);
@@ -1265,7 +1230,7 @@ fn demo_frames() {
     d.glide(x + 8, y, 420);
     d.click(330);
     d.press(KeyCode::Char('o'));
-    d.pop(900);
+    d.shot(900);
     d.keys(KeyCode::Char('j'), 2, 180);
     d.shot(300);
     d.press(KeyCode::Enter);
@@ -1276,15 +1241,15 @@ fn demo_frames() {
     d.feed();
     d.press(KeyCode::Esc);
     d.hide_pointer();
-    d.pop(1300);
+    d.shot(1300);
 
     d.caption = "Every key binding one keystroke away";
     d.press(KeyCode::Char('?'));
-    d.pop(700);
+    d.shot(700);
     d.keys(KeyCode::Char('j'), 12, 60);
     d.shot(700);
     d.press(KeyCode::Esc);
-    d.pop(250);
+    d.shot(250);
 
     let count = d.count;
     let out = d.out.clone();
@@ -1294,6 +1259,6 @@ fn demo_frames() {
     d.app.enter_chat(MAYA_CHAT);
     d.feed();
     d.press(KeyCode::Esc);
-    d.fade(600);
+    d.shot(600);
     crate::termcolors::set(None);
 }
