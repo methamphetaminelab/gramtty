@@ -4,6 +4,8 @@ mod app;
 mod archive;
 mod bots;
 mod config;
+#[cfg(test)]
+mod demo;
 mod details;
 mod format;
 mod input;

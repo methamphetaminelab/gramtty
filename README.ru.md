@@ -2,6 +2,8 @@
 
 # gramtty
 
+![Демонстрация gramtty](assets/demo.gif)
+
 Терминальный клиент Telegram на Rust и TDLib.
 
 ## Содержание
