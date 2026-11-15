@@ -2,21 +2,30 @@ mod admin;
 mod anim;
 mod app;
 mod archive;
+mod audio;
 mod bots;
 mod config;
 #[cfg(test)]
 mod demo;
 mod details;
+mod editor;
 mod format;
+mod highlight;
+mod hooks;
 mod input;
+mod ipc;
 mod keymap;
+mod markup;
 mod media;
 mod model;
+#[cfg(target_os = "linux")]
+mod mpris;
 mod notify;
 mod player;
 mod popups;
 mod presence;
 mod qr;
+mod reply_prompt;
 mod search;
 mod stickers;
 mod td;
@@ -24,6 +33,7 @@ mod termcolors;
 mod termprobe;
 mod textmap;
 mod theme;
+mod transcribe;
 mod ui;
 mod upload;
 mod video;
@@ -135,6 +145,11 @@ fn help_text() -> String {
          -V, --version              show the version\n  \
          --print-theme [preset]     print a theme as TOML (terminal, default, high-contrast, light, mono, custom)\n  \
          --print-keymap             print every key binding with its action name\n\n\
+         Commands (talk to the running {name}):\n  \
+         send <chat> [--file PATH]... [--code [LANG]] [--] [text...]\n                             send text (or stdin) and files; <chat> is me, an id, @username or a title\n  \
+         unread [--json]            show chats with unread messages\n  \
+         chats [--json]             list known chats with ids\n  \
+         open <chat>                open a chat in the running {name}\n\n\
          Environment:\n  \
          {keys:<34} your own Telegram API keys\n  \
          {data_var:<34} where the session and data live\n  \
@@ -176,6 +191,7 @@ async fn run() -> Result<(), String> {
             print!("{}", keymap.help_text());
             return Ok(());
         }
+        Some((command, _)) if ipc::is_command(command) => return control_command(&args),
         Some((other, _)) => {
             return Err(format!(
                 "unknown argument {other:?}; see {} --help",
@@ -250,6 +266,7 @@ async fn run() -> Result<(), String> {
         warnings.push(e);
     }
     app.theme_path = Some(theme_path);
+    let _control_socket = control_socket(&tx, &mut warnings).await;
     if let Err(e) = upload::prune_uploads(app.uploads_dir()) {
         warnings.push(e);
     }
@@ -283,6 +300,150 @@ async fn run() -> Result<(), String> {
     );
     ratatui::restore();
     result.and(settled).and(cleared)
+}
+
+type AppTerminal =
+    ratatui::Terminal<ui::Resync<ratatui::backend::CrosstermBackend<std::io::Stdout>>>;
+
+fn suspend_terminal(app: &mut App) {
+    let _ = execute!(std::io::stdout(), DisableMouseCapture);
+    let _ = input_barrier();
+    let mut out = std::io::stdout();
+    app.inline.stop();
+    let cleared = app
+        .inline
+        .flush(&mut out)
+        .and_then(|()| app.media.anim.shutdown(&mut out))
+        .and_then(|()| std::io::Write::flush(&mut out));
+    if let Err(e) = cleared {
+        app.set_status(format!("terminal: {e}"), true);
+    }
+    let _ = execute!(
+        std::io::stdout(),
+        DisableBracketedPaste,
+        DisableFocusChange,
+        PopKeyboardEnhancementFlags
+    );
+    ratatui::restore();
+}
+
+fn resume_terminal(terminal: &mut AppTerminal, app: &mut App) -> Result<(), String> {
+    drop(ratatui::init());
+    let _ = execute!(
+        std::io::stdout(),
+        EnableBracketedPaste,
+        EnableFocusChange,
+        EnableMouseCapture,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    );
+    terminal
+        .clear()
+        .map_err(|e| format!("terminal: {e}"))?;
+    app.force_clear = true;
+    Ok(())
+}
+
+fn edit_in_editor(terminal: &mut AppTerminal, app: &mut App) -> Result<(), String> {
+    let prepared = editor::editor_command(
+        std::env::var("VISUAL").ok(),
+        std::env::var("EDITOR").ok(),
+        |name| config::find_in_path(name).is_some(),
+    )
+    .and_then(|command| {
+        let dir = config::cache_dir()?.join("editor");
+        let path = editor::write_draft(&dir, app.composer_text())?;
+        Ok((command, path))
+    });
+    let (command, path) = match prepared {
+        Ok(p) => p,
+        Err(e) => {
+            app.set_status(e, true);
+            return Ok(());
+        }
+    };
+    suspend_terminal(app);
+    let original = app.composer_text().to_owned();
+    let ran = editor::run_on_file(&command, &path);
+    let resumed = resume_terminal(terminal, app);
+    let text = editor::read_back(&path);
+    resumed?;
+    match ran.and_then(|elapsed| text.map(|text| (elapsed, text))) {
+        Ok((elapsed, text)) => {
+            match editor::judge(elapsed, !editor::unchanged(&original, &text)) {
+                editor::Outcome::Apply => app.apply_editor_text(&text),
+                editor::Outcome::ReturnedImmediately => {
+                    app.set_status(editor::RETURNED_IMMEDIATELY, false)
+                }
+            }
+        }
+        Err(e) => app.set_status(e, true),
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+async fn control_socket(
+    tx: &tokio::sync::mpsc::UnboundedSender<Event>,
+    warnings: &mut Vec<String>,
+) -> Option<ipc::SocketGuard> {
+    let path = match ipc::socket_path() {
+        Ok(path) => path,
+        Err(e) => {
+            warnings.push(format!("command line control is off: {e}"));
+            return None;
+        }
+    };
+    match ipc::bind(&path).await {
+        Ok(listener) => {
+            ipc::serve(listener, tx.clone());
+            Some(ipc::SocketGuard(path))
+        }
+        Err(e) => {
+            warnings.push(e);
+            None
+        }
+    }
+}
+
+#[cfg(not(unix))]
+async fn control_socket(
+    _tx: &tokio::sync::mpsc::UnboundedSender<Event>,
+    _warnings: &mut Vec<String>,
+) -> Option<()> {
+    None
+}
+
+#[cfg(unix)]
+fn control_command(args: &[String]) -> Result<(), String> {
+    use std::io::{IsTerminal, Read};
+    let mut cli = ipc::parse_cli(args)?;
+    if let ipc::Request::Send { text, files, .. } = &mut cli.request {
+        if text.is_empty() && files.is_empty() {
+            if std::io::stdin().is_terminal() {
+                return Err(
+                    "nothing to send: give some text, pipe it in, or use --file PATH".to_owned(),
+                );
+            }
+            std::io::stdin()
+                .read_to_string(text)
+                .map_err(|e| format!("cannot read stdin: {e}"))?;
+            if text.trim().is_empty() {
+                return Err("nothing to send: stdin is empty".to_owned());
+            }
+        }
+        let cwd = std::env::current_dir().map_err(|e| format!("cannot get the directory: {e}"))?;
+        for file in files.iter_mut() {
+            *file = ipc::absolutize(file, &cwd);
+        }
+    }
+    let response = ipc::call(&ipc::socket_path()?, &cli.request)?;
+    print!("{}", ipc::render(&cli, &response)?);
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn control_command(_args: &[String]) -> Result<(), String> {
+    Err(ipc::UNSUPPORTED.to_owned())
 }
 
 fn release_mouse_on_panic() {
@@ -497,6 +658,13 @@ async fn event_loop(
     let mut layout = ui::image_layout(&ratatui::buffer::Buffer::empty(terminal.get_frame().area()));
     let mut idle = false;
     loop {
+        if std::mem::take(&mut app.editor_request) {
+            drop(input);
+            let outcome = edit_in_editor(terminal, app);
+            input = EventStream::new();
+            outcome?;
+            idle = false;
+        }
         if !std::mem::take(&mut idle) {
             ui::draw_frame(terminal, app, &mut layout, |_| {})
                 .map_err(|e| format!("terminal: {e}"))?;

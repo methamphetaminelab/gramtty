@@ -5,6 +5,7 @@ use ratatui::text::{Line, Span};
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use crate::highlight::{Token, highlight, token_style};
 use crate::model::{EntityKind, RichText};
 use crate::textmap::Join;
 use crate::theme;
@@ -23,37 +24,65 @@ pub struct Cell {
     pub block: Block,
 }
 
+pub fn entity_style(kind: &EntityKind, style: Style) -> Style {
+    match kind {
+        EntityKind::Bold => style.add_modifier(Modifier::BOLD),
+        EntityKind::Italic | EntityKind::Quote => style.add_modifier(Modifier::ITALIC),
+        EntityKind::Underline => style.add_modifier(Modifier::UNDERLINED),
+        EntityKind::Strike => style.add_modifier(Modifier::CROSSED_OUT),
+        EntityKind::Spoiler => style.patch(theme::spoiler()),
+        EntityKind::Code | EntityKind::Pre(_) => style.patch(theme::code()),
+        EntityKind::Link(_) => style.patch(theme::link()),
+        EntityKind::Mention | EntityKind::MentionName(_) => style.patch(theme::mention()),
+    }
+}
+
+fn token_marks(lang: &str, code: &str) -> Vec<Token> {
+    let tokens = highlight(lang, code);
+    if tokens.is_empty() {
+        return Vec::new();
+    }
+    let mut marks = vec![Token::Plain; code.chars().count()];
+    for (range, token) in tokens {
+        for mark in &mut marks[range] {
+            *mark = token;
+        }
+    }
+    marks
+}
+
 pub fn styled_cells(rt: &RichText, base: Style) -> Vec<Cell> {
     let mut cells = Vec::with_capacity(rt.text.len());
     let mut pos16 = 0usize;
+    let marks: Vec<Vec<Token>> = rt
+        .entities
+        .iter()
+        .map(|e| match &e.kind {
+            EntityKind::Pre(Some(lang)) => {
+                token_marks(lang, &utf16_slice(&rt.text, e.offset, e.length))
+            }
+            _ => Vec::new(),
+        })
+        .collect();
+    let mut seen = vec![0usize; rt.entities.len()];
     for ch in rt.text.chars() {
         let mut style = base;
         let mut block = Block::None;
-        for e in &rt.entities {
+        for (k, e) in rt.entities.iter().enumerate() {
             if pos16 < e.offset || pos16 >= e.offset + e.length {
                 continue;
             }
+            style = entity_style(&e.kind, style);
+            if !marks[k].is_empty() {
+                if let Some(token) = marks[k].get(seen[k]) {
+                    style = style.patch(token_style(*token));
+                }
+                seen[k] += 1;
+            }
             match &e.kind {
-                EntityKind::Bold => style = style.add_modifier(Modifier::BOLD),
-                EntityKind::Italic => style = style.add_modifier(Modifier::ITALIC),
-                EntityKind::Underline => style = style.add_modifier(Modifier::UNDERLINED),
-                EntityKind::Strike => style = style.add_modifier(Modifier::CROSSED_OUT),
-                EntityKind::Spoiler => style = style.patch(theme::spoiler()),
-                EntityKind::Code => style = style.patch(theme::code()),
-                EntityKind::Pre => {
-                    style = style.patch(theme::code());
-                    block = Block::Pre;
-                }
-                EntityKind::Link(_) => style = style.patch(theme::link()),
-                EntityKind::Mention | EntityKind::MentionName(_) => {
-                    style = style.patch(theme::mention())
-                }
-                EntityKind::Quote => {
-                    style = style.add_modifier(Modifier::ITALIC);
-                    if block == Block::None {
-                        block = Block::Quote;
-                    }
-                }
+                EntityKind::Pre(_) => block = Block::Pre,
+                EntityKind::Quote if block == Block::None => block = Block::Quote,
+                _ => {}
             }
         }
         pos16 += ch.len_utf16();
@@ -234,6 +263,31 @@ pub fn links(rt: &RichText) -> Vec<Link> {
         })
         .filter(|l| !l.url.is_empty() && seen.insert(l.url.clone()))
         .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodeBlock {
+    pub text: String,
+    pub lang: Option<String>,
+    pub block: bool,
+}
+
+pub fn code_blocks(rt: &RichText) -> Vec<CodeBlock> {
+    let mut found: Vec<(usize, CodeBlock)> = rt
+        .entities
+        .iter()
+        .filter_map(|e| {
+            let (lang, block) = match &e.kind {
+                EntityKind::Pre(lang) => (lang.clone().filter(|l| !l.is_empty()), true),
+                EntityKind::Code => (None, false),
+                _ => return None,
+            };
+            let text = utf16_slice(&rt.text, e.offset, e.length);
+            (!text.is_empty()).then_some((e.offset, CodeBlock { text, lang, block }))
+        })
+        .collect();
+    found.sort_by_key(|(offset, _)| *offset);
+    found.into_iter().map(|(_, b)| b).collect()
 }
 
 pub fn telegram_link(url: &str) -> bool {
@@ -826,6 +880,27 @@ mod tests {
         let spans: Vec<&str> = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(spans, vec!["say ", "hi", " now"]);
         assert_eq!(lines[0].spans[1].style.fg, theme::code().fg);
+    }
+
+    #[test]
+    fn rust_blocks_highlight_keywords_only_with_a_language() {
+        let text = "fn main() {}";
+        let with = RichText {
+            text: text.to_owned(),
+            entities: vec![ent(0, 12, EntityKind::Pre(Some("rust".to_owned())))],
+        };
+        let without = RichText {
+            text: text.to_owned(),
+            entities: vec![ent(0, 12, EntityKind::Pre(None))],
+        };
+        let a = styled_cells(&with, Style::default());
+        let b = styled_cells(&without, Style::default());
+        assert_eq!(a.len(), b.len());
+        assert_ne!(a[0].style, a[3].style);
+        assert!(b.iter().all(|c| c.style == b[0].style));
+        let chars_a: Vec<char> = a.iter().map(|c| c.ch).collect();
+        let chars_b: Vec<char> = b.iter().map(|c| c.ch).collect();
+        assert_eq!(chars_a, chars_b);
     }
 
     #[test]

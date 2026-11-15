@@ -11,6 +11,7 @@ pub enum Zone {
     Pane(Pane),
     Popup,
     Cover,
+    Side,
 }
 
 impl Zone {
@@ -32,14 +33,18 @@ pub enum Hit {
     Chat(Row),
     Message(i64),
     Composer,
+    Side,
 }
 
 impl Hit {
     fn zone(self) -> Zone {
+        if self == Hit::Side {
+            return Zone::Side;
+        }
         Zone::Pane(match self {
             Hit::Folder(_) => Pane::Folders,
             Hit::Chat(_) => Pane::Chats,
-            Hit::Message(_) | Hit::Composer => Pane::Messages,
+            Hit::Message(_) | Hit::Composer | Hit::Side => Pane::Messages,
         })
     }
 }

@@ -11,6 +11,7 @@ use tokio::sync::mpsc::UnboundedSender;
 
 use crate::bots::{Button, ButtonAction, Command, Keyboard};
 use crate::format::duration;
+use crate::markup;
 use crate::model::{
     self, Attachment, ChatInfo, ChatKind, Decode, Entity, EntityKind, FileRef, ListId, MediaKind,
     Membership, Msg, MsgMeta, Origin, Position, Profile, ProfileTarget, Reaction, RichText, Rights,
@@ -64,6 +65,22 @@ pub enum Event {
     Image(crate::media::Done),
     Anim(crate::anim::Done),
     Video,
+    Audio,
+    Transcript {
+        chat_id: i64,
+        msg_id: i64,
+        result: Result<String, String>,
+    },
+    TranscriptPartial {
+        chat_id: i64,
+        msg_id: i64,
+        text_so_far: String,
+        done_secs: Option<f64>,
+    },
+    #[cfg(target_os = "linux")]
+    Mpris(crate::mpris::Command),
+    #[cfg(target_os = "linux")]
+    MprisFailed(String),
     Player {
         token: u64,
         result: Result<(), String>,
@@ -83,6 +100,26 @@ pub enum Event {
     Stickers(crate::stickers::Data),
     StickersFailed(String),
     NotifyFailed(String),
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    NotifyAction {
+        chat_id: i64,
+        msg_id: i64,
+        topic: Option<i32>,
+        action: crate::notify::Action,
+    },
+    ReplyText {
+        chat_id: i64,
+        msg_id: i64,
+        topic: Option<i32>,
+        text: String,
+    },
+    ReplyFailed(String),
+    Hook(Result<(), String>),
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Ipc {
+        request: crate::ipc::Request,
+        reply: tokio::sync::oneshot::Sender<crate::ipc::Response>,
+    },
     Profile(ProfileTarget, Result<Profile, String>),
     BotCommands {
         chat_id: i64,
@@ -449,18 +486,12 @@ fn execute(request: &serde_json::Value) -> Result<(), String> {
     execute_value(request).map(|_| ())
 }
 
-fn markdown_text(text: &types::FormattedText) -> Result<String, String> {
-    if text.entities.is_empty() {
-        return Ok(text.text.clone());
+fn formatted_from_source(source: &str) -> types::FormattedText {
+    let rich = markup::parse(source).rich;
+    types::FormattedText {
+        text: rich.text,
+        entities: rich.entities.iter().filter_map(to_td_entity).collect(),
     }
-    let reply = execute_value(&serde_json::json!({
-        "@type": "getMarkdownText",
-        "text": text,
-    }))?;
-    reply["text"]
-        .as_str()
-        .map(str::to_owned)
-        .ok_or_else(|| "TDLib returned no text".to_owned())
 }
 
 pub fn convert_draft(d: &types::DraftMessage) -> (Option<model::Draft>, Option<String>) {
@@ -472,10 +503,9 @@ pub fn convert_draft(d: &types::DraftMessage) -> (Option<model::Draft>, Option<S
         _ => (None, None),
     };
     let (text, problem) = match &d.input_message_text {
-        enums::InputMessageContent::InputMessageText(t) => match markdown_text(&t.text) {
-            Ok(text) => (text, None),
-            Err(e) => (t.text.text.clone(), Some(e)),
-        },
+        enums::InputMessageContent::InputMessageText(t) => {
+            (markup::to_source(&convert_text(t.text.clone())), None)
+        }
         _ => (String::new(), None),
     };
     let draft = model::Draft {
@@ -514,14 +544,7 @@ async fn save_draft(
     let message = match draft {
         Some(d) => {
             let reply_to = draft_reply(&d);
-            let enums::FormattedText::FormattedText(text) = tdlib_rs::functions::parse_markdown(
-                types::FormattedText {
-                    text: d.text,
-                    entities: Vec::new(),
-                },
-                c,
-            )
-            .await?;
+            let text = formatted_from_source(&d.text);
             Some(types::DraftMessage {
                 reply_to,
                 date: 0,
@@ -707,6 +730,7 @@ fn failure_label(context: &str) -> &str {
         "close chat" => "close the chat",
         "close" => "close the session",
         "mark read" => "mark messages as read",
+        "open content" => "mark the message as listened",
         "delete" => "delete the messages",
         "forward" => "forward the messages",
         "react" => "set the reaction",
@@ -1027,6 +1051,14 @@ impl Td {
         });
     }
 
+    pub fn open_content(&self, chat_id: i64, id: i64) {
+        self.note(format!("open content {chat_id} {id}"));
+        let c = self.client_id;
+        self.spawn("open content", false, async move {
+            tdlib_rs::functions::open_message_content(chat_id, id, c).await
+        });
+    }
+
     pub fn send_text(
         &self,
         chat_id: i64,
@@ -1049,15 +1081,7 @@ impl Td {
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let result = async {
-                let enums::FormattedText::FormattedText(formatted) =
-                    tdlib_rs::functions::parse_markdown(
-                        types::FormattedText {
-                            text,
-                            entities: Vec::new(),
-                        },
-                        c,
-                    )
-                    .await?;
+                let formatted = formatted_from_source(&text);
                 let content =
                     enums::InputMessageContent::InputMessageText(types::InputMessageText {
                         text: formatted,
@@ -1107,26 +1131,42 @@ impl Td {
         });
     }
 
-    pub fn fetch_edit_text(&self, chat_id: i64, message_id: i64, body: RichText) {
-        if self.fake("fetch edit text") {
+    pub fn send_plain(&self, chat_id: i64, body: RichText) {
+        self.note(format!(
+            "send plain {chat_id} {:?} {:?}",
+            body.text, body.entities
+        ));
+        if self.fake("send") {
             return;
         }
         let c = self.client_id;
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let formatted = types::FormattedText {
-                text: body.text,
-                entities: body.entities.iter().filter_map(to_td_entity).collect(),
-            };
-            let ev = match tdlib_rs::functions::get_markdown_text(formatted, c).await {
-                Ok(enums::FormattedText::FormattedText(md)) => Event::EditText {
-                    chat_id,
-                    message_id,
-                    text: md.text,
+            let content = enums::InputMessageContent::InputMessageText(types::InputMessageText {
+                text: types::FormattedText {
+                    text: body.text,
+                    entities: body.entities.iter().filter_map(to_td_entity).collect(),
                 },
-                Err(e) => Event::Error(failed("edit the message", &friendly_error(&e))),
-            };
-            let _ = tx.send(ev);
+                link_preview_options: None,
+                clear_draft: false,
+            });
+            if let Err(e) =
+                tdlib_rs::functions::send_message(chat_id, None, None, None, content, c).await
+            {
+                let _ = tx.send(Event::Error(failed(
+                    "send the message",
+                    &friendly_error(&e),
+                )));
+            }
+        });
+    }
+
+    pub fn fetch_edit_text(&self, chat_id: i64, message_id: i64, body: RichText) {
+        self.note("fetch edit text".to_owned());
+        let _ = self.tx.send(Event::EditText {
+            chat_id,
+            message_id,
+            text: markup::to_source(&body),
         });
     }
 
@@ -1209,18 +1249,6 @@ fn local_file(path: &std::path::Path) -> enums::InputFile {
     enums::InputFile::Local(types::InputFileLocal {
         path: path.to_string_lossy().into_owned(),
     })
-}
-
-async fn parse_caption(text: String, c: i32) -> Result<types::FormattedText, types::Error> {
-    let enums::FormattedText::FormattedText(f) = tdlib_rs::functions::parse_markdown(
-        types::FormattedText {
-            text,
-            entities: Vec::new(),
-        },
-        c,
-    )
-    .await?;
-    Ok(f)
 }
 
 async fn probe_or_note(p: &Pending, notes: &mut Vec<String>) -> upload::Probe {
@@ -1461,7 +1489,7 @@ impl Td {
                 let mut caption = if text.trim().is_empty() || long {
                     None
                 } else {
-                    Some(parse_caption(text.clone(), c).await?)
+                    Some(formatted_from_source(&text))
                 };
                 let mut reply = reply_to;
                 for group in upload::plan(&items) {
@@ -1496,7 +1524,7 @@ impl Td {
                     }
                 }
                 if long {
-                    let formatted = parse_caption(text, c).await?;
+                    let formatted = formatted_from_source(&text);
                     let content =
                         enums::InputMessageContent::InputMessageText(types::InputMessageText {
                             text: formatted,
@@ -1770,16 +1798,63 @@ impl Td {
         }
     }
 
-    pub fn notify(&self, title: String, body: String, icon: crate::notify::Icon) {
+    pub fn run_hook(&self, command: Vec<String>, payload: String) {
+        if self.fake("hook") {
+            self.note(format!("hook {command:?} {payload}"));
+            return;
+        }
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let _ = tx.send(Event::Hook(crate::hooks::run(&command, payload).await));
+        });
+    }
+
+    pub fn reply_prompt(&self, command: Vec<String>, target: crate::notify::Target) {
+        if self.fake("reply prompt") {
+            self.note(format!(
+                "reply prompt {command:?} target {} {} {:?}",
+                target.chat_id, target.msg_id, target.topic
+            ));
+            return;
+        }
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let event = match crate::reply_prompt::run(&command).await {
+                Ok(Some(text)) => Event::ReplyText {
+                    chat_id: target.chat_id,
+                    msg_id: target.msg_id,
+                    topic: target.topic,
+                    text,
+                },
+                Ok(None) => return,
+                Err(e) => Event::ReplyFailed(e),
+            };
+            let _ = tx.send(event);
+        });
+    }
+
+    pub fn notify(
+        &self,
+        title: String,
+        body: String,
+        icon: crate::notify::Icon,
+        target: Option<crate::notify::Target>,
+    ) {
         if self.fake("notify") {
-            self.note(format!("notify icon {icon:?}"));
+            match target {
+                Some(t) => self.note(format!(
+                    "notify icon {icon:?} target {} {} {:?}",
+                    t.chat_id, t.msg_id, t.topic
+                )),
+                None => self.note(format!("notify icon {icon:?}")),
+            }
             return;
         }
         let tx = self.tx.clone();
         let c = self.client_id;
         match icon {
-            crate::notify::Icon::None => crate::notify::send(title, body, None, tx),
-            crate::notify::Icon::Path(p) => crate::notify::send(title, body, Some(p), tx),
+            crate::notify::Icon::None => crate::notify::send(title, body, None, target, tx),
+            crate::notify::Icon::Path(p) => crate::notify::send(title, body, Some(p), target, tx),
             crate::notify::Icon::Download(id) => {
                 tokio::spawn(async move {
                     let fetched = tokio::time::timeout(
@@ -1791,7 +1866,7 @@ impl Td {
                         Ok(Ok(enums::File::File(f))) => convert_file(&f).local().map(str::to_owned),
                         _ => None,
                     };
-                    crate::notify::send(title, body, path, tx);
+                    crate::notify::send(title, body, path, target, tx);
                 });
             }
         }
@@ -1803,6 +1878,36 @@ impl Td {
             return;
         }
         crate::notify::play(cmd, file, self.tx.clone());
+    }
+
+    pub fn transcribe(
+        &self,
+        chat_id: i64,
+        msg_id: i64,
+        args: Vec<String>,
+        output: crate::transcribe::Output,
+    ) {
+        if self.fake(&format!("transcribe {chat_id} {msg_id} {}", args.join(" "))) {
+            return;
+        }
+        let tx = self.tx.clone();
+        tokio::spawn(async move {
+            let progress = tx.clone();
+            let result = crate::transcribe::run(args, output, move |text_so_far, done_secs| {
+                let _ = progress.send(Event::TranscriptPartial {
+                    chat_id,
+                    msg_id,
+                    text_so_far,
+                    done_secs,
+                });
+            })
+            .await;
+            let _ = tx.send(Event::Transcript {
+                chat_id,
+                msg_id,
+                result,
+            });
+        });
     }
 
     pub fn load_pinned(&self, chat_id: i64) {
@@ -2951,7 +3056,10 @@ fn convert_entity(e: &types::TextEntity) -> Option<Entity> {
         TextEntityType::Strikethrough => EntityKind::Strike,
         TextEntityType::Spoiler => EntityKind::Spoiler,
         TextEntityType::Code => EntityKind::Code,
-        TextEntityType::Pre | TextEntityType::PreCode(_) => EntityKind::Pre,
+        TextEntityType::Pre => EntityKind::Pre(None),
+        TextEntityType::PreCode(p) => {
+            EntityKind::Pre((!p.language.is_empty()).then(|| p.language.clone()))
+        }
         TextEntityType::Url => EntityKind::Link(None),
         TextEntityType::EmailAddress => EntityKind::Link(None),
         TextEntityType::TextUrl(u) => EntityKind::Link(Some(u.url.clone())),
@@ -2978,7 +3086,10 @@ fn to_td_entity(e: &Entity) -> Option<types::TextEntity> {
         EntityKind::Strike => TextEntityType::Strikethrough,
         EntityKind::Spoiler => TextEntityType::Spoiler,
         EntityKind::Code => TextEntityType::Code,
-        EntityKind::Pre => TextEntityType::Pre,
+        EntityKind::Pre(Some(language)) => TextEntityType::PreCode(types::TextEntityTypePreCode {
+            language: language.clone(),
+        }),
+        EntityKind::Pre(None) => TextEntityType::Pre,
         EntityKind::Link(Some(url)) => {
             TextEntityType::TextUrl(types::TextEntityTypeTextUrl { url: url.clone() })
         }
@@ -3820,7 +3931,7 @@ fn media_filter(f: crate::model::MediaFilter) -> enums::SearchMessagesFilter {
         M::Videos => enums::SearchMessagesFilter::Video,
         M::Files => enums::SearchMessagesFilter::Document,
         M::Links => enums::SearchMessagesFilter::Url,
-        M::Voice => enums::SearchMessagesFilter::VoiceNote,
+        M::Voice => enums::SearchMessagesFilter::VoiceAndVideoNote,
         M::Gifs => enums::SearchMessagesFilter::Animation,
         M::Music => enums::SearchMessagesFilter::Audio,
     }

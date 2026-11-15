@@ -267,6 +267,13 @@ pub enum Action {
     OpenMessageUrl,
     PlayMedia,
     ViewAttachment,
+    PlayerPause,
+    PlayerStop,
+    PlayerNext,
+    PlayerPrevious,
+    PlayerSeekBack,
+    PlayerSeekForward,
+    PlayerSpeed,
     ToggleFolderPane,
     ToggleChatPane,
     ToggleInfoPane,
@@ -290,6 +297,8 @@ pub enum Action {
     OpenInbox,
     MarkChatRead,
     OpenBotKeyboard,
+    FormatText,
+    EditInEditor,
     OpenOptions,
     JumpToPinned,
     OpenNextUnread,
@@ -297,7 +306,13 @@ pub enum Action {
     JumpToNextReaction,
     CopyQuote,
     TranslateMessage,
+    Transcribe,
     SaveMessage,
+    CopyCode,
+    SplitOpen,
+    SplitFocus,
+    SplitClose,
+    SplitForward,
     MarkMessage,
     SelectText,
     OpenSharedMedia,
@@ -312,6 +327,7 @@ pub enum Group {
     Navigate,
     Compose,
     Message,
+    Player,
     Panes,
     Account,
 }
@@ -322,6 +338,7 @@ impl Group {
             Group::Navigate => "Navigate",
             Group::Compose => "Compose",
             Group::Message => "Message",
+            Group::Player => "Player",
             Group::Panes => "Panes",
             Group::Account => "Account",
         }
@@ -371,7 +388,7 @@ pub enum HelpLine {
     Blank,
 }
 
-const HELP_EXTRA: [(Section, &str, &str); 28] = [
+const HELP_EXTRA: [(Section, &str, &str); 29] = [
     (
         Section::Global,
         "Enter",
@@ -399,6 +416,11 @@ const HELP_EXTRA: [(Section, &str, &str); 28] = [
     ),
     (Section::Composer, "<C-s>, <C-g>", "stickers, GIFs"),
     (Section::Composer, "<C-k>", "bot buttons"),
+    (
+        Section::Composer,
+        "<C-t>",
+        "format menu; Shift+arrows select text",
+    ),
     (Section::Composer, "<C-n>", "next unread chat"),
     (
         Section::Composer,
@@ -484,6 +506,13 @@ impl Action {
             Action::EditMessage => (Group::Message, 1),
             Action::PlayMedia => (Group::Message, 2),
             Action::ViewAttachment => (Group::Message, 3),
+            Action::PlayerPause => (Group::Player, 0),
+            Action::PlayerStop => (Group::Player, 1),
+            Action::PlayerNext => (Group::Player, 2),
+            Action::PlayerPrevious => (Group::Player, 3),
+            Action::PlayerSeekBack => (Group::Player, 4),
+            Action::PlayerSeekForward => (Group::Player, 5),
+            Action::PlayerSpeed => (Group::Player, 6),
             Action::OpenMessageUrl => (Group::Message, 4),
             Action::DeleteMessage => (Group::Message, 5),
             Action::ToggleFolderPane => (Group::Panes, 0),
@@ -505,6 +534,8 @@ impl Action {
             Action::OpenInbox => (Group::Navigate, 21),
             Action::MarkChatRead => (Group::Navigate, 22),
             Action::OpenBotKeyboard => (Group::Compose, 4),
+            Action::FormatText => (Group::Compose, 5),
+            Action::EditInEditor => (Group::Compose, 6),
             Action::OpenOptions => (Group::Account, 1),
             Action::JumpToPinned => (Group::Navigate, 23),
             Action::OpenNextUnread => (Group::Navigate, 24),
@@ -512,7 +543,9 @@ impl Action {
             Action::JumpToNextReaction => (Group::Navigate, 28),
             Action::CopyQuote => (Group::Message, 13),
             Action::TranslateMessage => (Group::Message, 14),
+            Action::Transcribe => (Group::Message, 18),
             Action::SaveMessage => (Group::Message, 15),
+            Action::CopyCode => (Group::Message, 18),
             Action::MarkMessage => (Group::Message, 16),
             Action::SelectText => (Group::Message, 17),
             Action::OpenSharedMedia => (Group::Navigate, 29),
@@ -520,6 +553,10 @@ impl Action {
             Action::PreviousSearchResult => (Group::Navigate, 31),
             Action::ShowHelp => (Group::Account, 0),
             Action::ShowStatusLog => (Group::Panes, 4),
+            Action::SplitOpen => (Group::Panes, 5),
+            Action::SplitFocus => (Group::Panes, 6),
+            Action::SplitClose => (Group::Panes, 7),
+            Action::SplitForward => (Group::Panes, 8),
         }
     }
 
@@ -574,6 +611,17 @@ impl Action {
             Action::OpenMessageUrl => (Section::Messages, 7),
             Action::PlayMedia => (Section::Messages, 8),
             Action::ViewAttachment => (Section::Messages, 9),
+            Action::PlayerPause => (Section::Global, 29),
+            Action::PlayerStop => (Section::Global, 30),
+            Action::PlayerNext => (Section::Global, 31),
+            Action::PlayerPrevious => (Section::Global, 32),
+            Action::PlayerSeekBack => (Section::Global, 33),
+            Action::PlayerSeekForward => (Section::Global, 34),
+            Action::PlayerSpeed => (Section::Global, 35),
+            Action::SplitOpen => (Section::Global, 36),
+            Action::SplitFocus => (Section::Global, 37),
+            Action::SplitClose => (Section::Global, 38),
+            Action::SplitForward => (Section::Global, 39),
             Action::MarkMessage => (Section::Messages, 10),
             Action::SelectText => (Section::Messages, 11),
             Action::ScrollViewportDown => (Section::Messages, 12),
@@ -583,12 +631,16 @@ impl Action {
             Action::ShowReactionUsers => (Section::Messages, 16),
             Action::CopyQuote => (Section::Messages, 17),
             Action::TranslateMessage => (Section::Messages, 18),
+            Action::Transcribe => (Section::Messages, 20),
             Action::SaveMessage => (Section::Messages, 19),
+            Action::CopyCode => (Section::Messages, 20),
             Action::StartComposer => (Section::Composer, 0),
             Action::AttachFile => (Section::Composer, 1),
             Action::RecordVoice => (Section::Composer, 2),
             Action::OpenStickers => (Section::Composer, 3),
             Action::OpenBotKeyboard => (Section::Composer, 4),
+            Action::FormatText => (Section::Composer, 5),
+            Action::EditInEditor => (Section::Composer, 6),
         }
     }
 
@@ -596,7 +648,7 @@ impl Action {
         matches!(self, Action::LogOut | Action::DeleteMessage)
     }
 
-    pub const ALL: [Action; 64] = [
+    pub const ALL: [Action; 79] = [
         Action::StartComposer,
         Action::OpenPaneFilter,
         Action::ClosePopup,
@@ -623,6 +675,13 @@ impl Action {
         Action::OpenMessageUrl,
         Action::PlayMedia,
         Action::ViewAttachment,
+        Action::PlayerPause,
+        Action::PlayerStop,
+        Action::PlayerNext,
+        Action::PlayerPrevious,
+        Action::PlayerSeekBack,
+        Action::PlayerSeekForward,
+        Action::PlayerSpeed,
         Action::ToggleFolderPane,
         Action::ToggleChatPane,
         Action::ToggleInfoPane,
@@ -646,6 +705,8 @@ impl Action {
         Action::OpenInbox,
         Action::MarkChatRead,
         Action::OpenBotKeyboard,
+        Action::FormatText,
+        Action::EditInEditor,
         Action::OpenOptions,
         Action::JumpToPinned,
         Action::OpenNextUnread,
@@ -653,7 +714,13 @@ impl Action {
         Action::JumpToNextReaction,
         Action::CopyQuote,
         Action::TranslateMessage,
+        Action::Transcribe,
         Action::SaveMessage,
+        Action::CopyCode,
+        Action::SplitOpen,
+        Action::SplitFocus,
+        Action::SplitClose,
+        Action::SplitForward,
         Action::MarkMessage,
         Action::SelectText,
         Action::OpenSharedMedia,
@@ -691,6 +758,13 @@ impl Action {
             Action::OpenMessageUrl => "OpenMessageUrl",
             Action::PlayMedia => "PlayMedia",
             Action::ViewAttachment => "ViewMessageAttachment",
+            Action::PlayerPause => "PlayerPause",
+            Action::PlayerStop => "PlayerStop",
+            Action::PlayerNext => "PlayerNext",
+            Action::PlayerPrevious => "PlayerPrevious",
+            Action::PlayerSeekBack => "PlayerSeekBack",
+            Action::PlayerSeekForward => "PlayerSeekForward",
+            Action::PlayerSpeed => "PlayerSpeed",
             Action::ToggleFolderPane => "ToggleFolderPane",
             Action::ToggleChatPane => "ToggleChatPane",
             Action::ToggleInfoPane => "ToggleInfoPane",
@@ -714,6 +788,8 @@ impl Action {
             Action::OpenInbox => "OpenNotificationInbox",
             Action::MarkChatRead => "MarkChatRead",
             Action::OpenBotKeyboard => "OpenBotKeyboard",
+            Action::FormatText => "FormatText",
+            Action::EditInEditor => "EditInEditor",
             Action::OpenOptions => "OpenOptions",
             Action::JumpToPinned => "JumpToPinnedMessage",
             Action::OpenNextUnread => "OpenNextUnread",
@@ -721,7 +797,13 @@ impl Action {
             Action::JumpToNextReaction => "JumpToNextReaction",
             Action::CopyQuote => "CopyQuote",
             Action::TranslateMessage => "TranslateMessage",
+            Action::Transcribe => "Transcribe",
             Action::SaveMessage => "SaveMessage",
+            Action::CopyCode => "CopyCode",
+            Action::SplitOpen => "SplitOpen",
+            Action::SplitFocus => "SplitFocus",
+            Action::SplitClose => "SplitClose",
+            Action::SplitForward => "SplitForward",
             Action::MarkMessage => "MarkMessage",
             Action::SelectText => "SelectMessageText",
             Action::OpenSharedMedia => "OpenSharedMedia",
@@ -764,6 +846,13 @@ impl Action {
             Action::OpenMessageUrl => "open link / mention",
             Action::PlayMedia => "play / open media",
             Action::ViewAttachment => "view attachment",
+            Action::PlayerPause => "pause or resume the player",
+            Action::PlayerStop => "stop the player",
+            Action::PlayerNext => "next track",
+            Action::PlayerPrevious => "previous track",
+            Action::PlayerSeekBack => "seek back 5 seconds",
+            Action::PlayerSeekForward => "seek forward 5 seconds",
+            Action::PlayerSpeed => "player speed",
             Action::ToggleFolderPane => "toggle folders",
             Action::ToggleChatPane => "toggle chats",
             Action::ToggleInfoPane => "toggle chat info",
@@ -787,6 +876,8 @@ impl Action {
             Action::OpenInbox => "notification inbox",
             Action::MarkChatRead => "mark chat read",
             Action::OpenBotKeyboard => "bot buttons",
+            Action::FormatText => "format text",
+            Action::EditInEditor => "write in $EDITOR",
             Action::OpenOptions => "options",
             Action::JumpToPinned => "jump to pinned message",
             Action::OpenNextUnread => "next unread chat",
@@ -794,7 +885,13 @@ impl Action {
             Action::JumpToNextReaction => "next unread reaction",
             Action::CopyQuote => "copy as quote",
             Action::TranslateMessage => "translate message",
+            Action::Transcribe => "transcribe voice message",
             Action::SaveMessage => "save to Saved Messages",
+            Action::CopyCode => "copy code",
+            Action::SplitOpen => "split: park this chat on the side",
+            Action::SplitFocus => "split: switch panes",
+            Action::SplitClose => "split: close the focused pane",
+            Action::SplitForward => "split: forward to the other pane",
             Action::MarkMessage => "mark / unmark message",
             Action::SelectText => "select text to copy",
             Action::OpenSharedMedia => "shared media",
@@ -833,6 +930,13 @@ impl Action {
             Action::OpenMessageUrl => &["o"],
             Action::PlayMedia => &["x"],
             Action::ViewAttachment => &["v"],
+            Action::PlayerPause => &["<leader>."],
+            Action::PlayerStop => &["<leader>x"],
+            Action::PlayerNext => &["<leader>]"],
+            Action::PlayerPrevious => &["<leader>["],
+            Action::PlayerSeekBack => &["<leader>h"],
+            Action::PlayerSeekForward => &["<leader>l"],
+            Action::PlayerSpeed => &["<leader>>"],
             Action::ToggleFolderPane => &["<leader>1"],
             Action::ToggleChatPane => &["<leader>2"],
             Action::ToggleInfoPane => &["<leader>4"],
@@ -856,12 +960,20 @@ impl Action {
             Action::OpenInbox => &["<leader>n"],
             Action::MarkChatRead => &["<leader>m"],
             Action::OpenBotKeyboard => &["<leader>k"],
+            Action::FormatText => &["<C-t>"],
+            Action::EditInEditor => &["<C-x>"],
             Action::OpenOptions => &["<leader>o"],
             Action::JumpToPinned => &["gp"],
             Action::OpenNextUnread => &["]u"],
             Action::JumpToNextMention => &["]m"],
             Action::JumpToNextReaction => &["]r"],
             Action::CopyQuote | Action::TranslateMessage | Action::SaveMessage => &[],
+            Action::CopyCode => &["Y"],
+            Action::SplitOpen => &["<C-w>v", "<leader>wv"],
+            Action::SplitFocus => &["<C-w>w", "<leader>ww"],
+            Action::SplitClose => &["<C-w>q", "<leader>wq"],
+            Action::SplitForward => &["<C-w>f", "<leader>wf"],
+            Action::Transcribe => &["T"],
             Action::MarkMessage => &["m"],
             Action::SelectText => &["V"],
             Action::OpenSharedMedia => &["<leader>g"],
@@ -1105,11 +1217,12 @@ impl Keymap {
         for (keys, action) in &self.bindings {
             if keys.len() > pending.len() && keys[..pending.len()] == pending[..] {
                 let rest = &keys[pending.len()..];
-                let label: String = rest.iter().map(Chord::label).collect();
+                let label = rest[0].label();
                 let desc = if rest.len() == 1 {
                     action.description().to_owned()
                 } else {
-                    format!("+{}", action.description())
+                    let d = action.description();
+                    format!("+{}", d.split_once(": ").map_or(d, |(p, _)| p))
                 };
                 if !out.iter().any(|h| h.key == label) {
                     out.push(Hint {
@@ -1414,7 +1527,7 @@ Bogus = "x"
         let map = Keymap::default();
         let groups = map.grouped_continuations(&[space()]);
         let titles: Vec<&str> = groups.iter().map(|(g, _)| g.title()).collect();
-        assert_eq!(titles, ["Navigate", "Compose", "Panes", "Account"]);
+        assert_eq!(titles, ["Navigate", "Compose", "Player", "Panes", "Account"]);
         let keys: Vec<Vec<&str>> = groups
             .iter()
             .map(|(_, h)| h.iter().map(|h| h.key.as_str()).collect())
@@ -1424,7 +1537,8 @@ Bogus = "x"
             [
                 vec!["Space", "a", "p", "P", "/", "n", "m", "g"],
                 vec!["u", "v", "s", "k"],
-                vec!["1", "2", "4", "r", "M"],
+                vec![".", "x", "]", "[", "h", "l", ">"],
+                vec!["1", "2", "4", "r", "M", "w"],
                 vec!["?", "o", "L"]
             ]
         );
@@ -1440,6 +1554,27 @@ Bogus = "x"
         );
         let total: usize = groups.iter().map(|(_, h)| h.len()).sum();
         assert_eq!(total, map.continuations(&[space()]).len());
+    }
+
+    #[test]
+    fn leader_w_collapses_to_one_split_entry_and_expands_on_the_next_key() {
+        let map = Keymap::default();
+        let hints = map.continuations(&[space()]);
+        let w: Vec<&Hint> = hints.iter().filter(|h| h.key == "w").collect();
+        assert_eq!(w.len(), 1);
+        assert_eq!(w[0].desc, "+split");
+        let w_chord = Chord::new(KeyCode::Char('w'), KeyModifiers::NONE);
+        let keys: Vec<String> = map
+            .continuations(&[space(), w_chord])
+            .into_iter()
+            .map(|h| h.key)
+            .collect();
+        assert_eq!(keys, ["v", "w", "q", "f"]);
+        let v = Chord::new(KeyCode::Char('v'), KeyModifiers::NONE);
+        assert_eq!(
+            map.feed(&[space(), w_chord], v),
+            Feed::Action(Action::SplitOpen)
+        );
     }
 
     #[test]

@@ -213,6 +213,12 @@ pub fn theme_path() -> Result<PathBuf, String> {
     Ok(config_dir()?.join("theme.toml"))
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Hooks {
+    pub on_message: Vec<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Notifications {
@@ -220,6 +226,8 @@ pub struct Notifications {
     pub sound: bool,
     pub volume: u8,
     pub sound_file: String,
+    pub actions: bool,
+    pub reply_command: Vec<String>,
 }
 
 impl Default for Notifications {
@@ -229,6 +237,8 @@ impl Default for Notifications {
             sound: true,
             volume: 70,
             sound_file: String::new(),
+            actions: true,
+            reply_command: Vec::new(),
         }
     }
 }
@@ -534,6 +544,8 @@ pub struct MediaSettings {
     pub animations: Animations,
     pub max_animations: u8,
     pub pause_unfocused: bool,
+    pub voice_speed: u16,
+    pub mpris: bool,
 }
 
 impl Default for MediaSettings {
@@ -542,11 +554,21 @@ impl Default for MediaSettings {
             animations: Animations::All,
             max_animations: 4,
             pause_unfocused: true,
+            voice_speed: 100,
+            mpris: true,
         }
     }
 }
 
 impl MediaSettings {
+    pub fn voice_speed(&self) -> f64 {
+        f64::from(self.voice_speed.clamp(100, 200)) / 100.0
+    }
+
+    pub fn remember_voice_speed(&mut self, speed: f64) {
+        self.voice_speed = (speed * 100.0).round().clamp(100.0, 200.0) as u16;
+    }
+
     pub fn max_animations(&self) -> usize {
         usize::from(self.max_animations.clamp(1, MAX_ANIMATIONS_LIMIT))
     }
@@ -565,11 +587,20 @@ impl MediaSettings {
 #[serde(default, deny_unknown_fields)]
 pub struct Settings {
     pub notifications: Notifications,
+    pub hooks: Hooks,
     pub privacy: Privacy,
     pub appearance: Appearance,
     pub navigation: Navigation,
     pub chats: Chats,
     pub media: MediaSettings,
+    pub transcription: Transcription,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize, serde::Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Transcription {
+    pub command: Vec<String>,
+    pub language: String,
 }
 
 impl Settings {
@@ -835,6 +866,47 @@ mod tests {
         assert!(Settings::parse("[navigation]\nnext = 1\n", &mut Vec::new()).is_err());
         assert_eq!(OpenFocus::Smart.step(true), OpenFocus::Composer);
         assert_eq!(OpenFocus::Messages.step(true), OpenFocus::Smart);
+    }
+
+    #[test]
+    fn transcription_settings_default_parse_and_roundtrip() {
+        let d = Settings::default();
+        assert!(d.transcription.command.is_empty());
+        assert!(d.transcription.language.is_empty());
+        let s = Settings::parse(
+            "[transcription]\ncommand = [\"whisper-cli\", \"-f\", \"{file}\"]\nlanguage = \"ru\"\n",
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(s.transcription.command, ["whisper-cli", "-f", "{file}"]);
+        assert_eq!(s.transcription.language, "ru");
+        assert_eq!(
+            Settings::parse(&s.to_toml().unwrap(), &mut Vec::new()).unwrap(),
+            s
+        );
+    }
+
+    #[test]
+    fn player_options_default_parse_clamp_and_roundtrip() {
+        let d = Settings::default();
+        assert_eq!(d.media.voice_speed(), 1.0);
+        assert!(d.media.mpris);
+        let s = Settings::parse(
+            "[media]\nvoice_speed = 150\nmpris = false\n",
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert_eq!(s.media.voice_speed(), 1.5);
+        assert!(!s.media.mpris);
+        assert_eq!(
+            Settings::parse(&s.to_toml().unwrap(), &mut Vec::new()).unwrap(),
+            s
+        );
+        let wild = Settings::parse("[media]\nvoice_speed = 900\n", &mut Vec::new()).unwrap();
+        assert_eq!(wild.media.voice_speed(), 2.0);
+        let mut m = MediaSettings::default();
+        m.remember_voice_speed(1.25);
+        assert_eq!(m.voice_speed, 125);
     }
 
     #[test]

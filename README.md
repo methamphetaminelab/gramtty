@@ -30,6 +30,13 @@ Terminal Telegram client in Rust on TDLib.
 - Bot commands and inline keyboard buttons
 - t.me links and @mentions open users, bots, channels, groups and messages right in gramtty; joining by an invite link and sending /start from a bot link ask first
 - Desktop notifications and a notification sound
+- Formatting as you type: bold, italic, underline, strikethrough, spoiler, code, links and quotes, shown live in the composer; a Format menu on `Ctrl-t`; editing a sent message keeps its formatting
+- Syntax highlighting in code blocks, copying a code block with `Y`, writing a message in `$EDITOR` with `Ctrl-x`
+- Background player for voice messages and music with a queue, speed control and MPRIS (media keys, `playerctl`) on Linux
+- Local, offline transcription of voice messages and video notes with whisper (`T`)
+- Two chats side by side (`Ctrl-w v`)
+- Command line control of the running client (`gramtty send`, `unread`, `chats`, `open`) and message hooks
+- Open, Mark as read and Reply right from the desktop notification (Linux)
 - Privacy: "don't mark as read", ghost mode (no online status, typing or read receipts)
 - Opt-in, local-only history of messages deleted by others and earlier versions of edited ones (not kept for protected or secret chats)
 - Themes (presets, including one that follows the terminal palette, and a custom `theme.toml`), six message layouts, border styles, avatar shapes
@@ -174,7 +181,7 @@ Vim-style. `?` lists every key binding by context, your remaps included. `Space`
 | `Space n` | notification inbox |
 | `Space m` | mark chat read |
 | `Space p` | profile |
-| `Space g` | shared media: photos, videos, files, links, voice, GIFs, music |
+| `Space g` | shared media: photos, videos, files, links, voice and video messages, GIFs, music |
 | `Space a` | actions for the selected message, or for the selected chat: mute, pin, archive, leave or delete it and more |
 | `Space 1` `2` `4` | toggle folders, chats, info panes |
 | `Space r` | redraw |
@@ -198,12 +205,92 @@ With an empty query it shows recently found chats and the top of the chat list. 
 
 `/` in the messages pane searches the open chat as you type. `Tab` `Shift-Tab` pick a media type (photos, videos, files, links, voice, GIFs, music), `Backspace` on an empty query drops the media or sender filter, and a date like `2024-05-01` or `01.05.2024` offers to go to that day. `Enter` jumps to the selected message and keeps the search: `n` `N` step to the next (older) and previous (newer) result right in the chat, `/` reopens the list where you left it, `Esc` in the list ends the search. In the lists of shared media and of messages from a member (`a` in a profile), `/` starts a text search inside that list.
 
+### Formatting messages
+
+Type markup and it is shown live in the composer (the markers are dimmed).
+
+| Syntax | Result |
+|---|---|
+| `**text**` | bold |
+| `__text__` | italic |
+| `<u>text</u>` | underline |
+| `~~text~~` | strikethrough |
+| `\|\|text\|\|` | spoiler |
+| `` `code` `` | inline code |
+| ```` ```lang ```` ... ```` ``` ```` on their own lines | code block, optional language |
+| `[text](https://example.com)` | link |
+| `[name](tg://user?id=123)` | mention by user id |
+| `> text` (one or more lines) | block quote |
+| `\*` | a literal marker character |
+
+An opening marker must be followed by a non-space and a closing one preceded by one, and `__` only applies at word boundaries, so `my__var__name`, `2 ** 3` and `a * b * c` stay as typed. Nothing is parsed inside code.
+
+`Shift`+arrows, `Shift-Home` `Shift-End` and `Ctrl-Shift-←` `→` select text in the composer. `Ctrl-t` opens the Format menu: `b` bold, `i` italic, `u` underline, `s` strikethrough, `p` spoiler, `c` code, `k` code block, `l` link, `q` quote, `x` clear formatting. With a selection the format wraps it (again unwraps it); without one it inserts the markers and puts the cursor between them. Editing a sent message (`e`) shows its formatting as markup and keeps it; the one exception is italic that starts or ends in the middle of a word.
+
+`Ctrl-x` in the composer opens the text in `$VISUAL` or `$EDITOR` (arguments are allowed, for example `code --wait`; when neither is set, the first of nano, nvim, vim and vi that is installed; on Windows nvim, vim, nano, then Notepad); if the editor returns within a second without changing the text, the draft is kept and the status asks for a command that waits; when the editor exits the text replaces the draft and is not sent automatically.
+
+Code blocks with a language (rust, python, js/ts, go, c/c++, java, kotlin, bash/sh, json, toml, yaml, sql, diff) are highlighted with the theme's colours. `Y` on a message copies its code without the fences; with several blocks a list opens.
+
+### Background player
+
+`v` on a voice message or an audio file plays it in the background; the following voice messages and video notes (or audio files) of the chat are queued. A line at the bottom shows state, title, time, progress, speed and queue position, and the queue keeps playing when you open another chat. Video, video notes and photos still open the viewer, `x` still opens mpv. Needs `libmpv`; without it `v` plays in mpv.
+
+`Space .` pause or resume, `Space x` stop, `Space ]` `Space [` next and previous, `Space h` `Space l` seek 5 s back and forward, `Space >` speed 1×, 1.25×, 1.5×, 2×. The voice speed is remembered (`media.voice_speed`, percent 100-200); music always starts at 1×.
+
+On Linux gramtty registers `org.mpris.MediaPlayer2.gramtty`, so media keys and `playerctl -p gramtty play-pause` work; `media.mpris = false` turns it off.
+
+### Transcribing voice messages
+
+`T` on a voice message or video note transcribes it locally with a speech-to-text program and shows the text under the message; `T` again hides it. One transcription runs at a time; the text appears while it runs, with progress (a percentage, or seconds when the length is unknown). The menu item and `T` hint are shown only when a program is found or `command` is set. `/` in the chat also finds text from transcripts already made. Auto-detected: `whisper-ctranslate2`, then `whisper` (openai-whisper). Any other program goes into the config; it must print the text to stdout (each line is shown as it arrives):
+
+```toml
+[transcription]
+command = ["whisper-cli", "-m", "/path/model.bin", "-nt", "-f", "{file}"]
+language = "ru"
+```
+
+This is an example for whisper.cpp to adapt: it reads WAV, so it needs a wrapper that converts with ffmpeg first. `{file}` is the downloaded file, `{lang}` the language (or `auto`). Transcripts are cached in `transcripts.json` in the data directory (at most 5000); for secret chats and chats with protected content they stay in memory only.
+
+### Two chats side by side
+
+`Ctrl-w v` parks the current chat as a side pane; open another chat in the active pane as usual. `Ctrl-w w` switches panes (each keeps its scroll position, selection and draft), `Ctrl-w f` forwards the selected or marked messages to the other pane's chat, `Ctrl-w q` closes the focused pane (the other one stays). `Tab`/`Shift-Tab`, `h`/`l` and `3` move between the two message panes as if they were panes of the row. Clicking the other pane focuses it. The split needs at least 100 columns for the messages; on a narrower terminal only the active pane is drawn and its title shows `[split: <other chat>]`. Messages in the side pane are not marked read until you focus it. The same actions are under `Space w` (`Space w v`, `w`, `q`, `f`).
+
+### Command line and hooks
+
+With gramtty running, these commands talk to it over a local socket (Linux and macOS; not on Windows yet):
+
+```
+gramtty send me "remember the milk"
+git diff | gramtty send me --code diff
+gramtty send "Team chat" --file ./report.pdf "weekly report"
+gramtty unread --json
+gramtty chats
+gramtty open @someone
+```
+
+`<chat>` is `me` (Saved Messages), a numeric id, an @username gramtty already knows, or a chat title (exact, then partial; several matches are an error). Text is sent as plain text and split at 4096 characters; `--code [lang]` sends it as a code block. `queued` in the answer means the running client accepted the message, not that Telegram delivered it. The socket is `$XDG_RUNTIME_DIR/gramtty.sock` (in the data directory when `GRAMTTY_DATA_DIR` is set), mode 0600.
+
+`unread --json` prints `{"total":{"chats":2,"messages":5,"mentions":1},"chats":[{"id":10,"title":"Team","unread":3,"mentions":1,"muted":false}]}`, ready for a status bar; `chats --json` prints `{"chats":[{"id":1,"title":"Alice","kind":"private","username":"alice"}]}`.
+
+A hook runs a command for every incoming message:
+
+```toml
+[hooks]
+on_message = ["/home/me/bin/on-message.sh"]
+```
+
+The command is an argument list, run without a shell, and gets one JSON line on stdin: `chat_id`, `chat_title`, `chat_kind`, `sender_id`, `sender_name`, `message_id`, `date`, `text`, `media`, `muted`, `mention`. At most 4 hooks run at once (extra events are dropped), each is stopped after 10 s, failures show in `Space M`.
+
+### Notification actions
+
+On Linux a notification has three actions: clicking it opens the chat at that message, "Mark as read" marks the chat read (even with "don't mark as read"), "Reply" asks for the text in a small prompt (fuzzel, rofi, wofi, zenity or kdialog, the first one found) and sends it. Without a prompt program gramtty opens the chat and starts a reply. Needs a `notify-send` with `--action`; whether the buttons show depends on the notification daemon. `notifications.actions = false` turns them off; `notifications.reply_command = ["fuzzel", "--dmenu", "--prompt-only=Reply to {title}: "]` sets your own prompt.
+
 ## Configuration
 
 Files in `~/.config/gramtty/` (`$XDG_CONFIG_HOME` is honoured):
 
 - `api.toml`: API credentials
-- `config.toml`: settings; `Space o` edits and saves it. Sections: `[notifications]`, `[privacy]`, `[appearance]`, `[navigation]`, `[chats]`, `[media]`. Unknown keys are rejected. In `[media]`, `animations = "all" | "selected" | "off"` chooses which stickers and GIFs move (`"off"` keeps them still, useful on slow terminals), `max_animations` caps how many play at once in the chat, `pause_unfocused` stops them while the terminal is not focused
+- `config.toml`: settings; `Space o` edits and saves it. Sections: `[notifications]`, `[privacy]`, `[appearance]`, `[navigation]`, `[chats]`, `[media]`, `[hooks]`, `[transcription]`. Unknown keys are rejected. In `[media]`, `animations = "all" | "selected" | "off"` chooses which stickers and GIFs move (`"off"` keeps them still, useful on slow terminals), `max_animations` caps how many play at once in the chat, `pause_unfocused` stops them while the terminal is not focused
 - `theme.toml`: custom theme, used when `appearance.theme = "custom"`. Reloaded on save, no restart needed
 - `keymap.toml`: key bindings
 

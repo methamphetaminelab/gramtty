@@ -163,8 +163,138 @@ fn notifier_args(title: &str, body: &str, _icon: Option<&str>) -> Vec<String> {
     osascript_args(title, body)
 }
 
-pub fn send(title: String, body: String, icon: Option<String>, tx: UnboundedSender<Event>) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub enum Action {
+    Open,
+    Read,
+    Reply,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Target {
+    pub chat_id: i64,
+    pub msg_id: i64,
+    pub topic: Option<i32>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub fn action_args(title: &str, body: &str, icon: Option<&str>) -> Vec<String> {
+    let mut args = notify_args(title, body, icon);
+    let at = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let actions = [
+        "--action=default=Open",
+        "--action=read=Mark as read",
+        "--action=reply=Reply",
+    ];
+    args.splice(at..at, actions.map(str::to_owned));
+    args
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub fn parse_action(stdout: &str) -> Option<Action> {
+    match stdout.trim() {
+        "default" => Some(Action::Open),
+        "read" => Some(Action::Read),
+        "reply" => Some(Action::Reply),
+        _ => None,
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+pub fn help_supports_actions(help: &str) -> bool {
+    help.contains("--action")
+}
+
+#[cfg(target_os = "linux")]
+fn supports_actions() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        std::process::Command::new(NOTIFIER)
+            .arg("--help")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .is_ok_and(|out| help_supports_actions(&String::from_utf8_lossy(&out.stdout)))
+    })
+}
+
+#[cfg(target_os = "linux")]
+const ACTION_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
+
+#[cfg(target_os = "linux")]
+async fn send_with_actions(
+    title: String,
+    body: String,
+    icon: Option<String>,
+    target: Target,
+    tx: UnboundedSender<Event>,
+) {
+    let args = action_args(&title, &body, icon.as_deref());
+    let mut cmd = tokio::process::Command::new(NOTIFIER);
+    cmd.args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            let _ = tx.send(Event::NotifyFailed(spawn_error(&e)));
+            return;
+        }
+    };
+    let Ok(result) = tokio::time::timeout(ACTION_WAIT, child.wait_with_output()).await else {
+        return;
+    };
+    let err = match result {
+        Ok(out) if out.status.success() => {
+            if let Some(action) = parse_action(&String::from_utf8_lossy(&out.stdout)) {
+                let _ = tx.send(Event::NotifyAction {
+                    chat_id: target.chat_id,
+                    msg_id: target.msg_id,
+                    topic: target.topic,
+                    action,
+                });
+            }
+            return;
+        }
+        Ok(out) => format!(
+            "{NOTIFIER} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Err(e) => spawn_error(&e),
+    };
+    let _ = tx.send(Event::NotifyFailed(err));
+}
+
+fn spawn_error(e: &std::io::Error) -> String {
+    if e.kind() == std::io::ErrorKind::NotFound {
+        NOTIFIER_MISSING.to_owned()
+    } else {
+        format!("{NOTIFIER}: {e}")
+    }
+}
+
+pub fn send(
+    title: String,
+    body: String,
+    icon: Option<String>,
+    target: Option<Target>,
+    tx: UnboundedSender<Event>,
+) {
     tokio::spawn(async move {
+        #[cfg(target_os = "linux")]
+        if let Some(target) = target
+            && tokio::task::spawn_blocking(supports_actions)
+                .await
+                .unwrap_or(false)
+        {
+            send_with_actions(title, body, icon, target, tx).await;
+            return;
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = target;
         let args = notifier_args(&title, &body, icon.as_deref());
         let mut cmd = tokio::process::Command::new(NOTIFIER);
         #[cfg(windows)]
@@ -182,8 +312,7 @@ pub fn send(title: String, body: String, icon: Option<String>, tx: UnboundedSend
                 "{NOTIFIER} failed: {}",
                 String::from_utf8_lossy(&out.stderr).trim()
             ),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => NOTIFIER_MISSING.to_owned(),
-            Err(e) => format!("{NOTIFIER}: {e}"),
+            Err(e) => spawn_error(&e),
         };
         let _ = tx.send(Event::NotifyFailed(err));
     });
@@ -461,6 +590,47 @@ mod tests {
             escape_markup("plain text, no markup"),
             "plain text, no markup"
         );
+    }
+
+    #[test]
+    fn action_args_put_actions_before_the_separator() {
+        assert_eq!(
+            action_args("Chat", "hi", None),
+            [
+                "--app-name",
+                "gramtty",
+                "--action=default=Open",
+                "--action=read=Mark as read",
+                "--action=reply=Reply",
+                "--",
+                "Chat",
+                "hi"
+            ]
+        );
+        let with_icon = action_args("Chat", "-x", Some("/p/a.jpg"));
+        assert_eq!(with_icon[2..4], ["--icon", "/p/a.jpg"]);
+        assert_eq!(with_icon[with_icon.len() - 3..], ["--", "Chat", "-x"]);
+    }
+
+    #[test]
+    fn parses_the_action_name_from_stdout() {
+        assert_eq!(parse_action("default\n"), Some(Action::Open));
+        assert_eq!(parse_action("read\n"), Some(Action::Read));
+        assert_eq!(parse_action("reply"), Some(Action::Reply));
+        assert_eq!(parse_action(""), None);
+        assert_eq!(parse_action("\n"), None);
+        assert_eq!(parse_action("delete\n"), None);
+    }
+
+    #[test]
+    fn help_text_tells_whether_actions_exist() {
+        assert!(help_supports_actions(
+            "  -A, --action=[NAME=]Text...       Specifies the actions"
+        ));
+        assert!(!help_supports_actions(
+            "  -u, --urgency=LEVEL\n  -t, --expire-time=TIME\n"
+        ));
+        assert!(!help_supports_actions(""));
     }
 
     #[test]

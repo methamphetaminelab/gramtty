@@ -229,6 +229,17 @@ impl App {
     }
 
     pub(super) fn on_found(&mut self, token: u64, result: Result<Found, String>) {
+        let view = match &self.popup {
+            Some(Popup::Search(sv)) if sv.token == token => Some(sv),
+            _ => self.chat_search.as_ref().filter(|sv| sv.token == token),
+        };
+        let result = match (view, result) {
+            (Some(sv), Ok(mut found)) => {
+                self.add_cached_transcripts(sv, &mut found);
+                Ok(found)
+            }
+            (_, other) => other,
+        };
         match &mut self.popup {
             Some(Popup::Search(sv)) if sv.token == token => {
                 apply_found(sv, result);

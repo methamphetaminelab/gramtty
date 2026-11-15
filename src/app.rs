@@ -34,6 +34,12 @@ use crate::voice::{self, Stop};
 
 #[path = "app_search.rs"]
 mod finder;
+#[path = "app_player.rs"]
+mod player_queue;
+#[path = "app_transcribe.rs"]
+pub mod transcripts;
+#[path = "app_split.rs"]
+mod split;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Pane {
@@ -136,12 +142,15 @@ pub enum MenuAction {
     CopyQuote,
     ReplyQuote,
     Translate,
+    Transcribe,
     SaveMessage,
+    CopyCode,
     CopyImage,
     Members,
     EventLog,
     Mark,
     SelectText,
+    Format(crate::markup::Format),
     Retry,
     SharedMedia,
     ChatMute,
@@ -192,6 +201,8 @@ impl Row {
 pub enum FileJob {
     Play(MediaKind, (i64, usize)),
     Inline(MediaKind, (i64, usize)),
+    Background((i64, usize)),
+    Transcribe(i64, i64),
     Open,
     Save(String),
     CopyImage,
@@ -254,6 +265,10 @@ pub enum Popup {
     ConfirmUrl(String),
     Links {
         links: Vec<format::Link>,
+        sel: usize,
+    },
+    CodePick {
+        items: Vec<format::CodeBlock>,
         sel: usize,
     },
     Files {
@@ -343,6 +358,7 @@ impl Popup {
             Popup::Search(sv) => !sv.listing(),
             Popup::Menu { .. }
             | Popup::Links { .. }
+            | Popup::CodePick { .. }
             | Popup::Files { .. }
             | Popup::ConfirmStart { .. }
             | Popup::ConfirmJoin(_)
@@ -505,7 +521,7 @@ pub struct ButtonsView {
     pub sel: usize,
 }
 
-pub const OPTIONS: [(&str, &str); 30] = [
+pub const OPTIONS: [(&str, &str); 33] = [
     (
         "Desktop notifications",
         "System notifications for new messages in unmuted chats and mentions",
@@ -626,10 +642,25 @@ pub const OPTIONS: [(&str, &str); 30] = [
         "Compact chat list",
         "One line per chat: title and badges, without the last message and its time",
     ),
+    (
+        "Voice message speed",
+        "Playback speed of voice messages in the background player, applied when one starts; h/l change",
+    ),
+    (
+        "Media keys and playerctl (MPRIS)",
+        "Show the player in the desktop media controls so media keys and playerctl work (Linux)",
+    ),
+    (
+        "Notification actions",
+        "Open, Mark as read and Reply buttons on desktop notifications (Linux, needs libnotify with --action)",
+    ),
 ];
 
 pub const OPTION_GROUPS: [(&str, &[usize]); 7] = [
-    ("Notifications", &[0, SOUND_OPTION, VOLUME_OPTION]),
+    (
+        "Notifications",
+        &[0, SOUND_OPTION, VOLUME_OPTION, ACTIONS_OPTION],
+    ),
     (
         "Privacy",
         &[
@@ -674,7 +705,13 @@ pub const OPTION_GROUPS: [(&str, &[usize]); 7] = [
     ),
     (
         "Messages",
-        &[TRANSLATE_OPTION, PHOTOS_AS_FILES_OPTION, SAVE_TARGET_OPTION],
+        &[
+            TRANSLATE_OPTION,
+            PHOTOS_AS_FILES_OPTION,
+            SAVE_TARGET_OPTION,
+            VOICE_SPEED_OPTION,
+            MPRIS_OPTION,
+        ],
     ),
     ("Navigation", &[OPEN_FOCUS_OPTION, AFTER_SEND_OPTION]),
 ];
@@ -731,6 +768,9 @@ pub const ANIMATIONS_OPTION: usize = 26;
 pub const MAX_ANIMATIONS_OPTION: usize = 27;
 pub const PAUSE_ANIMATIONS_OPTION: usize = 28;
 pub const COMPACT_CHATS_OPTION: usize = 29;
+pub const ACTIONS_OPTION: usize = 32;
+pub const VOICE_SPEED_OPTION: usize = 30;
+pub const MPRIS_OPTION: usize = 31;
 
 pub struct FilePicker {
     pub input: TextInput,
@@ -801,6 +841,7 @@ pub struct App {
     pub quitting: bool,
     pub exit_ready: bool,
     pub force_clear: bool,
+    pub editor_request: bool,
     pub connection: Option<&'static str>,
     pub my_id: Option<i64>,
     pub users: HashMap<i64, String>,
@@ -843,6 +884,12 @@ pub struct App {
     pub media: Media,
     pub playing: Option<Playing>,
     pub inline: crate::video::Inline,
+    pub bg: crate::audio::Background,
+    pub transcripts: transcripts::Transcripts,
+    #[cfg(target_os = "linux")]
+    mpris: Option<crate::mpris::Handle>,
+    #[cfg(target_os = "linux")]
+    mpris_failed: bool,
     next_token: u64,
     file_jobs: Vec<(i32, FileJob)>,
     pub anim_start: Instant,
@@ -874,6 +921,7 @@ pub struct App {
     reply_kb: HashMap<i64, Option<Keyboard>>,
     pub inbox: std::collections::VecDeque<InboxItem>,
     notify_broken: bool,
+    hook_gate: crate::hooks::Gate,
     pending_jump: Option<(i64, i64)>,
     jump_inflight: Option<(i64, i64)>,
     pub unread_counts: HashMap<ListId, i32>,
@@ -885,6 +933,7 @@ pub struct App {
     props: HashMap<(i64, i64), Option<td::Flags>>,
     sound_broken: bool,
     pub sound_env: Option<notify::SoundEnv>,
+    pub reply_tools: Option<Vec<&'static str>>,
     pub layout_cache: crate::ui::LayoutCache,
     pub lang: format::Lang,
     pending_open: Option<PendingOpen>,
@@ -917,6 +966,8 @@ pub struct App {
     pub login_busy: bool,
     session_closed: bool,
     pub terminal_out: Vec<String>,
+    pub side: Option<split::SideView>,
+    pub side_left: bool,
 }
 
 pub struct StatusEntry {
@@ -959,6 +1010,7 @@ impl App {
             quitting: false,
             exit_ready: false,
             force_clear: false,
+            editor_request: false,
             connection: None,
             my_id: None,
             users: HashMap::new(),
@@ -1001,6 +1053,12 @@ impl App {
             media,
             playing: None,
             inline: crate::video::Inline::default(),
+            bg: crate::audio::Background::new(),
+            transcripts: transcripts::Transcripts::default(),
+            #[cfg(target_os = "linux")]
+            mpris: None,
+            #[cfg(target_os = "linux")]
+            mpris_failed: false,
             next_token: 0,
             file_jobs: Vec::new(),
             anim_start: Instant::now(),
@@ -1032,6 +1090,7 @@ impl App {
             reply_kb: HashMap::new(),
             inbox: std::collections::VecDeque::new(),
             notify_broken: false,
+            hook_gate: crate::hooks::Gate::default(),
             pending_jump: None,
             jump_inflight: None,
             unread_counts: HashMap::new(),
@@ -1043,6 +1102,7 @@ impl App {
             props: HashMap::new(),
             sound_broken: false,
             sound_env: None,
+            reply_tools: None,
             layout_cache: crate::ui::LayoutCache::default(),
             lang: if cfg!(test) {
                 format::Lang::En
@@ -1079,6 +1139,8 @@ impl App {
             login_busy: false,
             session_closed: false,
             terminal_out: Vec::new(),
+            side: None,
+            side_left: false,
         }
     }
 
@@ -1105,9 +1167,11 @@ impl App {
             .search_due()
             .map(|t| t.saturating_duration_since(Instant::now()));
         let status = self.status_due(Instant::now());
+        let transcribing = self.transcribe_tick();
         redraw
             .into_iter()
             .chain(view)
+            .chain(transcribing)
             .chain(search)
             .chain(status)
             .chain(self.redraw_due)
@@ -1269,6 +1333,7 @@ impl App {
             Event::File(f) => self.on_file(f),
             Event::DownloadFailed { file_id, error } => {
                 self.media.download_failed(file_id, error.clone());
+                self.transcript_download_failed(file_id);
                 let had_job = self.file_jobs.iter().any(|(id, _)| *id == file_id);
                 self.file_jobs.retain(|(id, _)| *id != file_id);
                 if had_job {
@@ -1277,6 +1342,26 @@ impl App {
             }
             Event::Image(done) => self.media.on_done(done),
             Event::Video => {}
+            Event::Audio => self.audio_tick(),
+            Event::Transcript {
+                chat_id,
+                msg_id,
+                result,
+            } => self.on_transcript(chat_id, msg_id, result),
+            Event::TranscriptPartial {
+                chat_id,
+                msg_id,
+                text_so_far,
+                done_secs,
+            } => self.on_transcript_partial(chat_id, msg_id, text_so_far, done_secs),
+            #[cfg(target_os = "linux")]
+            Event::Mpris(cmd) => self.on_mpris(cmd),
+            #[cfg(target_os = "linux")]
+            Event::MprisFailed(reason) => {
+                self.mpris = None;
+                self.mpris_failed = true;
+                self.set_status(reason, false);
+            }
             Event::Anim(done) => self.media.anim.on_done(done),
             Event::Player { token, result } => {
                 if self.playing.as_ref().is_some_and(|p| p.token == token) {
@@ -1301,10 +1386,30 @@ impl App {
             Event::Voice(result) => self.on_voice(result),
             Event::Stickers(data) => self.on_sticker_data(data),
             Event::StickersFailed(e) => self.set_status(td::failed("load stickers", &e), true),
+            Event::Ipc { request, reply } => self.on_ipc(request, reply),
+            Event::Hook(result) => {
+                self.hook_gate.finished();
+                if let Err(e) = result {
+                    self.set_status(e, true);
+                }
+            }
             Event::NotifyFailed(e) => {
                 self.notify_broken = true;
                 self.set_status(e, true);
             }
+            Event::NotifyAction {
+                chat_id,
+                msg_id,
+                topic,
+                action,
+            } => self.on_notify_action(chat_id, msg_id, topic, action),
+            Event::ReplyFailed(e) => self.set_status(e, true),
+            Event::ReplyText {
+                chat_id,
+                msg_id,
+                topic,
+                text,
+            } => self.on_reply_text(chat_id, msg_id, topic, text),
             Event::Profile(target, result) => {
                 if let ProfileTarget::Chat(id) = target
                     && self.profile_asked.contains(&id)
@@ -1563,6 +1668,8 @@ impl App {
             }
             Event::Link(result) => self.on_link(result),
         }
+        #[cfg(target_os = "linux")]
+        self.mpris_sync();
     }
 
     fn on_file(&mut self, f: FileRef) {
@@ -1610,6 +1717,8 @@ impl App {
                     Err(e) => self.set_status(format!("{e}; x opens mpv"), true),
                 }
             }
+            FileJob::Background(target) => self.background_loaded(path, target),
+            FileJob::Transcribe(chat_id, msg_id) => self.transcript_downloaded(path, chat_id, msg_id),
             FileJob::Play(kind, target) => {
                 self.inline.stop();
                 self.stop_playback();
@@ -2371,6 +2480,8 @@ impl App {
         self.folder_sel = 0;
         self.chat_sel = 0;
         self.filter = None;
+        self.side = None;
+        self.side_left = false;
         self.open_chat = None;
         self.histories.clear();
         self.msg_sel = None;
@@ -2388,6 +2499,7 @@ impl App {
         self.status = None;
         self.file_jobs.clear();
         self.stop_playback();
+        self.bg.stop();
         self.cancel_recording();
         self.stickers = Library::default();
         self.user_meta.clear();
@@ -2421,6 +2533,7 @@ impl App {
         self.topic_select = None;
         self.topic_unread = None;
         self.archive = crate::archive::Archive::memory(self.settings.privacy.keep_deleted_limit);
+        self.transcripts = transcripts::Transcripts::default();
         self.blocked.clear();
         self.blocked_loaded = false;
         self.revealed.clear();
@@ -2444,6 +2557,7 @@ impl App {
             ("loaded_lists", self.loaded_lists.is_empty()),
             ("filter", self.filter.is_none()),
             ("open_chat", self.open_chat.is_none()),
+            ("side", self.side.is_none()),
             ("histories", self.histories.is_empty()),
             ("msg_sel", self.msg_sel.is_none()),
             ("last_viewed", self.last_viewed.is_empty()),
@@ -2490,6 +2604,7 @@ impl App {
                 "archive",
                 self.archive.len() == 0 && self.archive.path().is_none(),
             ),
+            ("transcripts", self.transcripts.is_empty()),
             ("blocked", self.blocked.is_empty()),
             ("blocked_loaded", !self.blocked_loaded),
             ("revealed", self.revealed.is_empty()),
@@ -2527,9 +2642,12 @@ impl App {
         }
         self.quitting = true;
         self.stop_playback();
+        self.bg.stop();
         self.cancel_recording();
         let drafts: Vec<td::DraftSave> = if self.auth == Auth::Ready {
-            self.leave_draft().into_iter().collect()
+            let mut drafts: Vec<td::DraftSave> = self.leave_draft().into_iter().collect();
+            drafts.extend(self.side_drafts());
+            drafts
         } else {
             Vec::new()
         };
@@ -2790,6 +2908,9 @@ impl App {
                 self.show_chats = true;
                 self.focus = Pane::Chats;
             }
+            Action::FocusMessagePane if self.focus == Pane::Messages && self.side.is_some() => {
+                self.split_focus()
+            }
             Action::FocusMessagePane => self.focus = Pane::Messages,
             Action::FocusInfoPane => {
                 self.show_info = true;
@@ -2837,6 +2958,17 @@ impl App {
             Action::OpenMessageUrl => self.message_action(MenuAction::OpenUrl),
             Action::PlayMedia => self.message_action(MenuAction::Play),
             Action::ViewAttachment => self.message_action(MenuAction::View),
+            Action::PlayerPause => self.player_pause(),
+            Action::PlayerStop => self.player_stop(),
+            Action::PlayerNext => self.player_next(),
+            Action::PlayerPrevious => self.player_previous(),
+            Action::PlayerSeekBack => self.player_seek(-crate::audio::SEEK_STEP),
+            Action::PlayerSeekForward => self.player_seek(crate::audio::SEEK_STEP),
+            Action::PlayerSpeed => self.player_speed(),
+            Action::SplitOpen => self.split_open(),
+            Action::SplitFocus => self.split_focus(),
+            Action::SplitClose => self.split_close_focused(),
+            Action::SplitForward => self.split_forward(),
             Action::ToggleFolderPane => {
                 self.show_folders = !self.show_folders;
                 self.fix_focus();
@@ -2865,7 +2997,9 @@ impl App {
             Action::ShowReactionUsers => self.message_action(MenuAction::ReactionList),
             Action::CopyQuote => self.message_action(MenuAction::CopyQuote),
             Action::TranslateMessage => self.message_action(MenuAction::Translate),
+            Action::Transcribe => self.message_action(MenuAction::Transcribe),
             Action::SaveMessage => self.message_action(MenuAction::SaveMessage),
+            Action::CopyCode => self.message_action(MenuAction::CopyCode),
             Action::MarkMessage => self.message_action(MenuAction::Mark),
             Action::SelectText => self.message_action(MenuAction::SelectText),
             Action::OpenSharedMedia => match self.focused_chat() {
@@ -2889,6 +3023,8 @@ impl App {
                 None => self.set_status("open a chat first", false),
             },
             Action::OpenBotKeyboard => self.open_buttons(),
+            Action::FormatText => self.open_format_menu(),
+            Action::EditInEditor => self.editor_request = self.composer.active,
             Action::OpenOptions => self.popup = Some(Popup::Options { sel: 0 }),
             Action::OpenNextUnread => {
                 self.open_next_unread();
@@ -2927,11 +3063,25 @@ impl App {
     }
 
     fn cycle_focus(&mut self, step: usize) {
+        let rightwards = step == 1;
+        if self.focus == Pane::Messages
+            && self.side.is_some()
+            && self.side_left != rightwards
+        {
+            self.split_focus();
+            return;
+        }
         let mut idx = self.focus.index();
         for _ in 0..4 {
             idx = (idx + step) % 4;
             if self.pane_visible(Pane::ORDER[idx]) {
                 self.focus = Pane::ORDER[idx];
+                if self.focus == Pane::Messages
+                    && self.side.is_some()
+                    && self.side_left == rightwards
+                {
+                    self.split_focus();
+                }
                 return;
             }
         }
@@ -3383,6 +3533,7 @@ impl App {
                 self.maybe_load_newer();
             }
             Some(Hit::Composer) => self.start_composer(None, None),
+            Some(Hit::Side) => self.split_focus(),
             None => {
                 if let Some(Zone::Pane(p)) = self.text_map.zone_at(at) {
                     self.focus = p;
@@ -3900,19 +4051,24 @@ impl App {
             if let Some(save) = self.leave_draft() {
                 self.td.set_draft(save);
             }
+            self.side_adopt_draft();
         }
         if same_chat && self.open_topic != topic {
             let epoch = self.histories.get(&chat_id).map_or(0, |h| h.epoch + 1);
             self.reset_history(chat_id, topic, epoch);
         }
         if !same_chat {
-            if let Some(old) = self.open_chat.take() {
+            if let Some(old) = self.open_chat.take()
+                && !self.side_shows(old)
+            {
                 self.td.close_chat(old);
                 self.histories.remove(&old);
             }
             self.open_chat = Some(chat_id);
             self.info_scroll = 0;
-            self.td.open_chat(chat_id);
+            if !self.side_shows(chat_id) {
+                self.td.open_chat(chat_id);
+            }
             self.profile_asked.remove(&chat_id);
             self.reset_history(chat_id, topic, 0);
             self.pinned_msg.remove(&chat_id);
@@ -3942,6 +4098,7 @@ impl App {
         h.start_older();
         self.td.load_history(chat_id, 0, true, h.epoch, topic);
         self.histories.insert(chat_id, h);
+        self.side_history_replaced(chat_id);
         self.open_topic = topic;
         self.last_viewed.remove(&chat_id);
         self.composer = Composer::default();
@@ -4313,6 +4470,20 @@ impl App {
                 }
             }
             KeyCode::Enter if key.modifiers.is_empty() => self.submit_composer(),
+            _ if self
+                .keymap
+                .actions_for(Chord::from_event(&key))
+                .contains(&Action::FormatText) =>
+            {
+                self.open_format_menu();
+            }
+            _ if self
+                .keymap
+                .actions_for(Chord::from_event(&key))
+                .contains(&Action::EditInEditor) =>
+            {
+                self.editor_request = true;
+            }
             KeyCode::Char('v') if ctrl => self.paste_clipboard(),
             KeyCode::Char('o') if ctrl => self.open_file_picker(),
             KeyCode::Char('r') if ctrl => self.start_recording(),
@@ -4916,6 +5087,13 @@ impl App {
             return;
         }
         self.anim_start = Instant::now();
+        let sound = items
+            .get(pos)
+            .and_then(|(m, i)| self.attachment(chat_id, *m, *i))
+            .is_some_and(|a| crate::video::playable(a.kind));
+        if sound {
+            self.pause_background();
+        }
         self.popup = Some(Popup::Viewer {
             chat_id,
             pos: pos.min(items.len() - 1),
@@ -4968,6 +5146,7 @@ impl App {
 
     fn start_inline(&mut self, msg_id: i64, idx: usize, att: &Attachment) {
         self.inline.requested = Some((msg_id, idx));
+        self.pause_background();
         let name = attachment_name(att, msg_id);
         self.queue_file_job(&att.file, &name, FileJob::Inline(att.kind, (msg_id, idx)));
     }
@@ -5126,8 +5305,10 @@ impl App {
                 None => self.set_status("no media in this message", false),
             },
             MenuAction::View => {
-                let items = self.viewable_items();
-                self.open_viewer(msg.chat_id, items, 0);
+                if !self.play_in_background(&msg) {
+                    let items = self.viewable_items();
+                    self.open_viewer(msg.chat_id, items, 0);
+                }
             }
             MenuAction::Save => {
                 let items = self.action_attachments();
@@ -5280,6 +5461,19 @@ impl App {
                     self.copy_text(format::quote_block(&text, &author, &when));
                 }
             }
+            MenuAction::CopyCode => {
+                let mut blocks = format::code_blocks(&msg.body);
+                match blocks.len() {
+                    0 => self.set_status("no code in this message", false),
+                    1 => self.copy_text(blocks.remove(0).text),
+                    _ => {
+                        self.popup = Some(Popup::CodePick {
+                            items: blocks,
+                            sel: 0,
+                        })
+                    }
+                }
+            }
             MenuAction::ReplyQuote => {
                 if msg.body.text.trim().is_empty() {
                     self.set_status("no text to quote", false);
@@ -5292,6 +5486,7 @@ impl App {
                 }
             }
             MenuAction::Translate => self.translate_message(&msg),
+            MenuAction::Transcribe => self.transcribe_message(&msg),
             MenuAction::SaveMessage => {
                 let Some(target) = self.save_target() else {
                     self.set_status("not logged in yet", true);
@@ -5612,9 +5807,19 @@ impl App {
             Action::RecordVoice => {
                 self.can_compose() && self.composer.edit.is_none() && self.recording.is_none()
             }
+            Action::FormatText | Action::EditInEditor => self.composer.active,
+            Action::SplitOpen => self.open_chat.is_some() && self.side.is_none(),
+            Action::SplitFocus | Action::SplitClose | Action::SplitForward => self.side.is_some(),
             Action::OpenProfile | Action::OpenSharedMedia => chat.is_some(),
             Action::ShowPinned => chat.is_some_and(|c| self.no_pinned != Some(c)),
             Action::MarkChatRead => chat.is_some_and(|c| self.has_unread(c)),
+            Action::PlayerPause
+            | Action::PlayerStop
+            | Action::PlayerNext
+            | Action::PlayerPrevious
+            | Action::PlayerSeekBack
+            | Action::PlayerSeekForward
+            | Action::PlayerSpeed => self.bg.active(),
             Action::OpenBotKeyboard => {
                 self.inline_buttons()
                     || self
@@ -5909,6 +6114,12 @@ impl App {
             ),
             (text, 'Y', "Copy as quote", MenuAction::CopyQuote),
             (
+                !format::code_blocks(&sel.body).is_empty(),
+                'Z',
+                "Copy code",
+                MenuAction::CopyCode,
+            ),
+            (
                 live && own_text && can_reply,
                 'Q',
                 "Reply with quote",
@@ -5919,6 +6130,12 @@ impl App {
                 't',
                 "Translate",
                 MenuAction::Translate,
+            ),
+            (
+                live && Self::transcribable(sel) && self.transcription_available(),
+                'w',
+                "Transcribe",
+                MenuAction::Transcribe,
             ),
             (
                 live && forward,
@@ -6409,6 +6626,7 @@ impl App {
         }
         self.drafts.retain(|(c, _), _| *c != chat_id);
         self.draft_files.retain(|(c, _), _| *c != chat_id);
+        self.split_chat_removed(chat_id);
     }
 
     pub fn topic_menu(&self, chat: i64, topic: i32) -> Vec<MenuItem> {
@@ -6518,6 +6736,7 @@ impl App {
 
     fn run_menu_action(&mut self, action: MenuAction) {
         match action {
+            MenuAction::Format(format) => self.format_composer(format),
             MenuAction::OpenTopic
             | MenuAction::TopicMarkRead
             | MenuAction::TopicReadMarks
@@ -6597,7 +6816,9 @@ impl App {
             | MenuAction::CopyQuote
             | MenuAction::ReplyQuote
             | MenuAction::Translate
+            | MenuAction::Transcribe
             | MenuAction::SaveMessage
+            | MenuAction::CopyCode
             | MenuAction::CopyImage => self.message_action(action),
             MenuAction::Members => {
                 if let Some(chat) = self.focused_chat() {
@@ -6799,6 +7020,7 @@ impl App {
             Popup::Inbox { sel } => *sel = step(*sel, delta, inbox_len),
             Popup::Ttl { choices, sel, .. } => *sel = step(*sel, delta, choices.len()),
             Popup::Links { links, sel } => *sel = step(*sel, delta, links.len()),
+            Popup::CodePick { items, sel } => *sel = step(*sel, delta, items.len()),
             Popup::Files { items, sel } => *sel = step(*sel, delta, items.len()),
             _ => return false,
         }
@@ -6825,12 +7047,20 @@ impl App {
             | Popup::Buttons(_)
             | Popup::ConfirmUrl(_)
             | Popup::Links { .. }
+            | Popup::CodePick { .. }
             | Popup::Files { .. }
             | Popup::ConfirmStart { .. }
             | Popup::ConfirmJoin(_)
             | Popup::Options { .. }
             | Popup::Inbox { .. } => self.on_stage4_popup_key(key),
             Popup::Menu { items, sel, .. } => match key.code {
+                KeyCode::Char(c) if !ctrl && items.iter().any(|i| i.key == c) => {
+                    let action = items.iter().find(|i| i.key == c).map(|i| i.action);
+                    self.popup = None;
+                    if let Some(action) = action {
+                        self.run_menu_action(action);
+                    }
+                }
                 KeyCode::Esc | KeyCode::Char('q') => self.popup = None,
                 KeyCode::Char('j') | KeyCode::Down => *sel = (*sel + 1) % items.len(),
                 KeyCode::Char('n') if ctrl => *sel = (*sel + 1) % items.len(),
@@ -7475,6 +7705,7 @@ impl App {
                     .is_none_or(|h| h.accepts(msg)),
             age: unix_now() - msg.date,
         };
+        self.message_hook(msg, &cand);
         if !notify::worth_inbox(&cand) {
             return;
         }
@@ -7510,7 +7741,131 @@ impl App {
             format!("{from}: {preview}")
         };
         let icon = self.notify_icon(msg, private);
-        self.td.notify(chat, format::truncate(&body, 300), icon);
+        let target = self
+            .settings
+            .notifications
+            .actions
+            .then_some(notify::Target {
+                chat_id: msg.chat_id,
+                msg_id: msg.id,
+                topic: msg.topic,
+            });
+        self.td
+            .notify(chat, format::truncate(&body, 300), icon, target);
+    }
+
+    fn on_notify_action(
+        &mut self,
+        chat_id: i64,
+        msg_id: i64,
+        topic: Option<i32>,
+        action: notify::Action,
+    ) {
+        match action {
+            notify::Action::Open => self.jump_to_in(chat_id, msg_id, topic),
+            notify::Action::Read => self.mark_chat_read(chat_id),
+            notify::Action::Reply => self.start_reply(chat_id, msg_id, topic),
+        }
+    }
+
+    fn start_reply(&mut self, chat_id: i64, msg_id: i64, topic: Option<i32>) {
+        if let Some(why) = self.cannot_send(chat_id) {
+            self.set_status(why, true);
+            return;
+        }
+        let title = self.sender_name(Sender::Chat(chat_id));
+        let tools = self.reply_tools.get_or_insert_with(|| {
+            crate::reply_prompt::TOOL_NAMES
+                .into_iter()
+                .filter(|t| crate::config::find_in_path(t).is_some())
+                .collect()
+        });
+        let command = crate::reply_prompt::prompt_command(
+            &self.settings.notifications.reply_command,
+            &title,
+            |name| tools.contains(&name),
+        );
+        match command {
+            Some(command) => self.td.reply_prompt(
+                command,
+                notify::Target {
+                    chat_id,
+                    msg_id,
+                    topic,
+                },
+            ),
+            None => {
+                self.jump_to_in(chat_id, msg_id, topic);
+                self.start_composer(Some(msg_id), None);
+                self.set_status(
+                    format!(
+                        "no reply prompt program found ({}); reply here",
+                        crate::reply_prompt::TOOLS
+                    ),
+                    false,
+                );
+            }
+        }
+    }
+
+    fn on_reply_text(&mut self, chat_id: i64, msg_id: i64, topic: Option<i32>, text: String) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        if let Some(why) = self.cannot_send(chat_id) {
+            self.set_status(why, true);
+            return;
+        }
+        let in_group = self.chats.get(&chat_id).is_some_and(|c| {
+            matches!(
+                c.kind,
+                ChatKind::Group | ChatKind::Supergroup | ChatKind::Channel
+            )
+        });
+        self.td.send_text(
+            chat_id,
+            text.to_owned(),
+            in_group.then_some(msg_id),
+            None,
+            topic,
+            None,
+        );
+    }
+
+    fn message_hook(&mut self, msg: &Msg, cand: &notify::Candidate) {
+        let command = &self.settings.hooks.on_message;
+        if command.is_empty() || msg.outgoing {
+            return;
+        }
+        let Some(chat) = self.chats.get(&msg.chat_id) else {
+            return;
+        };
+        match self.hook_gate.admit() {
+            crate::hooks::Admit::Run => {}
+            crate::hooks::Admit::Drop { first } => {
+                if first {
+                    self.set_status(
+                        format!(
+                            "message hook is busy ({} running); dropping events until one finishes",
+                            crate::hooks::MAX_RUNNING
+                        ),
+                        true,
+                    );
+                }
+                return;
+            }
+        }
+        let from = self.sender_name(msg.sender);
+        let payload = crate::hooks::payload(
+            msg,
+            &chat.title,
+            &chat.kind,
+            &from,
+            cand.muted,
+            cand.mention,
+        );
+        self.td.run_hook(command.clone(), payload.to_string());
     }
 
     fn notify_icon(&self, msg: &Msg, private: bool) -> notify::Icon {
@@ -7708,6 +8063,57 @@ impl App {
             .map(|k| (id, k))
     }
 
+    pub fn composer_text(&self) -> &str {
+        self.composer.input.text()
+    }
+
+    pub fn apply_editor_text(&mut self, text: &str) {
+        self.composer.input = TextInput::with_text(text);
+    }
+
+    fn open_format_menu(&mut self) {
+        use crate::markup::Format;
+        const CHOICES: [(char, &str, Format); 10] = [
+            ('b', "Bold", Format::Bold),
+            ('i', "Italic", Format::Italic),
+            ('u', "Underline", Format::Underline),
+            ('s', "Strikethrough", Format::Strike),
+            ('p', "Spoiler", Format::Spoiler),
+            ('c', "Code", Format::Code),
+            ('k', "Code block", Format::Pre),
+            ('l', "Link", Format::Link),
+            ('q', "Quote", Format::Quote),
+            ('x', "Clear formatting", Format::Clear),
+        ];
+        if !self.composer.active {
+            return;
+        }
+        self.popup = Some(Popup::Menu {
+            title: "Format",
+            items: CHOICES
+                .iter()
+                .map(|&(key, label, format)| MenuItem {
+                    key,
+                    label,
+                    action: MenuAction::Format(format),
+                })
+                .collect(),
+            sel: 0,
+        });
+    }
+
+    fn format_composer(&mut self, format: crate::markup::Format) {
+        let input = &mut self.composer.input;
+        let out = crate::markup::apply(input.text(), input.cursor(), input.selection(), format);
+        let len = input.text().chars().count();
+        input.splice(0, len, &out.text, out.cursor);
+        if let Some(anchor) = out.anchor {
+            input.select(anchor, out.cursor);
+        }
+        self.cmd_sel = 0;
+        self.note_typing();
+    }
+
     fn open_buttons(&mut self) {
         let inline = self.selected_group().iter().find_map(|m| {
             m.keyboard
@@ -7772,6 +8178,173 @@ impl App {
         } else if let Err(e) = player::xdg_open(&format::normalize_url(&url)) {
             self.set_status(td::failed("open the link", &e), true);
         }
+    }
+
+    fn ipc_chat_keys(&self) -> Vec<crate::ipc::ChatKey> {
+        self.chats
+            .values()
+            .map(|c| crate::ipc::ChatKey {
+                id: c.id,
+                title: c.title.clone(),
+                usernames: self.chat_usernames(c.id).to_vec(),
+            })
+            .collect()
+    }
+
+    fn ipc_chats_sorted(&self) -> Vec<&ChatInfo> {
+        let mut chats: Vec<&ChatInfo> = self.chats.values().collect();
+        chats.sort_by_key(|c| {
+            (
+                std::cmp::Reverse(c.position_in(ListId::Main).map_or(0, |p| p.order)),
+                c.id,
+            )
+        });
+        chats
+    }
+
+    fn ipc_resolve(&self, query: &str) -> Result<i64, String> {
+        crate::ipc::resolve_chat(query, &self.ipc_chat_keys(), self.my_id).map_err(|e| e.message())
+    }
+
+    fn on_ipc(
+        &mut self,
+        request: crate::ipc::Request,
+        reply: tokio::sync::oneshot::Sender<crate::ipc::Response>,
+    ) {
+        let _ = reply.send(self.run_ipc(request));
+    }
+
+    fn run_ipc(&mut self, request: crate::ipc::Request) -> crate::ipc::Response {
+        use crate::ipc::{Request, Response};
+        use serde_json::json;
+        match request {
+            Request::Unread => {
+                let unread: Vec<&ChatInfo> = self
+                    .ipc_chats_sorted()
+                    .into_iter()
+                    .filter(|c| c.unread > 0)
+                    .collect();
+                let messages = unread.iter().map(|c| i64::from(c.unread)).sum();
+                let mentions = unread.iter().map(|c| i64::from(c.mentions)).sum();
+                let list = unread
+                    .iter()
+                    .map(|c| {
+                        json!({
+                            "id": c.id,
+                            "title": c.title,
+                            "unread": c.unread,
+                            "mentions": c.mentions,
+                            "muted": self.is_muted(c.id),
+                        })
+                    })
+                    .collect();
+                Response::ok(crate::ipc::unread_data(
+                    (unread.len() as i64, messages, mentions),
+                    list,
+                ))
+            }
+            Request::Chats => {
+                let list: Vec<_> = self
+                    .ipc_chats_sorted()
+                    .into_iter()
+                    .map(|c| {
+                        json!({
+                            "id": c.id,
+                            "title": c.title,
+                            "kind": match c.kind {
+                                ChatKind::Private(_) => "private",
+                                ChatKind::Group => "group",
+                                ChatKind::Supergroup => "supergroup",
+                                ChatKind::Channel => "channel",
+                                ChatKind::Secret(_) => "secret",
+                            },
+                            "username": self.chat_usernames(c.id).first(),
+                        })
+                    })
+                    .collect();
+                Response::ok(json!({ "chats": list }))
+            }
+            Request::Open { chat } => match self.ipc_resolve(&chat) {
+                Ok(id) => {
+                    self.popup = None;
+                    self.open_any(id);
+                    Response::ok(json!({ "chat": id }))
+                }
+                Err(e) => Response::error(e),
+            },
+            Request::Send {
+                chat,
+                text,
+                files,
+                code,
+            } => match self.ipc_send(&chat, &text, &files, code) {
+                Ok(queued) => Response::ok(json!({ "queued": queued })),
+                Err(e) => Response::error(e),
+            },
+        }
+    }
+
+    fn ipc_send(
+        &mut self,
+        chat: &str,
+        text: &str,
+        files: &[String],
+        code: Option<String>,
+    ) -> Result<usize, String> {
+        let chat_id = self.ipc_resolve(chat)?;
+        if let Some(why) = self.cannot_send(chat_id) {
+            return Err(why.to_owned());
+        }
+        if text.trim().is_empty() && files.is_empty() {
+            return Err("nothing to send".to_owned());
+        }
+        if !files.is_empty() && code.is_some() {
+            return Err("--code cannot be combined with --file".to_owned());
+        }
+        if !files.is_empty() {
+            let mut items = Vec::with_capacity(files.len());
+            for f in files {
+                let path = std::path::Path::new(f);
+                if !path.is_absolute() {
+                    return Err(format!("{f} is not an absolute path"));
+                }
+                items.push(upload::Pending::from_path(path)?);
+            }
+            let queued = items.len();
+            self.td.send_uploads(
+                chat_id,
+                items,
+                text.trim_end().to_owned(),
+                None,
+                self.uploads_dir.clone(),
+                None,
+            );
+            return Ok(queued);
+        }
+        let parts = crate::ipc::split_text(text, crate::ipc::MESSAGE_LIMIT);
+        if parts.is_empty() {
+            return Err("nothing to send".to_owned());
+        }
+        let queued = parts.len();
+        for part in parts {
+            let body = match &code {
+                Some(lang) => {
+                    let part = part.trim_end().to_owned();
+                    let length = part.encode_utf16().count();
+                    model::RichText {
+                        text: part,
+                        entities: vec![model::Entity {
+                            offset: 0,
+                            length,
+                            kind: model::EntityKind::Pre(Some(lang.clone()).filter(|l| !l.is_empty())),
+                        }],
+                    }
+                }
+                None => model::RichText::plain(part),
+            };
+            self.td.send_plain(chat_id, body);
+        }
+        Ok(queued)
     }
 
     fn on_link(&mut self, result: Result<td::Resolved, String>) {
@@ -7939,6 +8512,7 @@ impl App {
             0 => check(self.settings.notifications.desktop),
             1 => check(self.settings.privacy.dont_mark_read),
             2 => check(self.settings.privacy.ghost_mode),
+            ACTIONS_OPTION => check(self.settings.notifications.actions),
             SOUND_OPTION => check(self.settings.notifications.sound),
             VOLUME_OPTION => format!("{}%", self.settings.volume()),
             THEME_OPTION => match self.settings.appearance.theme {
@@ -7975,6 +8549,8 @@ impl App {
             ANIMATIONS_OPTION => self.settings.media.animations.name().to_owned(),
             MAX_ANIMATIONS_OPTION => self.settings.media.max_animations().to_string(),
             PAUSE_ANIMATIONS_OPTION => check(self.settings.media.pause_unfocused),
+            VOICE_SPEED_OPTION => crate::audio::speed_text(self.settings.media.voice_speed()),
+            MPRIS_OPTION => check(self.settings.media.mpris),
             _ => String::new(),
         }
     }
@@ -8183,6 +8759,10 @@ impl App {
                 let p = &mut self.settings.privacy;
                 p.ghost_mode = flip(p.ghost_mode);
             }
+            ACTIONS_OPTION => {
+                let n = &mut self.settings.notifications;
+                n.actions = flip(n.actions);
+            }
             SOUND_OPTION => {
                 let n = &mut self.settings.notifications;
                 n.sound = flip(n.sound);
@@ -8293,6 +8873,14 @@ impl App {
             PAUSE_ANIMATIONS_OPTION => {
                 let m = &mut self.settings.media;
                 m.pause_unfocused = flip(m.pause_unfocused);
+            }
+            VOICE_SPEED_OPTION => {
+                let m = &mut self.settings.media;
+                m.remember_voice_speed(crate::audio::next_speed(m.voice_speed()));
+            }
+            MPRIS_OPTION => {
+                let m = &mut self.settings.media;
+                m.mpris = flip(m.mpris);
             }
             SAVE_TARGET_OPTION => {
                 if dir.is_some() {
@@ -8507,6 +9095,39 @@ impl App {
                     self.open_url(link.url, link.hidden);
                 }
             }
+            Popup::CodePick { items, sel } => {
+                let n = items.len();
+                let pick = match key.code {
+                    KeyCode::Esc | KeyCode::Char('q') => {
+                        self.popup = None;
+                        return;
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        *sel = (*sel + 1) % n;
+                        None
+                    }
+                    KeyCode::Char('n') if ctrl => {
+                        *sel = (*sel + 1) % n;
+                        None
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        *sel = (*sel + n - 1) % n;
+                        None
+                    }
+                    KeyCode::Char('p') if ctrl => {
+                        *sel = (*sel + n - 1) % n;
+                        None
+                    }
+                    KeyCode::Enter => Some(*sel),
+                    KeyCode::Char(c) => bots::key_index(c).filter(|i| *i < n),
+                    _ => None,
+                };
+                if let Some(i) = pick {
+                    let block = items.swap_remove(i);
+                    self.popup = None;
+                    self.copy_text(block.text);
+                }
+            }
             Popup::ConfirmStart {
                 chat_id,
                 bot_id,
@@ -8646,7 +9267,9 @@ fn message_menu_action(action: Action) -> Option<MenuAction> {
         Action::ShowReactionUsers => MenuAction::ReactionList,
         Action::CopyQuote => MenuAction::CopyQuote,
         Action::TranslateMessage => MenuAction::Translate,
+        Action::Transcribe => MenuAction::Transcribe,
         Action::SaveMessage => MenuAction::SaveMessage,
+        Action::CopyCode => MenuAction::CopyCode,
         Action::MarkMessage => MenuAction::Mark,
         Action::SelectText => MenuAction::SelectText,
         _ => return None,
@@ -8757,6 +9380,7 @@ impl App {
         if self.archive.path() != Some(path.as_path()) {
             self.open_archive(path);
         }
+        self.open_transcripts(self.data_dir.join("transcripts.json"));
     }
 
     fn ensure_blocked_loaded(&mut self) {
@@ -8956,10 +9580,10 @@ fn step(cur: usize, delta: isize, len: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ChatInfo, Position, RichText, SendState};
+    use crate::model::{ChatInfo, Entity, EntityKind, Position, RichText, SendState};
     use crossterm::event::{KeyCode as K, KeyModifiers as M};
 
-    fn msg(chat_id: i64, id: i64, sender: i64) -> Msg {
+    pub(super) fn msg(chat_id: i64, id: i64, sender: i64) -> Msg {
         Msg {
             id,
             chat_id,
@@ -8986,7 +9610,7 @@ mod tests {
         }
     }
 
-    fn chat(id: i64, kind: ChatKind, muted: bool) -> ChatInfo {
+    pub(super) fn chat(id: i64, kind: ChatKind, muted: bool) -> ChatInfo {
         ChatInfo {
             id,
             title: format!("chat {id}"),
@@ -9015,7 +9639,7 @@ mod tests {
         }
     }
 
-    fn fake_app(settings: Settings) -> (App, td::RequestLog) {
+    pub(super) fn fake_app(settings: Settings) -> (App, td::RequestLog) {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let (td, log) = Td::recording(tx);
         let creds = ApiCredentials {
@@ -9030,6 +9654,7 @@ mod tests {
             ratatui_image::picker::Picker::halfblocks(),
         );
         app.auth = Auth::Ready;
+        app.bg = crate::audio::Background::fake();
         app.settings = settings;
         app.my_id = Some(1);
         app.users.insert(1, "Me".to_owned());
@@ -9046,7 +9671,7 @@ mod tests {
         (app, log)
     }
 
-    fn press(app: &mut App, code: K, mods: M) {
+    pub(super) fn press(app: &mut App, code: K, mods: M) {
         app.handle(Event::Input(TermEvent::Key(KeyEvent::new(code, mods))));
     }
 
@@ -9065,7 +9690,7 @@ mod tests {
         press(app, K::Char(c), M::NONE);
     }
 
-    fn open_with_history(app: &mut App, chat: i64) {
+    pub(super) fn open_with_history(app: &mut App, chat: i64) {
         app.open(chat);
         app.handle(Event::History {
             chat_id: chat,
@@ -9558,7 +10183,7 @@ mod tests {
         }
     }
 
-    fn count(log: &td::RequestLog, what: &str) -> usize {
+    pub(super) fn count(log: &td::RequestLog, what: &str) -> usize {
         log.lock().unwrap().iter().filter(|e| *e == what).count()
     }
 
@@ -9936,9 +10561,290 @@ mod tests {
         assert_eq!(app.chats[&10].last_read_outbox, 300);
     }
 
+    fn sends(log: &td::RequestLog) -> Vec<String> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.starts_with("send plain") || e.starts_with("send uploads "))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn ipc_unread_lists_chats_with_unread_messages() {
+        let (mut app, _log) = fake_app(Settings::default());
+        app.chats.get_mut(&20).unwrap().unread = 0;
+        app.chats.get_mut(&30).unwrap().unread = 5;
+        let r = app.run_ipc(crate::ipc::Request::Unread);
+        assert!(r.ok);
+        let data = serde_json::Value::Object(r.data);
+        assert_eq!(
+            data["total"],
+            serde_json::json!({"chats": 2, "messages": 7, "mentions": 2})
+        );
+        let ids: Vec<i64> = data["chats"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, [30, 10]);
+        assert_eq!(data["chats"][0]["muted"], true);
+        assert_eq!(data["chats"][1]["title"], "chat 10");
+    }
+
+    #[test]
+    fn ipc_chats_lists_kind_and_username() {
+        let (mut app, _log) = fake_app(Settings::default());
+        app.group_usernames.insert(0, vec!["team".to_owned()]);
+        let r = app.run_ipc(crate::ipc::Request::Chats);
+        let data = serde_json::Value::Object(r.data);
+        let by_id = |id: i64| {
+            data["chats"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["id"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert_eq!(by_id(20)["kind"], "private");
+        assert_eq!(by_id(30)["kind"], "group");
+        assert_eq!(by_id(10)["kind"], "supergroup");
+        assert_eq!(by_id(10)["username"], "team");
+    }
+
+    #[test]
+    fn ipc_open_resolves_a_title_and_reports_unknown_chats() {
+        let (mut app, _log) = fake_app(Settings::default());
+        let r = app.run_ipc(crate::ipc::Request::Open {
+            chat: "chat 20".to_owned(),
+        });
+        assert!(r.ok);
+        assert_eq!(app.open_chat, Some(20));
+        let r = app.run_ipc(crate::ipc::Request::Open {
+            chat: "@ghost".to_owned(),
+        });
+        assert!(!r.ok);
+        assert!(r.error.unwrap().contains("open that chat once"));
+        assert_eq!(app.open_chat, Some(20));
+    }
+
+    #[test]
+    fn ipc_send_code_wraps_each_part_in_one_pre_entity() {
+        let (mut app, log) = fake_app(Settings::default());
+        let r = app.run_ipc(crate::ipc::Request::Send {
+            chat: "10".to_owned(),
+            text: "a *b*\nc\n".to_owned(),
+            files: Vec::new(),
+            code: Some("diff".to_owned()),
+        });
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(r.data["queued"], 1);
+        assert_eq!(
+            sends(&log),
+            ["send plain 10 \"a *b*\\nc\" [Entity { offset: 0, length: 7, kind: Pre(Some(\"diff\")) }]"]
+        );
+    }
+
+    #[test]
+    fn ipc_send_plain_text_has_no_entities_and_long_text_is_split() {
+        let (mut app, log) = fake_app(Settings::default());
+        let line = format!("{}\n", "x".repeat(3000));
+        let r = app.run_ipc(crate::ipc::Request::Send {
+            chat: "chat 10".to_owned(),
+            text: line.repeat(3),
+            files: Vec::new(),
+            code: None,
+        });
+        assert_eq!(r.data["queued"], 3);
+        let sent = sends(&log);
+        assert_eq!(sent.len(), 3);
+        assert!(sent.iter().all(|s| s.ends_with(" []")));
+    }
+
+    #[test]
+    fn ipc_send_refuses_blocked_chats_and_empty_input() {
+        let (mut app, log) = fake_app(Settings::default());
+        app.chats.get_mut(&10).unwrap().group_id = 5;
+        app.groups.insert(
+            5,
+            model::GroupMeta {
+                status: model::Membership::Left,
+                ..model::GroupMeta::default()
+            },
+        );
+        let send = |app: &mut App, chat: &str, text: &str, files: Vec<String>, code| {
+            app.run_ipc(crate::ipc::Request::Send {
+                chat: chat.to_owned(),
+                text: text.to_owned(),
+                files,
+                code,
+            })
+        };
+        let r = send(&mut app, "10", "hi", Vec::new(), None);
+        assert!(!r.ok);
+        assert!(r.error.unwrap().contains("haven't joined"));
+        assert!(!send(&mut app, "20", "  ", Vec::new(), None).ok);
+        assert!(!send(&mut app, "20", "x", vec!["rel.txt".to_owned()], None).ok);
+        assert!(
+            !send(
+                &mut app,
+                "20",
+                "x",
+                vec!["/nonexistent/zzz".to_owned()],
+                None
+            )
+            .ok
+        );
+        let both = send(
+            &mut app,
+            "20",
+            "x",
+            vec!["/etc/hostname".to_owned()],
+            Some(String::new()),
+        );
+        assert!(both.error.unwrap().contains("--code"));
+        assert!(sends(&log).is_empty());
+    }
+
+    #[test]
+    fn ipc_send_me_goes_to_saved_messages_and_files_become_uploads() {
+        let (mut app, log) = fake_app(Settings::default());
+        app.chats.insert(1, chat(1, ChatKind::Private(1), false));
+        let file =
+            std::env::temp_dir().join(format!("gramtty-ipc-send-{}.txt", std::process::id()));
+        std::fs::write(&file, "data").unwrap();
+        let r = app.run_ipc(crate::ipc::Request::Send {
+            chat: "me".to_owned(),
+            text: "caption".to_owned(),
+            files: vec![file.to_string_lossy().into_owned()],
+            code: None,
+        });
+        let _ = std::fs::remove_file(&file);
+        assert!(r.ok, "{:?}", r.error);
+        assert_eq!(r.data["queued"], 1);
+        assert_eq!(sends(&log), ["send uploads 1 topic None reply None"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ipc_request_travels_through_the_socket_to_the_app_and_back() {
+        let dir = std::env::temp_dir().join(format!("gramtty-ipc-app-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("g.sock");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        crate::ipc::serve(crate::ipc::bind(&path).await.unwrap(), tx);
+        let (mut app, _log) = fake_app(Settings::default());
+        let client_path = path.clone();
+        let client = tokio::task::spawn_blocking(move || {
+            crate::ipc::call(&client_path, &crate::ipc::Request::Unread)
+        });
+        let ev = rx.recv().await.unwrap();
+        assert!(matches!(ev, Event::Ipc { .. }));
+        app.handle(ev);
+        let r = client.await.unwrap().unwrap();
+        assert!(r.ok);
+        assert_eq!(r.data["total"]["chats"], 3);
+        assert_eq!(r.data["total"]["messages"], 6);
+        assert_eq!(r.data["total"]["mentions"], 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn hook_entries(log: &td::RequestLog) -> Vec<String> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.starts_with("hook ["))
+            .cloned()
+            .collect()
+    }
+
+    fn hooked() -> (App, td::RequestLog) {
+        let mut settings = Settings::default();
+        settings.hooks.on_message = vec!["my-hook".to_owned(), "--flag".to_owned()];
+        fake_app(settings)
+    }
+
+    #[test]
+    fn message_hook_payload_for_a_group_mention() {
+        let (mut app, log) = hooked();
+        let mut m = msg(10, 77, 2);
+        m.mention = true;
+        m.date = 1_700_000_000;
+        m.body = RichText::plain("hello @me");
+        app.on_incoming(&m);
+        let entries = hook_entries(&log);
+        assert_eq!(entries.len(), 1);
+        let line = entries[0]
+            .strip_prefix("hook [\"my-hook\", \"--flag\"] ")
+            .unwrap();
+        let payload: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(
+            payload,
+            serde_json::json!({
+                "chat_id": 10,
+                "chat_title": "chat 10",
+                "chat_kind": "supergroup",
+                "sender_id": 2,
+                "sender_name": "Alice Smith",
+                "message_id": 77,
+                "date": 1_700_000_000,
+                "text": "hello @me",
+                "media": null,
+                "muted": false,
+                "mention": true,
+            })
+        );
+    }
+
+    #[test]
+    fn message_hook_is_off_without_a_command_and_skips_outgoing() {
+        let (mut app, log) = fake_app(Settings::default());
+        app.on_incoming(&msg(10, 1, 2));
+        assert!(hook_entries(&log).is_empty());
+        let (mut app, log) = hooked();
+        let mut mine = msg(10, 2, 1);
+        mine.outgoing = true;
+        app.on_incoming(&mine);
+        assert!(hook_entries(&log).is_empty());
+        app.on_incoming(&msg(30, 3, 2));
+        let entries = hook_entries(&log);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].contains("\"muted\":true"));
+    }
+
+    #[test]
+    fn message_hooks_are_capped_and_the_overflow_is_reported_once() {
+        let (mut app, log) = hooked();
+        for id in 1..=7 {
+            app.on_incoming(&msg(10, id, 2));
+        }
+        assert_eq!(hook_entries(&log).len(), crate::hooks::MAX_RUNNING);
+        let busy = app
+            .status_log
+            .iter()
+            .filter(|e| e.error && e.text.contains("hook is busy"))
+            .count();
+        assert_eq!(busy, 1);
+        app.handle(Event::Hook(Ok(())));
+        app.on_incoming(&msg(10, 8, 2));
+        assert_eq!(hook_entries(&log).len(), crate::hooks::MAX_RUNNING + 1);
+    }
+
+    #[test]
+    fn a_failed_hook_lands_in_the_status_log() {
+        let (mut app, _log) = hooked();
+        app.handle(Event::Hook(Err("hook my-hook: exit status: 3".to_owned())));
+        let last = app.status_log.back().unwrap();
+        assert!(last.error && last.text.contains("my-hook"));
+    }
+
     #[test]
     fn notifications_carry_avatar_and_sound() {
         let (mut app, log) = fake_app(Settings::default());
+        app.settings.notifications.actions = false;
         let entries = |log: &td::RequestLog, prefix: &str| -> Vec<String> {
             log.lock()
                 .unwrap()
@@ -10034,6 +10940,141 @@ mod tests {
         app.handle(Event::SoundFailed("pw-play failed".to_owned()));
         app.on_incoming(&msg(20, 11, 2));
         assert_eq!(entries(&log, "sound ").len(), 6);
+    }
+
+    fn lines(log: &td::RequestLog, prefix: &str) -> Vec<String> {
+        log.lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.starts_with(prefix))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn notification_records_its_target_only_with_actions() {
+        let (mut app, log) = fake_app(Settings::default());
+        let mut m = msg(10, 7, 2);
+        m.topic = Some(5);
+        app.on_incoming(&m);
+        assert_eq!(
+            lines(&log, "notify icon"),
+            ["notify icon None target 10 7 Some(5)"]
+        );
+        app.settings.notifications.actions = false;
+        app.on_incoming(&msg(20, 8, 2));
+        assert_eq!(
+            lines(&log, "notify icon").last().unwrap(),
+            "notify icon None"
+        );
+    }
+
+    #[test]
+    fn notification_read_action_marks_the_chat_read_even_in_ghost_mode() {
+        let (mut app, log) = fake_app(ghost());
+        app.settings.privacy.dont_mark_read = true;
+        app.chats.get_mut(&20).unwrap().last_message = Some(msg(20, 50, 2));
+        app.handle(Event::NotifyAction {
+            chat_id: 20,
+            msg_id: 50,
+            topic: None,
+            action: notify::Action::Read,
+        });
+        assert_eq!(lines(&log, "view 20").len(), 1, "{:?}", log.lock().unwrap());
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|(t, e)| !*e && t == "marked as read")
+        );
+    }
+
+    #[test]
+    fn notification_open_action_opens_the_chat() {
+        let (mut app, _log) = fake_app(Settings::default());
+        app.handle(Event::NotifyAction {
+            chat_id: 10,
+            msg_id: 30,
+            topic: None,
+            action: notify::Action::Open,
+        });
+        assert_eq!(app.open_chat, Some(10));
+        assert_eq!(app.pending_jump, Some((10, 30)));
+    }
+
+    #[test]
+    fn notification_reply_action_asks_for_text_and_sends_it() {
+        let (mut app, log) = fake_app(Settings::default());
+        app.settings.notifications.reply_command = vec!["ask".to_owned(), "{title}".to_owned()];
+        app.handle(Event::NotifyAction {
+            chat_id: 10,
+            msg_id: 30,
+            topic: Some(4),
+            action: notify::Action::Reply,
+        });
+        assert_eq!(
+            lines(&log, "reply prompt ["),
+            ["reply prompt [\"ask\", \"chat 10\"] target 10 30 Some(4)"]
+        );
+        assert!(app.status.is_none());
+        let reply = |chat_id, text: &str| Event::ReplyText {
+            chat_id,
+            msg_id: 30,
+            topic: Some(4),
+            text: text.to_owned(),
+        };
+        app.handle(reply(10, "  hi there \n"));
+        app.handle(reply(20, "private hi"));
+        app.handle(reply(20, "   "));
+        assert_eq!(
+            lines(&log, "send "),
+            [
+                "send 10 topic Some(4) reply Some(30) edit None",
+                "send 20 topic Some(4) reply None edit None"
+            ]
+        );
+    }
+
+    #[test]
+    fn notification_reply_is_refused_where_sending_is_not_allowed() {
+        let (mut app, log) = fake_app(Settings::default());
+        app.settings.notifications.reply_command = vec!["ask".to_owned()];
+        app.chats.get_mut(&10).unwrap().group_id = 5;
+        app.groups.insert(
+            5,
+            model::GroupMeta {
+                status: model::Membership::Left,
+                ..model::GroupMeta::default()
+            },
+        );
+        let why = app.cannot_send(10).expect("left supergroup");
+        app.handle(Event::NotifyAction {
+            chat_id: 10,
+            msg_id: 30,
+            topic: None,
+            action: notify::Action::Reply,
+        });
+        assert!(app.status.as_ref().is_some_and(|(t, e)| *e && t == why));
+        assert!(lines(&log, "reply prompt").is_empty());
+    }
+
+    #[test]
+    fn notification_reply_without_a_prompt_tool_opens_the_composer() {
+        let (mut app, log) = fake_app(Settings::default());
+        app.reply_tools = Some(Vec::new());
+        app.handle(Event::NotifyAction {
+            chat_id: 10,
+            msg_id: 30,
+            topic: None,
+            action: notify::Action::Reply,
+        });
+        assert!(lines(&log, "reply prompt").is_empty());
+        assert_eq!(app.open_chat, Some(10));
+        assert_eq!(app.composer.reply_to, Some(30));
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|(t, e)| !*e && t.contains("no reply prompt program found"))
+        );
     }
 
     #[test]
@@ -14052,6 +15093,80 @@ mod tests {
     }
 
     #[test]
+    fn copy_code_copies_one_block_directly() {
+        let (mut app, log) = fake_app(no_read());
+        open_with_history(&mut app, 10);
+        set_body(
+            &mut app,
+            10,
+            200,
+            "run this\nfn main() {}\nthen",
+            vec![entity(
+                9,
+                12,
+                model::EntityKind::Pre(Some("rust".to_owned())),
+            )],
+        );
+        select(&mut app, 10, 200);
+        press(&mut app, K::Char('Y'), M::NONE);
+        assert!(app.popup.is_none());
+        assert_eq!(logged(&log, "copy "), vec!["copy fn main() {}"]);
+    }
+
+    #[test]
+    fn copy_code_picks_among_several_blocks() {
+        let (mut app, log) = fake_app(no_read());
+        open_with_history(&mut app, 10);
+        set_body(
+            &mut app,
+            10,
+            200,
+            "a one two\nlet x = 1;",
+            vec![
+                entity(2, 3, model::EntityKind::Code),
+                entity(10, 10, model::EntityKind::Pre(Some("rust".to_owned()))),
+            ],
+        );
+        select(&mut app, 10, 200);
+        press(&mut app, K::Char('Y'), M::NONE);
+        let Some(Popup::CodePick { items, sel: 0 }) = &app.popup else {
+            panic!("no code list");
+        };
+        assert_eq!(items.len(), 2);
+        assert!(items[1].block && !items[0].block);
+        press(&mut app, K::Down, M::NONE);
+        press(&mut app, K::Enter, M::NONE);
+        assert!(app.popup.is_none());
+        assert_eq!(logged(&log, "copy "), vec!["copy let x = 1;"]);
+    }
+
+    #[test]
+    fn copy_code_without_code_says_so_and_menu_hides_it() {
+        let (mut app, log) = fake_app(no_read());
+        open_with_history(&mut app, 10);
+        select(&mut app, 10, 200);
+        press(&mut app, K::Char('Y'), M::NONE);
+        assert!(app.popup.is_none());
+        assert_eq!(
+            app.status.as_ref().map(|s| s.0.as_str()),
+            Some("no code in this message")
+        );
+        assert_eq!(count(&log, "copy "), 0);
+        press(&mut app, K::Enter, M::NONE);
+        assert!(!menu_keys(&app).contains('Z'));
+        press(&mut app, K::Esc, M::NONE);
+        set_body(
+            &mut app,
+            10,
+            200,
+            "x",
+            vec![entity(0, 1, model::EntityKind::Code)],
+        );
+        press(&mut app, K::Enter, M::NONE);
+        assert!(menu_keys(&app).contains('Z'));
+    }
+
+    #[test]
     fn telegram_links_skip_the_browser_and_hidden_ones_still_confirm_outside() {
         let (mut app, log) = fake_app(no_read());
         open_with_history(&mut app, 10);
@@ -15065,6 +16180,150 @@ mod tests {
     }
 
     #[test]
+    fn editing_keeps_underline_quote_and_code_language() {
+        let (mut app, _log) = fake_app(Settings::default());
+        open_with_history(&mut app, 10);
+        let body = RichText {
+            text: "quoted\nsome underline\nfn main() {}".to_owned(),
+            entities: vec![
+                Entity {
+                    offset: 0,
+                    length: 6,
+                    kind: EntityKind::Quote,
+                },
+                Entity {
+                    offset: 12,
+                    length: 9,
+                    kind: EntityKind::Underline,
+                },
+                Entity {
+                    offset: 22,
+                    length: 12,
+                    kind: EntityKind::Pre(Some("rust".to_owned())),
+                },
+            ],
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (td, _) = Td::recording(tx);
+        td.fetch_edit_text(10, 400, body.clone());
+        app.handle(rx.try_recv().expect("edit text event"));
+        assert_eq!(app.composer.edit, Some(400));
+        assert_eq!(crate::markup::parse(app.composer.input.text()).rich, body);
+    }
+
+    fn format_with(app: &mut App, key: char) {
+        press(app, K::Char('t'), M::CONTROL);
+        assert!(matches!(
+            app.popup,
+            Some(Popup::Menu {
+                title: "Format",
+                ..
+            })
+        ));
+        press(app, K::Char(key), M::NONE);
+        assert!(app.popup.is_none());
+        assert!(app.composer.active);
+    }
+
+    #[test]
+    fn format_menu_bolds_the_selection_and_toggles_it_off() {
+        let (mut app, _log) = fake_app(Settings::default());
+        open_with_history(&mut app, 10);
+        compose(&mut app, "say hello");
+        for _ in 0..5 {
+            press(&mut app, K::Left, M::SHIFT);
+        }
+        format_with(&mut app, 'b');
+        assert_eq!(app.composer.input.text(), "say **hello**");
+        assert_eq!(app.composer.input.selection(), Some((6, 11)));
+        format_with(&mut app, 'b');
+        assert_eq!(app.composer.input.text(), "say hello");
+        assert_eq!(app.composer.input.selection(), Some((4, 9)));
+    }
+
+    #[test]
+    fn format_menu_bold_without_selection_puts_the_cursor_between_markers() {
+        let (mut app, _log) = fake_app(Settings::default());
+        open_with_history(&mut app, 10);
+        compose(&mut app, "ab");
+        press(&mut app, K::Left, M::NONE);
+        format_with(&mut app, 'b');
+        assert_eq!(app.composer.input.text(), "a****b");
+        assert_eq!(app.composer.input.cursor(), 3);
+        press(&mut app, K::Char('x'), M::NONE);
+        assert_eq!(app.composer.input.text(), "a**x**b");
+    }
+
+    #[test]
+    fn format_menu_quotes_every_selected_line() {
+        let (mut app, _log) = fake_app(Settings::default());
+        open_with_history(&mut app, 10);
+        compose(&mut app, "one");
+        press(&mut app, K::Char('j'), M::CONTROL);
+        for c in "two".chars() {
+            press(&mut app, K::Char(c), M::NONE);
+        }
+        press(&mut app, K::Up, M::SHIFT);
+        press(&mut app, K::Home, M::SHIFT);
+        format_with(&mut app, 'q');
+        assert_eq!(app.composer.input.text(), "> one\n> two");
+    }
+
+    #[test]
+    fn format_menu_clears_markers_inside_the_selection() {
+        let (mut app, _log) = fake_app(Settings::default());
+        open_with_history(&mut app, 10);
+        compose(&mut app, "**a** and __b__");
+        press(&mut app, K::Home, M::SHIFT);
+        assert_eq!(app.composer.input.selection(), Some((0, 15)));
+        format_with(&mut app, 'x');
+        assert_eq!(app.composer.input.text(), "a and b");
+    }
+
+    #[test]
+    fn format_menu_link_leaves_the_cursor_for_the_url() {
+        let (mut app, _log) = fake_app(Settings::default());
+        open_with_history(&mut app, 10);
+        compose(&mut app, "site");
+        press(&mut app, K::Left, M::CONTROL | M::SHIFT);
+        format_with(&mut app, 'l');
+        for c in "https://e.com".chars() {
+            press(&mut app, K::Char(c), M::NONE);
+        }
+        assert_eq!(app.composer.input.text(), "[site](https://e.com)");
+    }
+
+    #[test]
+    fn format_menu_needs_the_composer() {
+        let (mut app, _log) = fake_app(Settings::default());
+        open_with_history(&mut app, 10);
+        press(&mut app, K::Char('t'), M::CONTROL);
+        assert!(app.popup.is_none());
+    }
+
+    #[test]
+    fn ctrl_x_asks_for_the_editor_only_in_the_composer() {
+        let (mut app, _log) = fake_app(Settings::default());
+        open_with_history(&mut app, 10);
+        press(&mut app, K::Char('x'), M::CONTROL);
+        assert!(!app.editor_request);
+        compose(&mut app, "draft");
+        press(&mut app, K::Char('x'), M::CONTROL);
+        assert!(app.editor_request);
+        assert_eq!(app.composer_text(), "draft");
+    }
+
+    #[test]
+    fn editor_text_replaces_the_composer_with_the_cursor_at_the_end() {
+        let (mut app, _log) = fake_app(Settings::default());
+        open_with_history(&mut app, 10);
+        compose(&mut app, "old");
+        app.apply_editor_text("line one\nline two");
+        assert_eq!(app.composer_text(), "line one\nline two");
+        assert!(app.composer.input.at_end());
+    }
+
+    #[test]
     fn forum_topics_keep_their_own_drafts() {
         let (mut app, log) = forum_app(Settings::default());
         app.open(40);
@@ -15369,5 +16628,568 @@ mod tests {
         assert_eq!(app.auth, Auth::Starting);
         press(&mut app, K::Char('q'), M::NONE);
         assert!(app.quitting);
+    }
+
+    fn track_attachment(kind: MediaKind, file_id: i32, path: &str) -> Attachment {
+        Attachment {
+            kind,
+            file: FileRef {
+                id: file_id,
+                done: !path.is_empty(),
+                path: path.to_owned(),
+                ..FileRef::default()
+            },
+            preview: None,
+            full: None,
+            mini: None,
+            width: 0,
+            height: 0,
+            duration: 30,
+            name: format!("f{file_id}.ogg"),
+            mime: "audio/ogg".to_owned(),
+            waveform: Vec::new(),
+        }
+    }
+
+    fn player_app(settings: Settings) -> (App, td::RequestLog) {
+        let (mut app, log) = fake_app(settings);
+        open_with_history(&mut app, 10);
+        let tracks = [
+            (50, MediaKind::Voice, 1, "/v/50.ogg"),
+            (60, MediaKind::Voice, 2, ""),
+            (70, MediaKind::Photo, 3, "/v/70.jpg"),
+            (80, MediaKind::VideoNote, 4, ""),
+            (90, MediaKind::Audio, 5, "/v/90.mp3"),
+            (100, MediaKind::Audio, 6, ""),
+        ];
+        let h = app.histories.get_mut(&10).unwrap();
+        for (id, kind, file, path) in tracks {
+            let m = h.get_mut(id).unwrap();
+            let mut att = track_attachment(kind, file, path);
+            if kind == MediaKind::Photo {
+                att.mini = Some(std::sync::Arc::from(vec![1u8]));
+            }
+            m.attachments.push(att);
+            if kind == MediaKind::Audio {
+                m.media = Some(format!("♪ Artist – Song {id}"));
+            }
+        }
+        for (_, _, file, path) in tracks {
+            if !path.is_empty() {
+                app.on_file(FileRef {
+                    id: file,
+                    done: true,
+                    path: path.to_owned(),
+                    ..FileRef::default()
+                });
+            }
+        }
+        (app, log)
+    }
+
+    fn select_msg(app: &mut App, id: i64) {
+        app.focus = Pane::Messages;
+        app.msg_sel = app.histories[&10].index_of(id);
+        assert!(app.msg_sel.is_some());
+    }
+
+    fn queued_ids(app: &App) -> Vec<i64> {
+        app.bg.queue().iter().map(|t| t.msg_id).collect()
+    }
+
+    #[test]
+    fn v_on_a_voice_message_plays_in_the_background_with_the_following_voices_queued() {
+        let (mut app, log) = player_app(Settings::default());
+        select_msg(&mut app, 50);
+        press(&mut app, K::Char('v'), M::NONE);
+        assert!(!matches!(app.popup, Some(Popup::Viewer { .. })));
+        assert_eq!(queued_ids(&app), [50, 60, 80]);
+        assert_eq!(app.bg.index(), 0);
+        assert_eq!(app.bg.fake_log(), ["release", "load /v/50.ogg speed 1"]);
+        assert_eq!(logged(&log, "open content"), ["open content 10 50"]);
+    }
+
+    #[test]
+    fn v_on_an_audio_file_queues_only_audio_files() {
+        let (mut app, log) = player_app(Settings::default());
+        select_msg(&mut app, 90);
+        press(&mut app, K::Char('v'), M::NONE);
+        assert_eq!(queued_ids(&app), [90, 100]);
+        assert_eq!(app.bg.track().unwrap().title, "Artist – Song 90");
+        assert!(logged(&log, "open content").is_empty());
+    }
+
+    #[test]
+    fn listening_respects_ghost_mode_and_dont_mark_read() {
+        for settings in [ghost(), no_read()] {
+            let (mut app, log) = player_app(settings);
+            select_msg(&mut app, 50);
+            press(&mut app, K::Char('v'), M::NONE);
+            assert!(app.bg.loaded());
+            assert!(logged(&log, "open content").is_empty());
+        }
+    }
+
+    #[test]
+    fn photos_still_open_the_viewer() {
+        let (mut app, _log) = player_app(Settings::default());
+        select_msg(&mut app, 70);
+        press(&mut app, K::Char('v'), M::NONE);
+        assert!(matches!(app.popup, Some(Popup::Viewer { .. })));
+        assert!(!app.bg.active());
+    }
+
+    #[test]
+    fn a_finished_track_advances_and_downloads_the_next_one_first() {
+        let (mut app, log) = player_app(Settings::default());
+        select_msg(&mut app, 50);
+        press(&mut app, K::Char('v'), M::NONE);
+        app.bg.fake_mut().unwrap().status.eof = true;
+        app.handle(Event::Audio);
+        assert_eq!(app.bg.index(), 1);
+        assert!(!app.bg.loaded());
+        assert!(app.media.download_wanted(2));
+        assert!(
+            app.file_jobs
+                .contains(&(2, FileJob::Background((60, 0))))
+        );
+        app.on_file(FileRef {
+            id: 2,
+            done: true,
+            path: "/v/60.ogg".to_owned(),
+            ..FileRef::default()
+        });
+        assert!(app.bg.loaded());
+        assert!(app.bg.fake_log().contains(&"load /v/60.ogg speed 1".to_owned()));
+        assert_eq!(logged(&log, "open content"), ["open content 10 50", "open content 10 60"]);
+        app.bg.fake_mut().unwrap().status.eof = true;
+        app.handle(Event::Audio);
+        app.on_file(FileRef {
+            id: 4,
+            done: true,
+            path: "/v/80.mp4".to_owned(),
+            ..FileRef::default()
+        });
+        assert_eq!(app.bg.index(), 2);
+        app.bg.fake_mut().unwrap().status.eof = true;
+        app.handle(Event::Audio);
+        assert!(!app.bg.active(), "the end of the queue stops the player");
+    }
+
+    #[test]
+    fn the_queue_keeps_playing_when_another_chat_is_opened() {
+        let (mut app, _log) = player_app(Settings::default());
+        select_msg(&mut app, 50);
+        press(&mut app, K::Char('v'), M::NONE);
+        open_with_history(&mut app, 20);
+        assert_eq!(app.bg.chat_id(), Some(10));
+        assert_eq!(queued_ids(&app), [50, 60, 80]);
+    }
+
+    #[test]
+    fn player_actions_pause_seek_cycle_speed_skip_and_stop() {
+        let (mut app, _log) = player_app(Settings::default());
+        select_msg(&mut app, 50);
+        press(&mut app, K::Char('v'), M::NONE);
+        leader(&mut app, '.');
+        assert!(app.bg.paused());
+        leader(&mut app, '.');
+        assert!(!app.bg.paused());
+        leader(&mut app, 'l');
+        leader(&mut app, 'h');
+        leader(&mut app, '>');
+        assert_eq!(app.bg.speed(), 1.25);
+        assert_eq!(app.settings.media.voice_speed, 125);
+        leader(&mut app, '>');
+        leader(&mut app, '>');
+        leader(&mut app, '>');
+        assert_eq!(app.bg.speed(), 1.0);
+        let log = app.bg.fake_log();
+        assert!(log.contains(&"seek 5 relative".to_owned()));
+        assert!(log.contains(&"seek -5 relative".to_owned()));
+        assert!(log.contains(&"set speed 1.25".to_owned()));
+        leader(&mut app, ']');
+        assert_eq!(app.bg.index(), 1);
+        leader(&mut app, '[');
+        assert_eq!(app.bg.index(), 0);
+        leader(&mut app, 'x');
+        assert!(!app.bg.active());
+    }
+
+    #[test]
+    fn voice_speed_is_remembered_for_voices_but_not_for_music() {
+        let mut settings = Settings::default();
+        settings.media.voice_speed = 150;
+        let (mut app, _log) = player_app(settings);
+        select_msg(&mut app, 50);
+        press(&mut app, K::Char('v'), M::NONE);
+        assert_eq!(app.bg.speed(), 1.5);
+        assert!(app.bg.fake_log().contains(&"load /v/50.ogg speed 1.5".to_owned()));
+        select_msg(&mut app, 90);
+        press(&mut app, K::Char('v'), M::NONE);
+        assert_eq!(app.bg.speed(), 1.0);
+        leader(&mut app, '>');
+        assert_eq!(app.settings.media.voice_speed, 150);
+    }
+
+    #[test]
+    fn opening_the_viewer_on_a_sound_pauses_the_background_player() {
+        let (mut app, _log) = player_app(Settings::default());
+        select_msg(&mut app, 50);
+        press(&mut app, K::Char('v'), M::NONE);
+        assert!(!app.bg.paused());
+        app.open_viewer(10, vec![(70, 0)], 0);
+        assert!(!app.bg.paused(), "a photo is silent");
+        app.open_viewer(10, vec![(80, 0)], 0);
+        assert!(app.bg.paused());
+    }
+
+    #[test]
+    fn quitting_and_logging_out_stop_the_background_player() {
+        let (mut app, _log) = player_app(Settings::default());
+        select_msg(&mut app, 50);
+        press(&mut app, K::Char('v'), M::NONE);
+        app.request_quit();
+        assert!(!app.bg.active());
+    }
+
+    #[test]
+    fn player_actions_are_hidden_while_nothing_plays() {
+        let (mut app, _log) = player_app(Settings::default());
+        assert!(!app.action_possible(Action::PlayerPause, None));
+        select_msg(&mut app, 50);
+        press(&mut app, K::Char('v'), M::NONE);
+        assert!(app.action_possible(Action::PlayerPause, None));
+    }
+
+    #[test]
+    fn options_cycle_the_voice_speed_and_toggle_mpris() {
+        let (mut app, _log) = fake_app(Settings::default());
+        leader(&mut app, 'o');
+        assert_eq!(app.option_value(VOICE_SPEED_OPTION), "1×");
+        assert_eq!(app.option_value(MPRIS_OPTION), "[x]");
+        pick_option(&mut app, VOICE_SPEED_OPTION);
+        assert_eq!(app.option_value(VOICE_SPEED_OPTION), "1.25×");
+        assert_eq!(app.settings.media.voice_speed, 125);
+        pick_option(&mut app, MPRIS_OPTION);
+        assert!(!app.settings.media.mpris);
+        for _ in 0..3 {
+            pick_option(&mut app, VOICE_SPEED_OPTION);
+        }
+        assert_eq!(app.settings.media.voice_speed, 100);
+    }
+    fn stt_settings() -> Settings {
+        let mut s = Settings::default();
+        s.transcription.command = vec!["stt".to_owned(), "--lang".to_owned(), "{lang}".to_owned(), "{file}".to_owned()];
+        s.transcription.language = "ru".to_owned();
+        s
+    }
+
+    fn transcript_view(app: &App, id: i64) -> Option<String> {
+        let m = app.histories[&10].get(id).unwrap();
+        app.transcripts.view(m).map(|v| match v {
+            transcripts::View::Working { .. } => "working".to_owned(),
+            transcripts::View::Text(t) => t.to_owned(),
+        })
+    }
+
+    fn transcribe_log(log: &td::RequestLog) -> Vec<String> {
+        logged(log, "transcribe ")
+    }
+
+    #[test]
+    fn transcribe_without_any_tool_reports_how_to_configure_one() {
+        let (mut app, log) = player_app(Settings::default());
+        app.transcripts.probe = |_| false;
+        select_msg(&mut app, 50);
+        press(&mut app, K::Char('T'), M::SHIFT);
+        let (text, error) = app.status.clone().unwrap();
+        assert!(error);
+        assert_eq!(
+            text,
+            "no speech-to-text program found (whisper, whisper-ctranslate2); set [transcription] command"
+        );
+        assert!(transcribe_log(&log).is_empty());
+        assert_eq!(transcript_view(&app, 50), None);
+    }
+
+    #[test]
+    fn transcribe_runs_the_configured_command_and_toggles_the_result() {
+        let (mut app, log) = player_app(stt_settings());
+        select_msg(&mut app, 50);
+        press(&mut app, K::Char('T'), M::SHIFT);
+        assert_eq!(transcribe_log(&log), ["transcribe 10 50 stt --lang ru /v/50.ogg"]);
+        assert_eq!(transcript_view(&app, 50).as_deref(), Some("working"));
+        press(&mut app, K::Char('T'), M::SHIFT);
+        assert_eq!(transcribe_log(&log).len(), 1);
+        app.handle(Event::Transcript {
+            chat_id: 10,
+            msg_id: 50,
+            result: Ok("hello there".to_owned()),
+        });
+        assert_eq!(transcript_view(&app, 50).as_deref(), Some("hello there"));
+        press(&mut app, K::Char('T'), M::SHIFT);
+        assert_eq!(transcript_view(&app, 50), None);
+        press(&mut app, K::Char('T'), M::SHIFT);
+        assert_eq!(transcript_view(&app, 50).as_deref(), Some("hello there"));
+        assert_eq!(transcribe_log(&log).len(), 1);
+    }
+
+    #[test]
+    fn transcribe_downloads_first_and_runs_one_at_a_time_in_order() {
+        let (mut app, log) = player_app(stt_settings());
+        select_msg(&mut app, 60);
+        press(&mut app, K::Char('T'), M::SHIFT);
+        assert!(app.file_jobs.contains(&(2, FileJob::Transcribe(10, 60))));
+        assert!(transcribe_log(&log).is_empty());
+        select_msg(&mut app, 50);
+        press(&mut app, K::Char('T'), M::SHIFT);
+        assert_eq!(transcribe_log(&log), ["transcribe 10 50 stt --lang ru /v/50.ogg"]);
+        app.on_file(FileRef {
+            id: 2,
+            done: true,
+            path: "/v/60.ogg".to_owned(),
+            ..FileRef::default()
+        });
+        assert_eq!(transcribe_log(&log).len(), 1);
+        assert_eq!(transcript_view(&app, 60).as_deref(), Some("working"));
+        app.handle(Event::Transcript {
+            chat_id: 10,
+            msg_id: 50,
+            result: Ok("first".to_owned()),
+        });
+        assert_eq!(
+            transcribe_log(&log),
+            [
+                "transcribe 10 50 stt --lang ru /v/50.ogg",
+                "transcribe 10 60 stt --lang ru /v/60.ogg"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_failed_transcription_reports_and_leaves_the_working_state() {
+        let (mut app, _log) = player_app(stt_settings());
+        select_msg(&mut app, 50);
+        press(&mut app, K::Char('T'), M::SHIFT);
+        app.handle(Event::Transcript {
+            chat_id: 10,
+            msg_id: 50,
+            result: Err("stt failed: no model".to_owned()),
+        });
+        assert_eq!(transcript_view(&app, 50), None);
+        let (text, error) = app.status.clone().unwrap();
+        assert!(error);
+        assert!(text.contains("no model"), "{text}");
+        press(&mut app, K::Char('T'), M::SHIFT);
+        assert_eq!(transcript_view(&app, 50).as_deref(), Some("working"));
+    }
+
+    #[test]
+    fn a_failed_download_clears_the_working_state() {
+        let (mut app, log) = player_app(stt_settings());
+        select_msg(&mut app, 60);
+        press(&mut app, K::Char('T'), M::SHIFT);
+        assert_eq!(transcript_view(&app, 60).as_deref(), Some("working"));
+        app.handle(Event::DownloadFailed {
+            file_id: 2,
+            error: "offline".to_owned(),
+        });
+        assert_eq!(transcript_view(&app, 60), None);
+        assert!(transcribe_log(&log).is_empty());
+    }
+
+    #[test]
+    fn transcripts_persist_except_for_protected_chats() {
+        let dir = std::env::temp_dir().join(format!("gramtty-app-transcripts-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("transcripts.json");
+        let (mut app, _log) = player_app(stt_settings());
+        app.open_transcripts(path.clone());
+        app.transcripts.work(10, 50);
+        app.on_transcript(10, 50, Ok("kept".to_owned()));
+        app.chats.get_mut(&10).unwrap().protected = true;
+        app.transcripts.work(10, 60);
+        app.on_transcript(10, 60, Ok("private".to_owned()));
+        let saved = std::fs::read_to_string(&path).unwrap();
+        assert!(saved.contains("\"10:50\":\"kept\""), "{saved}");
+        assert!(!saved.contains("private"), "{saved}");
+        assert_eq!(transcript_view(&app, 60).as_deref(), Some("private"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn working_status_of(app: &App, id: i64) -> Option<(String, String)> {
+        let m = app.histories[&10].get(id).unwrap();
+        match app.transcripts.view(m) {
+            Some(transcripts::View::Working { partial, status }) => {
+                Some((partial.to_owned(), status))
+            }
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn partial_events_update_the_running_job_and_are_ignored_otherwise() {
+        let (mut app, _log) = player_app(stt_settings());
+        let partial = |app: &mut App, id: i64, text: &str, secs: Option<f64>| {
+            app.handle(Event::TranscriptPartial {
+                chat_id: 10,
+                msg_id: id,
+                text_so_far: text.to_owned(),
+                done_secs: secs,
+            });
+        };
+        partial(&mut app, 50, "early", None);
+        assert_eq!(working_status_of(&app, 50), None);
+        assert!(app.transcripts.is_empty());
+        select_msg(&mut app, 50);
+        press(&mut app, K::Char('T'), M::SHIFT);
+        let (text, status) = working_status_of(&app, 50).unwrap();
+        assert_eq!(text, "");
+        assert!(status.starts_with("transcribing… loading model"), "{status}");
+        partial(&mut app, 50, "hello", Some(1.0));
+        let (text, status) = working_status_of(&app, 50).unwrap();
+        assert_eq!(text, "hello");
+        assert!(status.starts_with("transcribing… "), "{status}");
+        partial(&mut app, 60, "other", None);
+        assert_eq!(working_status_of(&app, 60), None);
+        assert!(app.tick_interval().is_some());
+        app.handle(Event::Transcript {
+            chat_id: 10,
+            msg_id: 50,
+            result: Ok("hello there".to_owned()),
+        });
+        partial(&mut app, 50, "late", None);
+        assert_eq!(transcript_view(&app, 50).as_deref(), Some("hello there"));
+        assert_eq!(app.transcribe_tick(), None);
+    }
+
+    #[test]
+    fn progress_is_a_percentage_clamped_below_one_hundred() {
+        use transcripts::percent;
+        assert_eq!(percent(18.0, 40), Some(45));
+        assert_eq!(percent(0.0, 40), Some(0));
+        assert_eq!(percent(40.0, 40), Some(99));
+        assert_eq!(percent(55.0, 40), Some(99));
+        assert_eq!(percent(5.0, 0), None);
+        assert_eq!(percent(-1.0, 10), None);
+    }
+
+    #[test]
+    fn the_menu_hides_transcribe_without_a_tool_and_probes_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static PROBES: AtomicUsize = AtomicUsize::new(0);
+        let (mut app, _log) = player_app(Settings::default());
+        app.transcripts.probe = |_| {
+            PROBES.fetch_add(1, Ordering::SeqCst);
+            false
+        };
+        let offered = |app: &mut App| {
+            select_msg(app, 50);
+            app.message_menu()
+                .iter()
+                .any(|i| i.action == MenuAction::Transcribe)
+        };
+        assert!(!offered(&mut app));
+        let probes = PROBES.load(Ordering::SeqCst);
+        assert!(probes > 0);
+        assert!(!offered(&mut app));
+        assert!(!app.action_possible(Action::Transcribe, Some(&app.message_menu())));
+        assert_eq!(PROBES.load(Ordering::SeqCst), probes);
+        app.transcripts.probe = |t| t == "whisper";
+        app.settings.transcription.command = vec!["stt".to_owned()];
+        assert!(offered(&mut app));
+    }
+
+    #[test]
+    fn the_menu_offers_transcribe_for_voice_and_video_notes_only() {
+        let (mut app, _log) = player_app(stt_settings());
+        let offered = |app: &mut App, id: i64| {
+            select_msg(app, id);
+            app.message_menu()
+                .iter()
+                .any(|i| i.action == MenuAction::Transcribe)
+        };
+        assert!(offered(&mut app, 50));
+        assert!(offered(&mut app, 80));
+        assert!(!offered(&mut app, 70));
+        assert!(!offered(&mut app, 90));
+        assert!(!offered(&mut app, 10));
+    }
+
+    #[test]
+    fn logging_out_forgets_transcripts() {
+        let (mut app, _log) = player_app(stt_settings());
+        app.transcripts.work(10, 50);
+        app.on_transcript(10, 50, Ok("x".to_owned()));
+        assert!(!app.transcripts.is_empty());
+        app.reset_session();
+        assert!(app.transcripts.is_empty());
+    }
+    fn search_ids(app: &App) -> Vec<i64> {
+        match &app.popup {
+            Some(Popup::Search(sv)) => sv.results.iter().map(|m| m.id).collect(),
+            _ => panic!("search closed"),
+        }
+    }
+
+    fn search_token(app: &App) -> u64 {
+        match &app.popup {
+            Some(Popup::Search(sv)) => sv.token,
+            _ => panic!("search closed"),
+        }
+    }
+
+    #[test]
+    fn chat_search_also_finds_cached_transcripts_without_duplicates() {
+        let (mut app, log) = player_app(stt_settings());
+        app.transcripts.work(10, 50);
+        app.on_transcript(10, 50, Ok("Meet at the Old Station".to_owned()));
+        app.transcripts.work(10, 60);
+        app.on_transcript(10, 60, Ok("nothing relevant".to_owned()));
+        app.transcripts.work(10, 80);
+        app.on_transcript(10, 80, Ok("the station again".to_owned()));
+        app.focus = Pane::Messages;
+        press(&mut app, K::Char('/'), M::NONE);
+        type_query(&mut app, "station");
+        app.flush_search(later());
+        assert_eq!(count(&log, "search"), 1);
+        let token = search_token(&app);
+        app.handle(Event::Search {
+            token,
+            result: Ok(td::Found {
+                msgs: vec![msg(10, 300, 2), msg(10, 80, 2), msg(10, 20, 2)],
+                next: None,
+                total: 3,
+            }),
+        });
+        assert_eq!(search_ids(&app), [300, 80, 50, 20]);
+        match &app.popup {
+            Some(Popup::Search(sv)) => assert_eq!(sv.total, 4),
+            _ => panic!("search closed"),
+        }
+    }
+
+    #[test]
+    fn transcript_matches_wait_for_their_page_while_more_pages_follow() {
+        let (mut app, _log) = player_app(stt_settings());
+        app.transcripts.work(10, 150);
+        app.on_transcript(10, 150, Ok("station".to_owned()));
+        app.transcripts.work(10, 90);
+        app.on_transcript(10, 90, Ok("station".to_owned()));
+        app.focus = Pane::Messages;
+        press(&mut app, K::Char('/'), M::NONE);
+        type_query(&mut app, "station");
+        app.flush_search(later());
+        let token = search_token(&app);
+        app.handle(Event::Search {
+            token,
+            result: Ok(td::Found {
+                msgs: vec![msg(10, 300, 2), msg(10, 100, 2)],
+                next: Some(td::Cursor::From(100)),
+                total: 5,
+            }),
+        });
+        assert_eq!(search_ids(&app), [300, 150, 100]);
     }
 }

@@ -3,7 +3,7 @@ use crossterm::{execute, queue};
 use ratatui::backend::{Backend, ClearType, CrosstermBackend, WindowSize};
 use ratatui::buffer::{Buffer, Cell, CellDiffOption, CellWidth};
 use ratatui::layout::{Constraint, Layout, Position, Rect, Size};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
@@ -23,6 +23,8 @@ use std::time::Duration;
 use ratatui_image::sliced::{SignedPosition, SlicedImage, SlicedProtocol};
 
 use crate::format::{self, render_text};
+use crate::input::TextInput;
+use crate::markup;
 use crate::media::{self, Input, Key, Look, Media, Src, album_layout, fit_cells, layout_height};
 use crate::model::{self, Attachment, ChatKind, Decode, MediaKind, Msg, SendState, Sender, Visual};
 use crate::popups::draw as draw_stage4_popup;
@@ -211,6 +213,15 @@ fn paint(frame: &mut Frame, app: &mut App) {
     app.refresh_lists();
     let [header, main] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(area);
     draw_header(frame, header, app);
+    let bar = app.bg.bar();
+    let [main, bar_row] = Layout::vertical([
+        Constraint::Min(0),
+        Constraint::Length(u16::from(bar.is_some())),
+    ])
+    .areas(main);
+    if let Some(bar) = &bar {
+        draw_player_bar(frame, bar_row, bar);
+    }
     let [fw, cw, iw] = pane_widths(main.width, app, &th.layout);
     let [folders, chats, messages, info] = Layout::horizontal([
         Constraint::Length(fw),
@@ -225,7 +236,7 @@ fn paint(frame: &mut Frame, app: &mut App) {
     if cw > 0 {
         draw_chats(frame, chats, app);
     }
-    draw_messages(frame, messages, app);
+    draw_message_area(frame, messages, app);
     if iw > 0 {
         draw_info(frame, info, app);
     }
@@ -238,6 +249,12 @@ fn paint(frame: &mut Frame, app: &mut App) {
         draw_profile_avatar(frame, area, app);
     }
     draw_key_hint(frame, main, app);
+}
+
+fn draw_player_bar(frame: &mut Frame, area: Rect, bar: &crate::audio::BarState) {
+    let text = crate::audio::bar_text(bar, area.width.saturating_sub(2) as usize);
+    let line = Line::from(Span::styled(format!(" {text}"), theme::status()));
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 const MIN_MESSAGES: u16 = 30;
@@ -284,6 +301,10 @@ fn pane_widths(total: u16, app: &App, l: &theme::LayoutOptions) -> [u16; 3] {
 }
 
 fn pane_block(title: String, focused: bool) -> Block<'static> {
+    pane_block_hinted(title, String::new(), focused)
+}
+
+fn pane_block_hinted(title: String, hint: String, focused: bool) -> Block<'static> {
     let style = if focused {
         theme::focus_border()
     } else {
@@ -294,7 +315,10 @@ fn pane_block(title: String, focused: bool) -> Block<'static> {
         .borders(Borders::ALL)
         .border_set(theme::border_set())
         .border_style(style)
-        .title(Span::styled(format::sanitize(&title), title_style))
+        .title(Line::from(vec![
+            Span::styled(format::sanitize(&title), title_style),
+            Span::styled(hint, theme::border()),
+        ]))
 }
 
 fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
@@ -369,6 +393,29 @@ fn draw_header(frame: &mut Frame, area: Rect, app: &App) {
         }
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn composer_keys_hint(app: &App, width: u16) -> Option<String> {
+    use crate::keymap::Action;
+    let items = [
+        Some(("<C-o>".to_owned(), "file")),
+        Some(("<C-v>".to_owned(), "paste")),
+        Some(("<C-r>".to_owned(), "voice")),
+        app.keymap.label_for(Action::FormatText).map(|k| (k, "format")),
+        app.keymap.label_for(Action::EditInEditor).map(|k| (k, "editor")),
+        Some(("<C-s>".to_owned(), "stickers")),
+        Some(("<C-g>".to_owned(), "GIFs")),
+    ];
+    let mut parts: Vec<String> = items
+        .into_iter()
+        .flatten()
+        .map(|(key, name)| format!("{key} {name}"))
+        .collect();
+    let room = usize::from(width).saturating_sub(2);
+    while !parts.is_empty() && format::cells(&format!(" {} ", parts.join(" · "))) > room {
+        parts.pop();
+    }
+    (!parts.is_empty()).then(|| format!(" {} ", parts.join(" · ")))
 }
 
 fn split_filter(area: Rect, active: bool) -> (Rect, Option<Rect>) {
@@ -969,6 +1016,61 @@ fn push_text(
     }
 }
 
+fn push_transcript(
+    app: &App,
+    m: &Msg,
+    width: usize,
+    body: &mut Vec<Line<'static>>,
+    texts: &mut Vec<TextPlace>,
+) {
+    use crate::app::transcripts::View;
+    match app.transcripts.view(m) {
+        None => {}
+        Some(View::Working { partial, status }) => {
+            if !partial.is_empty() {
+                push_transcript_rows(partial, true, width, body, texts);
+            }
+            body.push(Line::from(Span::styled(
+                format::truncate(&status, width),
+                theme::muted(),
+            )));
+        }
+        Some(View::Text(text)) => push_transcript_rows(text, false, width, body, texts),
+    }
+}
+
+fn push_transcript_rows(
+    text: &str,
+    unfinished: bool,
+    width: usize,
+    body: &mut Vec<Line<'static>>,
+    texts: &mut Vec<TextPlace>,
+) {
+    let lead = 2;
+    let tail = if unfinished { 2 } else { 0 };
+    let rt = model::RichText::plain(text.to_owned());
+    let rows = format::render_rows(
+        &rt,
+        theme::normal(),
+        width.saturating_sub(lead + tail).max(1),
+    );
+    let last = rows.len().saturating_sub(1);
+    for (i, (mut line, wrap)) in rows.into_iter().enumerate() {
+        let marker = if i == 0 { "“ " } else { "  " };
+        line.spans.insert(0, Span::styled(marker, theme::muted()));
+        if unfinished && i == last {
+            line.spans.push(Span::styled(" …", theme::muted()));
+        }
+        texts.push(TextPlace {
+            line: body.len(),
+            col: (wrap.indent + lead) as u16,
+            width: wrap.width as u16,
+            join: wrap.join,
+        });
+        body.push(line);
+    }
+}
+
 const PHOTO_COLS: u16 = 60;
 const PHOTO_ROWS: u16 = 15;
 const STICKER_COLS: u16 = 32;
@@ -1431,6 +1533,7 @@ fn group_content(
                 body.push(line);
             }
         }
+        push_transcript(app, g, inner, body, &mut texts);
         if g.attachments.is_empty()
             && let Some(media) = &g.media
         {
@@ -1726,32 +1829,114 @@ fn composer_height(app: &App, width: usize) -> u16 {
     (lines.min(8) + 2 + extra) as u16
 }
 
-fn draw_messages(frame: &mut Frame, area: Rect, app: &mut App) {
-    let focused = app.focus == Pane::Messages;
+const SPLIT_MIN_WIDTH: u16 = 100;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SplitDraw {
+    Off,
+    Parked,
+    Hidden,
+}
+
+fn draw_message_area(frame: &mut Frame, area: Rect, app: &mut App) {
+    if app.side.is_none() {
+        draw_messages(frame, area, app, SplitDraw::Off);
+        return;
+    }
+    if area.width < SPLIT_MIN_WIDTH {
+        draw_messages(frame, area, app, SplitDraw::Hidden);
+        return;
+    }
+    let first = (area.width - 1) / 2;
+    let second = area.width - 1 - first;
+    let left = Rect::new(area.x, area.y, first, area.height);
+    let right = Rect::new(area.x + first + 1, area.y, second, area.height);
+    let (parked, live) = if app.side_left {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    draw_parked(frame, parked, app);
+    draw_messages(frame, live, app, SplitDraw::Off);
+}
+
+fn draw_parked(frame: &mut Frame, area: Rect, app: &mut App) {
+    let height = app.msg_view_height;
+    let width = app.msg_view_width;
+    let visible = std::mem::take(&mut app.visible_msgs);
+    let want_older = app.want_older;
+    let animating = app.animating;
+    let redraw_due = app.redraw_due;
+    let recording = app.recording.take();
+    app.swap_side();
+    let active = std::mem::replace(&mut app.composer.active, false);
+    textmap::hit(area, Hit::Side);
+    draw_messages(frame, area, app, SplitDraw::Parked);
+    app.composer.active = active;
+    app.swap_side();
+    app.recording = recording;
+    app.redraw_due = redraw_due;
+    app.animating = animating;
+    app.want_older = want_older;
+    app.visible_msgs = visible;
+    app.msg_view_width = width;
+    app.msg_view_height = height;
+}
+
+fn draw_messages(frame: &mut Frame, area: Rect, app: &mut App, split: SplitDraw) {
+    let parked = split == SplitDraw::Parked;
+    let focused = !parked && app.focus == Pane::Messages;
     let title = app.view_title();
     let title = match app.open_chat.and_then(|id| app.chat_subtitle(id)) {
         Some(sub) => format!("{title} · {sub}"),
         None => title,
     };
-    let block = pane_block(
-        format!(
-            " {} ",
-            format::truncate(&title, area.width.saturating_sub(4) as usize)
-        ),
+    let marker = match (split, app.side_title()) {
+        (SplitDraw::Hidden, Some(other)) => format!(" [split: {}]", format::sanitize(&other)),
+        _ => String::new(),
+    };
+    let hint = match split {
+        SplitDraw::Parked => app
+            .keymap
+            .label_for(crate::keymap::Action::SplitFocus)
+            .map(|k| format!(" · {k} switch"))
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+    let hint = format::truncate(&hint, (area.width as usize).saturating_sub(4) / 2);
+    let room = (area.width as usize)
+        .saturating_sub(4)
+        .saturating_sub(format::cells(&marker))
+        .saturating_sub(format::cells(&hint));
+    let end = if hint.is_empty() { " " } else { "" };
+    let block = pane_block_hinted(
+        format!(" {}{marker}{end}", format::truncate(&title, room)),
+        if hint.is_empty() { String::new() } else { format!("{hint} ") },
         focused,
     );
     let inner = block.inner(area);
     frame.render_widget(block, area);
-    textmap::area(Zone::Pane(Pane::Messages), area);
+    textmap::area(
+        if parked {
+            Zone::Side
+        } else {
+            Zone::Pane(Pane::Messages)
+        },
+        area,
+    );
     let ch = composer_height(app, inner.width as usize);
     let [list, composer] =
         Layout::vertical([Constraint::Min(0), Constraint::Length(ch)]).areas(inner);
     app.msg_view_height = list.height as usize;
-    draw_message_list(frame, list, app);
+    draw_message_list(frame, list, app, parked);
     if ch > 0 {
-        textmap::hit(composer, Hit::Composer);
+        if !parked {
+            textmap::hit(composer, Hit::Composer);
+        }
         draw_composer(frame, composer, app);
-        draw_command_suggestions(frame, list, app);
+        if !parked {
+            draw_command_suggestions(frame, list, app);
+        }
     }
 }
 
@@ -1935,6 +2120,7 @@ fn fingerprint(
             app.media.file_error(a.file.id).hash(&mut h);
         }
         button_focus(app, m.chat_id, m.id, true).hash(&mut h);
+        app.transcripts.view(m).hash(&mut h);
         for r in m.reactions.iter().filter(|r| r.custom != 0) {
             app.custom_emoji.get(&r.custom).hash(&mut h);
         }
@@ -2497,7 +2683,7 @@ pub fn lines_from(app: &mut App, chat_id: i64, from: usize) -> usize {
     total
 }
 
-fn draw_message_list(frame: &mut Frame, area: Rect, app: &mut App) {
+fn draw_message_list(frame: &mut Frame, area: Rect, app: &mut App, parked: bool) {
     let Some(chat_id) = app.open_chat else {
         let hint = Line::from(vec![
             Span::styled("  Select a chat and press ", theme::muted()),
@@ -2737,10 +2923,14 @@ fn draw_message_list(frame: &mut Frame, area: Rect, app: &mut App) {
     }
     let overlay = app.popup.is_some() || !app.pending.is_empty();
     let sel = sel_group.map(|g| groups[g].clone());
-    let animate = pick_animations(app, msgs, &placed, sel, |abs, rows| {
-        let y = pad as isize + abs as isize - first_line as isize;
-        y + rows as isize > 0 && y < height as isize
-    });
+    let animate = if parked {
+        std::collections::HashSet::new()
+    } else {
+        pick_animations(app, msgs, &placed, sel, |abs, rows| {
+            let y = pad as isize + abs as isize - first_line as isize;
+            y + rows as isize > 0 && y < height as isize
+        })
+    };
     let still = app.media.anim.paused() || (overlay && !app.media.anim.native());
     let now = app.chat_freeze.at(app.anim_start.elapsed(), still);
     let mut head = crate::anim::Playhead::new(now, animate.len(), still);
@@ -3453,11 +3643,8 @@ fn draw_composer(frame: &mut Frame, area: Rect, app: &App) {
             " Tab attachments · Del remove last · Enter send ",
             theme::muted(),
         ))
-    } else if c.active {
-        block.title_bottom(Span::styled(
-            " <C-o> file · <C-v> paste · <C-r> voice · <C-s> stickers · <C-g> GIFs ",
-            theme::muted(),
-        ))
+    } else if c.active && let Some(hint) = composer_keys_hint(app, area.width) {
+        block.title_bottom(Span::styled(hint, theme::muted()))
     } else {
         block
     };
@@ -3482,12 +3669,20 @@ fn draw_composer(frame: &mut Frame, area: Rect, app: &App) {
     let (row, col) = c.input.cursor_position(width);
     let h = inner.height as usize;
     let skip = (row + 1).saturating_sub(h);
-    let shown: Vec<Line> = lines
-        .into_iter()
-        .skip(skip)
-        .take(h)
-        .map(Line::from)
-        .collect();
+    let styles = composer_styles(&c.input);
+    let chars: Vec<char> = c.input.text().chars().collect();
+    let mut pos = 0;
+    let mut shown: Vec<Line> = Vec::new();
+    for (n, line) in lines.iter().enumerate() {
+        let count = line.chars().count();
+        if n >= skip && n < skip + h {
+            shown.push(styled_line(line, &styles[pos..pos + count]));
+        }
+        pos += count;
+        if chars.get(pos) == Some(&'\n') {
+            pos += 1;
+        }
+    }
     frame.render_widget(Paragraph::new(shown), inner);
     if c.active && c.att_sel.is_none() && h > 0 {
         frame.set_cursor_position(Position {
@@ -3495,6 +3690,46 @@ fn draw_composer(frame: &mut Frame, area: Rect, app: &App) {
             y: inner.y + (row - skip) as u16,
         });
     }
+}
+
+fn composer_styles(input: &TextInput) -> Vec<Style> {
+    let parsed = markup::parse(input.text());
+    let mut styles = vec![Style::default(); input.text().chars().count()];
+    for (range, kind) in &parsed.styled {
+        for style in &mut styles[range.clone()] {
+            *style = format::entity_style(kind, *style);
+        }
+    }
+    for range in parsed.markers.iter().chain(&parsed.escapes) {
+        for style in &mut styles[range.clone()] {
+            *style = theme::muted();
+        }
+    }
+    if let Some((from, to)) = input.selection() {
+        for style in &mut styles[from..to] {
+            *style = style.add_modifier(Modifier::REVERSED);
+        }
+    }
+    styles
+}
+
+fn styled_line(line: &str, styles: &[Style]) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut buf = String::new();
+    let mut cur: Option<Style> = None;
+    for (ch, style) in line.chars().zip(styles) {
+        if cur != Some(*style) {
+            if let Some(prev) = cur {
+                spans.push(Span::styled(std::mem::take(&mut buf), prev));
+            }
+            cur = Some(*style);
+        }
+        buf.push(ch);
+    }
+    if let Some(prev) = cur {
+        spans.push(Span::styled(buf, prev));
+    }
+    Line::from(spans)
 }
 
 fn draw_info(frame: &mut Frame, area: Rect, app: &mut App) {
@@ -3814,6 +4049,7 @@ fn draw_popup(frame: &mut Frame, area: Rect, app: &App) {
         | Popup::Buttons(_)
         | Popup::ConfirmUrl(_)
         | Popup::Links { .. }
+        | Popup::CodePick { .. }
         | Popup::Files { .. }
         | Popup::ConfirmStart { .. }
         | Popup::ConfirmJoin(_)
@@ -4760,6 +4996,56 @@ mod tests {
         dir
     }
 
+    const FULL_HINT: &str = " <C-o> file · <C-v> paste · <C-r> voice · <C-t> format · <C-x> editor · <C-s> stickers · <C-g> GIFs ";
+
+    #[tokio::test]
+    async fn composer_footer_lists_the_keys_and_drops_items_from_the_end() {
+        let app = app();
+        assert_eq!(composer_keys_hint(&app, 200).as_deref(), Some(FULL_HINT));
+        let mut seen = Vec::new();
+        for width in 0..=FULL_HINT.chars().count() as u16 + 2 {
+            if let Some(hint) = composer_keys_hint(&app, width) {
+                assert!(hint.chars().count() <= usize::from(width) - 2, "{width}: {hint}");
+                assert!(FULL_HINT.starts_with(hint.trim_end()), "{width}: {hint}");
+                seen.push(hint);
+            }
+        }
+        assert!(seen.windows(2).all(|w| w[0].len() <= w[1].len()));
+        assert_eq!(seen.last().map(String::as_str), Some(FULL_HINT));
+        let narrow = composer_keys_hint(&app, 50).unwrap();
+        assert_eq!(narrow, " <C-o> file · <C-v> paste · <C-r> voice ");
+        assert_eq!(composer_keys_hint(&app, 6), None);
+    }
+
+    #[tokio::test]
+    async fn composer_footer_follows_remapped_keys() {
+        let mut app = app();
+        app.keymap = Keymap::from_toml(
+            "[keymap]\nFormatText = \"<C-b>\"\nEditInEditor = \"<C-e>\"\n",
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let hint = composer_keys_hint(&app, 200).unwrap();
+        assert!(hint.contains("<C-b> format · <C-e> editor"), "{hint}");
+        assert!(!hint.contains("<C-t>") && !hint.contains("<C-x>"), "{hint}");
+    }
+
+    #[tokio::test]
+    async fn composer_footer_never_overflows_the_border() {
+        for width in [40u16, 60, 80, 120, 200] {
+            let mut app = app();
+            app.composer.active = true;
+            let rows = snapshot(&mut app, width, 24);
+            let footer = rows
+                .iter()
+                .find(|r| r.contains("<C-o> file"))
+                .unwrap_or_else(|| panic!("{width}: {rows:?}"));
+            assert!(footer.chars().count() <= usize::from(width), "{width}");
+            let wide = rows.iter().any(|r| r.contains("<C-t> format"));
+            assert_eq!(wide, width == 200, "{width}");
+        }
+    }
+
     #[tokio::test]
     async fn composer_attachments_select_reorder_toggle_remove() {
         use crossterm::event::{KeyCode as K, KeyModifiers as M};
@@ -4805,6 +5091,44 @@ mod tests {
         app.attach_paths(vec![dir.join("a.jpg")]);
         assert!(app.composer.attachments.is_empty());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn composer_styles_typed_markup_and_dims_the_markers() {
+        let mut app = app();
+        app.composer.active = true;
+        app.composer.input = crate::input::TextInput::with_text("**hi** there");
+        let (w, h) = (120, 40);
+        let (x, y) = locate(&mut app, w, h, "**hi** there").expect("composer text");
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        for dx in [0, 1, 4, 5] {
+            let style = buf[(x + dx, y)].style();
+            assert!(style.add_modifier.contains(Modifier::DIM), "marker at {dx}");
+            assert!(
+                !style.add_modifier.contains(Modifier::BOLD),
+                "marker at {dx}"
+            );
+        }
+        for dx in [2, 3] {
+            assert!(
+                buf[(x + dx, y)]
+                    .style()
+                    .add_modifier
+                    .contains(Modifier::BOLD),
+                "hi at {dx}"
+            );
+        }
+        for dx in 6..12 {
+            assert!(
+                !buf[(x + dx, y)]
+                    .style()
+                    .add_modifier
+                    .contains(Modifier::BOLD),
+                "tail at {dx}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -4937,7 +5261,9 @@ mod tests {
         );
         let screen = render(&mut app, 120, 40);
         assert!(screen.contains("Shared media") && screen.contains("63"), "{screen}");
-        assert!(screen.contains("Voice messages"));
+        assert!(screen.contains("Voice and video"));
+        assert!(screen.contains("│  Photos           63 "), "{screen}");
+        assert!(screen.contains("│  Voice and video  ..."), "{screen}");
     }
 
     #[test]
@@ -5025,6 +5351,41 @@ mod tests {
         term.draw(|f| draw(f, app)).unwrap();
         let buf = term.backend().buffer().clone();
         buf.content.iter().map(|c| c.symbol()).collect()
+    }
+
+    fn playing_app() -> App {
+        let mut app = app();
+        app.bg = crate::audio::Background::fake();
+        let track = |msg_id: i64| crate::audio::Track {
+            chat_id: 10,
+            msg_id,
+            idx: 0,
+            kind: crate::model::MediaKind::Voice,
+            title: "Alice Longname".to_owned(),
+            duration: 30,
+        };
+        app.bg.set_queue(vec![track(1), track(2)], 0);
+        app.bg.load("/a.ogg", 1.5, (80.0, false), || {}).unwrap();
+        app
+    }
+
+    #[test]
+    fn the_player_bar_shows_while_the_queue_is_not_empty_and_vanishes_after_stop() {
+        let mut app = app();
+        assert!(!render(&mut app, 100, 30).contains("0:30"));
+        let mut app = playing_app();
+        for width in [10, 40, 80, 200] {
+            let screen = render(&mut app, width, 30);
+            assert!(screen.contains('▶'), "{width}");
+        }
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("0:00 / 0:30"), "{screen}");
+        assert!(screen.contains("1.5×") && screen.contains("1/2"), "{screen}");
+        app.bg.toggle_pause();
+        assert!(render(&mut app, 100, 30).contains('⏸'));
+        app.bg.stop();
+        let screen = render(&mut app, 100, 30);
+        assert!(!screen.contains("0:30") && !screen.contains('⏸'), "{screen}");
     }
 
     fn locate(app: &mut App, w: u16, h: u16, needle: &str) -> Option<(u16, u16)> {
@@ -6627,6 +6988,76 @@ mod tests {
         app
     }
 
+    fn all_layouts() -> [MessageLayout; 6] {
+        [
+            MessageLayout::Classic,
+            MessageLayout::Cards,
+            MessageLayout::Compact,
+            MessageLayout::Minimal,
+            MessageLayout::Split,
+            MessageLayout::Bubbles,
+        ]
+    }
+
+    const SPOKEN: &str = "meet me at the old station at noon and bring the blue folder with you";
+
+    #[tokio::test]
+    async fn transcript_shows_under_the_voice_message_in_every_layout_and_leaves_no_trace() {
+        for layout in all_layouts() {
+            let mut app = media_app();
+            app.settings.appearance.layout = Some(layout);
+            let plain = render(&mut app, 100, 40);
+            let rows = lines_from(&mut app, 10, 0);
+            app.transcripts.work(10, 44);
+            let busy = render(&mut app, 100, 40);
+            assert!(busy.contains("transcribing…"), "{layout:?}");
+            assert_eq!(lines_from(&mut app, 10, 0), rows + 1, "{layout:?}");
+            app.transcripts.show(10, 44, SPOKEN);
+            let shown = render(&mut app, 100, 40);
+            assert!(shown.contains("“ meet me at the old station"), "{layout:?}");
+            assert!(shown.contains("blue folder"), "{layout:?}");
+            assert!(lines_from(&mut app, 10, 0) > rows, "{layout:?}");
+            app.transcripts.hide(10, 44);
+            assert_eq!(render(&mut app, 100, 40), plain, "{layout:?}");
+            assert_eq!(lines_from(&mut app, 10, 0), rows, "{layout:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn partial_transcript_shows_text_with_an_ellipsis_and_progress() {
+        let mut app = media_app();
+        app.histories.get_mut(&10).unwrap().get_mut(44).unwrap().attachments[0].duration = 40;
+        app.transcripts.progress(10, 44, "meet me at the old station", Some(18.0), 3);
+        let screen = render(&mut app, 100, 40);
+        assert!(screen.contains("“ meet me at the old station …"), "{screen}");
+        assert!(screen.contains("transcribing… 45%"), "{screen}");
+        app.transcripts.progress(10, 44, "meet me", None, 12);
+        let screen = render(&mut app, 100, 40);
+        assert!(screen.contains("transcribing… 12 s"), "{screen}");
+        app.transcripts.progress(10, 44, "meet me at the old station", Some(18.0), 3);
+        let narrow = render(&mut app, 30, 40);
+        assert!(narrow.contains("…"), "{narrow}");
+    }
+
+    #[tokio::test]
+    async fn loading_model_shows_before_the_first_segment() {
+        let mut app = media_app();
+        app.transcripts.progress(10, 44, "", None, 7);
+        let screen = render(&mut app, 100, 40);
+        assert!(screen.contains("transcribing… loading model, 7 s"), "{screen}");
+        assert!(!screen.contains("“"), "{screen}");
+    }
+
+    #[tokio::test]
+    async fn transcript_wraps_to_a_narrow_message_width() {
+        let mut app = media_app();
+        app.transcripts.show(10, 44, SPOKEN);
+        let screen = render(&mut app, 50, 40);
+        assert!(screen.contains("“ "));
+        assert!(screen.contains("folder"));
+        assert!(!screen.contains(SPOKEN));
+    }
+
     #[tokio::test]
     async fn album_renders_as_one_block_with_images() {
         let mut app = media_app();
@@ -7761,6 +8192,186 @@ mod tests {
         let second = &rows[row_of(&rows, "second from")];
         assert!(!second.contains("enough"), "{second}");
     }
+    fn split_scene() -> (App, crate::td::RequestLog) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (td, log) = crate::td::Td::recording(tx);
+        app.td = td;
+        app.show_info = false;
+        app.show_folders = false;
+        app.show_chats = false;
+        let mut other = app.chats[&10].clone();
+        other.id = 20;
+        other.title = "Второй чат".to_owned();
+        app.chats.insert(20, other);
+        app.focus = Pane::Messages;
+        press(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
+        let mut h = History::default();
+        h.reached_start = true;
+        h.merge_older(
+            (1..=40)
+                .map(|i| {
+                    let mut m = msg(i, 2, 1_700_000_000 + i * 400, "second-chat-line");
+                    m.chat_id = 20;
+                    m
+                })
+                .collect(),
+        );
+        app.histories.insert(20, h);
+        app.open_chat = Some(20);
+        (app, log)
+    }
+
+    fn close_split(app: &mut App) {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        press(app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        press(app, KeyCode::Char('q'), KeyModifiers::NONE);
+    }
+
+    #[test]
+    fn split_draws_both_chats_in_their_halves() {
+        let (mut app, _log) = split_scene();
+        let rows = snapshot(&mut app, 200, 40);
+        let title = &rows[row_of(&rows, "Rust чат")];
+        assert!(col_of(title, "Rust чат") < 100, "{title}");
+        let title = &rows[row_of(&rows, "Второй чат")];
+        assert!(col_of(title, "Второй чат") > 100, "{title}");
+        let left = &rows[row_of(&rows, "hello there")];
+        assert!(col_of(left, "hello there") < 100, "{left}");
+        let right = &rows[row_of(&rows, "second-chat-line")];
+        assert!(col_of(right, "second-chat-line") > 100, "{right}");
+        press(
+            &mut app,
+            crossterm::event::KeyCode::Char('w'),
+            crossterm::event::KeyModifiers::CONTROL,
+        );
+        press(
+            &mut app,
+            crossterm::event::KeyCode::Char('w'),
+            crossterm::event::KeyModifiers::NONE,
+        );
+        let rows = snapshot(&mut app, 200, 40);
+        let left = &rows[row_of(&rows, "hello there")];
+        assert!(col_of(left, "hello there") < 100, "{left}");
+        let right = &rows[row_of(&rows, "second-chat-line")];
+        assert!(col_of(right, "second-chat-line") > 100, "{right}");
+        let title = &rows[row_of(&rows, "Второй чат")];
+        assert!(col_of(title, "Второй чат") > 100, "{title}");
+    }
+
+    #[test]
+    fn split_below_the_minimum_width_draws_only_the_live_pane_and_names_the_other() {
+        let (mut app, _log) = split_scene();
+        for width in [90, 99] {
+            let rows = snapshot(&mut app, width, 40);
+            let text = rows.join("\n");
+            assert!(text.contains("second-chat-line"), "{width}");
+            assert!(!text.contains("hello there"), "{width}");
+            assert!(text.contains("[split: Rust чат]"), "{width}\n{text}");
+        }
+        let rows = snapshot(&mut app, 100, 40);
+        let text = rows.join("\n");
+        assert!(text.contains("hello there") && text.contains("second-chat-line"));
+        assert!(!text.contains("[split:"));
+    }
+
+    #[test]
+    fn closing_the_split_leaves_no_cells_from_the_right_half() {
+        let (mut app, _log) = split_scene();
+        let mut term = Terminal::new(TestBackend::new(200, 40)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        close_split(&mut app);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let after = term.backend().buffer().clone();
+        let mut fresh = Terminal::new(TestBackend::new(200, 40)).unwrap();
+        fresh.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(&after, fresh.backend().buffer());
+        let text: String = after.content.iter().map(|c| c.symbol()).collect();
+        assert!(!text.contains("second-chat-line"));
+        assert!(text.contains("hello there"));
+    }
+
+    #[test]
+    fn the_parked_title_reminds_how_to_switch_panes() {
+        let (mut app, _log) = split_scene();
+        let mut term = Terminal::new(TestBackend::new(200, 40)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer();
+        let rows: Vec<String> = (0..40)
+            .map(|y| (0..200).map(|x| buf[(x, y)].symbol()).collect())
+            .collect();
+        assert!(rows.iter().any(|r| r.contains("<C-w> w switch")), "{rows:#?}");
+    }
+
+    #[test]
+    fn drawing_the_parked_pane_reads_nothing_and_loads_nothing() {
+        let (mut app, log) = split_scene();
+        app.side.as_mut().unwrap().bottom_offset = 100_000;
+        let mut term = Terminal::new(TestBackend::new(200, 40)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(!app.want_older);
+        let live_view = (app.msg_view_width, app.msg_view_height, app.visible_msgs.clone());
+        assert!(live_view.0 <= 98, "{}", live_view.0);
+        app.side.as_mut().unwrap().bottom_offset = 0;
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(
+            live_view,
+            (app.msg_view_width, app.msg_view_height, app.visible_msgs.clone())
+        );
+        let now = std::time::Instant::now();
+        for step in 0..4 {
+            app.flush_views(now + Duration::from_secs(step * 5));
+        }
+        let entries = log.lock().unwrap().clone();
+        assert!(
+            !entries.iter().any(|e| e.starts_with("view 10")),
+            "{entries:?}"
+        );
+        assert!(!entries.iter().any(|e| e.starts_with("load")), "{entries:?}");
+        assert_eq!(app.chats[&10].unread, 3);
+    }
+
+    #[test]
+    fn a_parked_pane_at_the_bottom_shows_messages_that_arrive_in_its_chat() {
+        let (mut app, _log) = split_scene();
+        let rows = snapshot(&mut app, 200, 40);
+        assert!(!rows.join("\n").contains("newest-parked-line"));
+        app.histories
+            .get_mut(&10)
+            .unwrap()
+            .upsert(msg(41, 2, 1_700_100_000, "newest-parked-line"));
+        let rows = snapshot(&mut app, 200, 40);
+        let row = &rows[row_of(&rows, "newest-parked-line")];
+        assert!(col_of(row, "newest-parked-line") < 100, "{row}");
+        assert_eq!(app.side.as_ref().unwrap().bottom_offset, 0);
+        assert_eq!(app.side.as_ref().unwrap().msg_sel, None);
+    }
+
+    #[test]
+    fn a_click_in_the_parked_half_focuses_it() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let (mut app, _log) = split_scene();
+        let mut term = Terminal::new(TestBackend::new(200, 40)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let click = |app: &mut App, column: u16, kind: MouseEventKind| {
+            app.handle(Event::Input(crossterm::event::Event::Mouse(MouseEvent {
+                kind,
+                column,
+                row: 10,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            })));
+        };
+        click(&mut app, 150, MouseEventKind::Down(MouseButton::Left));
+        click(&mut app, 150, MouseEventKind::Up(MouseButton::Left));
+        assert_eq!(app.open_chat, Some(20));
+        click(&mut app, 20, MouseEventKind::Down(MouseButton::Left));
+        click(&mut app, 20, MouseEventKind::Up(MouseButton::Left));
+        assert_eq!(app.open_chat, Some(10));
+        assert!(!app.side_left);
+    }
+
     mod layout_variants {
         use super::*;
         use crate::config::MessageLayout;
@@ -11099,6 +11710,52 @@ mod repaint_tests {
         assert!(rig.screen.stale_cells(&rig.buf).is_empty());
         let text = buffer_text(&rig.buf);
         assert!(text.contains("Alice Longname"), "{text}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_parked_pane_shows_photos_and_closing_the_split_leaves_no_stale_cells() {
+        use crossterm::event::{Event as Term, KeyCode, KeyEvent, KeyModifiers};
+        let mut rig = Rig::new(200, 30);
+        rig.app.show_info = false;
+        rig.app.show_folders = false;
+        rig.app.show_chats = false;
+        rig.settle().await;
+        assert!(rig.images_on_screen() > 0);
+        let mut other = History::default();
+        other.reached_start = true;
+        for i in 1..=30 {
+            let mut m = rig.app.histories[&10].msgs()[0].clone();
+            m.id = i;
+            m.chat_id = 20;
+            m.attachments = Vec::new();
+            m.body = RichText::plain(format!("plain line {i}"));
+            other.upsert(m);
+        }
+        for (code, mods) in [
+            (KeyCode::Char('w'), KeyModifiers::CONTROL),
+            (KeyCode::Char('v'), KeyModifiers::NONE),
+        ] {
+            rig.app.handle(Event::Input(Term::Key(KeyEvent::new(code, mods))));
+        }
+        rig.app.histories.insert(20, other);
+        rig.app.open_chat = Some(20);
+        rig.settle().await;
+        let in_left = (0..30u16)
+            .flat_map(|y| (0..100u16).map(move |x| (x, y)))
+            .filter(|&(x, y)| matches!(rig.buf[(x, y)].diff_option, CellDiffOption::ForcedWidth(_)))
+            .count();
+        assert!(in_left > 0, "{}", buffer_text(&rig.buf));
+        assert!(rig.images_on_screen() == in_left);
+        assert!(rig.screen.stale_cells(&rig.buf).is_empty());
+        for (code, mods) in [
+            (KeyCode::Char('w'), KeyModifiers::CONTROL),
+            (KeyCode::Char('q'), KeyModifiers::NONE),
+        ] {
+            rig.app.handle(Event::Input(Term::Key(KeyEvent::new(code, mods))));
+        }
+        rig.settle().await;
+        assert!(rig.images_on_screen() > 0);
+        assert!(rig.screen.stale_cells(&rig.buf).is_empty());
     }
 
     #[cfg(target_os = "linux")]

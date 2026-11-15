@@ -281,6 +281,37 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, popup: &Popup) {
             let rect = centered(area, width, lines.len() as u16 + 2);
             framed(frame, rect, "Open link", "key or Enter open · Esc", lines);
         }
+        Popup::CodePick { items, sel } => {
+            let width = 72u16.min(area.width.saturating_sub(2)).max(1);
+            let w = width.saturating_sub(2) as usize;
+            let rows = area.height.saturating_sub(4).max(1) as usize;
+            app.popup_rows.set(rows);
+            let sel = (*sel).min(items.len().saturating_sub(1));
+            let start = list_window(sel, items.len(), rows);
+            let lines = items
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(rows)
+                .map(|(i, block)| {
+                    let key = crate::bots::button_key(i).unwrap_or(' ');
+                    let first = block.text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+                    let mut spans = vec![
+                        Span::styled(format!("{key} "), theme::active_field()),
+                        Span::raw(format::sanitize(&format::one_line(first.trim()))),
+                    ];
+                    if let Some(lang) = &block.lang {
+                        spans.push(Span::styled(
+                            format!("  {}", format::sanitize(lang)),
+                            theme::muted(),
+                        ));
+                    }
+                    row_line(spans, i == sel, true, w)
+                })
+                .collect::<Vec<_>>();
+            let rect = centered(area, width, lines.len() as u16 + 2);
+            framed(frame, rect, "Copy code", "key or Enter copy · Esc", lines);
+        }
         Popup::Files { items, sel } => {
             let width = 72u16.min(area.width.saturating_sub(2)).max(1);
             let w = width.saturating_sub(2) as usize;
@@ -552,6 +583,12 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, popup: &Popup) {
             let rect = centered(area, 40.min(area.width), 9.min(area.height));
             let w = rect.width.saturating_sub(2) as usize;
             let counts = app.media_counts.get(chat_id);
+            let col = model::MediaFilter::ALL
+                .iter()
+                .map(|f| f.label().width())
+                .max()
+                .unwrap_or(0)
+                + 2;
             let lines = model::MediaFilter::ALL
                 .iter()
                 .enumerate()
@@ -563,7 +600,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, popup: &Popup) {
                     };
                     row_line(
                         vec![
-                            Span::raw(format!("{:<16}", f.label())),
+                            Span::raw(format!("{:<col$}", f.label())),
                             Span::styled(count, theme::muted()),
                         ],
                         i == *sel,

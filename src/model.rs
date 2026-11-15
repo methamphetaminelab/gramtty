@@ -6,7 +6,7 @@ pub enum EntityKind {
     Strike,
     Spoiler,
     Code,
-    Pre,
+    Pre(Option<String>),
     Link(Option<String>),
     Mention,
     MentionName(i64),
@@ -183,7 +183,7 @@ impl MediaFilter {
             MediaFilter::Videos => "Videos",
             MediaFilter::Files => "Files",
             MediaFilter::Links => "Links",
-            MediaFilter::Voice => "Voice messages",
+            MediaFilter::Voice => "Voice and video",
             MediaFilter::Gifs => "GIFs",
             MediaFilter::Music => "Music",
         }

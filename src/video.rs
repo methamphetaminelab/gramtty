@@ -773,6 +773,10 @@ impl Inline {
         self.active.as_ref().map(|a| a.target)
     }
 
+    pub fn sound(&self) -> (f64, bool) {
+        (self.volume, self.muted)
+    }
+
     pub fn play(
         &mut self,
         target: (i64, usize),

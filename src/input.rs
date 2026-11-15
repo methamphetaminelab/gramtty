@@ -5,6 +5,7 @@ use unicode_width::UnicodeWidthStr;
 pub struct TextInput {
     text: String,
     cursor: usize,
+    anchor: Option<usize>,
 }
 
 pub enum Edit {
@@ -18,6 +19,7 @@ impl TextInput {
         Self {
             text: text.to_owned(),
             cursor: text.chars().count(),
+            anchor: None,
         }
     }
 
@@ -27,6 +29,34 @@ impl TextInput {
 
     pub fn cursor(&self) -> usize {
         self.cursor
+    }
+
+    pub fn selection(&self) -> Option<(usize, usize)> {
+        let anchor = self.anchor?;
+        (anchor != self.cursor && anchor <= self.len())
+            .then(|| (anchor.min(self.cursor), anchor.max(self.cursor)))
+    }
+
+    pub fn select(&mut self, anchor: usize, cursor: usize) {
+        let len = self.len();
+        self.anchor = Some(anchor.min(len));
+        self.cursor = cursor.min(len);
+    }
+
+    pub fn splice(&mut self, from: usize, to: usize, with: &str, cursor: usize) {
+        let (a, b) = (self.byte_at(from), self.byte_at(to.max(from)));
+        self.text.replace_range(a..b, with);
+        self.anchor = None;
+        self.cursor = cursor.min(self.len());
+    }
+
+    fn delete_selection(&mut self) -> bool {
+        let selection = self.selection();
+        self.anchor = None;
+        match selection {
+            Some((from, to)) => self.remove_range(from, to),
+            None => false,
+        }
     }
 
     pub fn slice(&self, from: usize, to: usize) -> String {
@@ -58,6 +88,7 @@ impl TextInput {
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;
+        self.anchor = None;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -80,6 +111,7 @@ impl TextInput {
     }
 
     pub fn insert(&mut self, ch: char) {
+        self.delete_selection();
         let b = self.byte_at(self.cursor);
         self.text.insert(b, ch);
         self.cursor += 1;
@@ -94,6 +126,9 @@ impl TextInput {
     }
 
     pub fn backspace(&mut self) -> bool {
+        if self.delete_selection() {
+            return true;
+        }
         if self.cursor == 0 {
             return false;
         }
@@ -104,6 +139,9 @@ impl TextInput {
     }
 
     pub fn delete(&mut self) -> bool {
+        if self.delete_selection() {
+            return true;
+        }
         if self.cursor >= self.len() {
             return false;
         }
@@ -240,6 +278,35 @@ impl TextInput {
     }
 
     pub fn handle_key(&mut self, key: &KeyEvent, allow_newline: bool) -> Edit {
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let motion = matches!(
+            key.code,
+            KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Home
+                | KeyCode::End
+        );
+        if allow_newline && shift && motion {
+            let anchor = self.anchor.unwrap_or(self.cursor);
+            let mut plain = *key;
+            plain.modifiers.remove(KeyModifiers::SHIFT);
+            let edit = self.apply_key(&plain, allow_newline);
+            self.anchor = (self.cursor != anchor).then_some(anchor);
+            return edit;
+        }
+        if matches!(key.code, KeyCode::Backspace | KeyCode::Delete) && self.delete_selection() {
+            return Edit::Changed;
+        }
+        let edit = self.apply_key(key, allow_newline);
+        if motion || !matches!(edit, Edit::Ignored) {
+            self.anchor = None;
+        }
+        edit
+    }
+
+    fn apply_key(&mut self, key: &KeyEvent, allow_newline: bool) -> Edit {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
@@ -418,5 +485,139 @@ mod tests {
         let t = TextInput::with_text("abcdef\ngh");
         assert_eq!(t.visual_lines(4), vec!["abcd", "ef", "gh"]);
         assert_eq!(t.cursor_position(4), (2, 2));
+    }
+
+    fn selected(t: &TextInput) -> Option<String> {
+        t.selection().map(|(a, b)| t.slice(a, b))
+    }
+
+    fn press(t: &mut TextInput, code: KeyCode, mods: KeyModifiers) {
+        t.handle_key(&key(code, mods), true);
+    }
+
+    #[test]
+    fn shift_arrows_extend_the_selection() {
+        let mut t = TextInput::with_text("hello world");
+        assert_eq!(t.selection(), None);
+        press(&mut t, KeyCode::Left, KeyModifiers::SHIFT);
+        press(&mut t, KeyCode::Left, KeyModifiers::SHIFT);
+        assert_eq!(t.selection(), Some((9, 11)));
+        assert_eq!(selected(&t).as_deref(), Some("ld"));
+        press(&mut t, KeyCode::Right, KeyModifiers::SHIFT);
+        assert_eq!(t.selection(), Some((10, 11)));
+        press(&mut t, KeyCode::Right, KeyModifiers::SHIFT);
+        assert_eq!(t.selection(), None);
+    }
+
+    #[test]
+    fn shift_home_end_and_vertical_moves_select() {
+        let mut t = TextInput::with_text("ab\ncd");
+        press(&mut t, KeyCode::Home, KeyModifiers::SHIFT);
+        assert_eq!(t.selection(), Some((3, 5)));
+        press(&mut t, KeyCode::Up, KeyModifiers::SHIFT);
+        assert_eq!(t.selection(), Some((0, 5)));
+        press(&mut t, KeyCode::Down, KeyModifiers::SHIFT);
+        assert_eq!(t.selection(), Some((3, 5)));
+        press(&mut t, KeyCode::End, KeyModifiers::SHIFT);
+        assert_eq!(t.selection(), None);
+    }
+
+    #[test]
+    fn ctrl_shift_arrows_select_by_word() {
+        let mut t = TextInput::with_text("one two three");
+        let mods = KeyModifiers::CONTROL | KeyModifiers::SHIFT;
+        press(&mut t, KeyCode::Left, mods);
+        assert_eq!(selected(&t).as_deref(), Some("three"));
+        press(&mut t, KeyCode::Left, mods);
+        assert_eq!(selected(&t).as_deref(), Some("two three"));
+        press(&mut t, KeyCode::Right, mods);
+        assert_eq!(selected(&t).as_deref(), Some(" three"));
+    }
+
+    #[test]
+    fn plain_moves_clear_the_selection() {
+        for code in [
+            KeyCode::Left,
+            KeyCode::Right,
+            KeyCode::Home,
+            KeyCode::End,
+            KeyCode::Up,
+        ] {
+            let mut t = TextInput::with_text("hello");
+            press(&mut t, KeyCode::Left, KeyModifiers::SHIFT);
+            assert!(t.selection().is_some());
+            press(&mut t, code, KeyModifiers::NONE);
+            assert_eq!(t.selection(), None, "{code:?}");
+        }
+    }
+
+    #[test]
+    fn typing_replaces_the_selection() {
+        let mut t = TextInput::with_text("hello world");
+        press(
+            &mut t,
+            KeyCode::Left,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        );
+        press(&mut t, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert_eq!(t.text(), "hello x");
+        assert_eq!(t.selection(), None);
+        assert_eq!(t.cursor(), 7);
+    }
+
+    #[test]
+    fn paste_replaces_the_selection() {
+        let mut t = TextInput::with_text("abcdef");
+        t.select(1, 4);
+        t.insert_str("XY");
+        assert_eq!(t.text(), "aXYef");
+        assert_eq!(t.cursor(), 3);
+    }
+
+    #[test]
+    fn backspace_and_delete_remove_the_selection() {
+        for code in [KeyCode::Backspace, KeyCode::Delete] {
+            let mut t = TextInput::with_text("abcdef");
+            t.select(4, 1);
+            press(&mut t, code, KeyModifiers::NONE);
+            assert_eq!(t.text(), "aef", "{code:?}");
+            assert_eq!(t.cursor(), 1);
+            assert_eq!(t.selection(), None);
+        }
+    }
+
+    #[test]
+    fn newline_replaces_the_selection_and_shift_enter_still_works() {
+        let mut t = TextInput::with_text("abcd");
+        t.select(1, 3);
+        press(&mut t, KeyCode::Enter, KeyModifiers::SHIFT);
+        assert_eq!(t.text(), "a\nd");
+        assert_eq!(t.selection(), None);
+    }
+
+    #[test]
+    fn single_line_inputs_never_start_a_selection() {
+        let mut t = TextInput::with_text("hello");
+        t.handle_key(&key(KeyCode::Left, KeyModifiers::SHIFT), false);
+        assert_eq!(t.selection(), None);
+        assert_eq!(t.cursor(), 4);
+    }
+
+    #[test]
+    fn selection_by_unicode_chars() {
+        let mut t = TextInput::with_text("привет 😀");
+        press(&mut t, KeyCode::Left, KeyModifiers::SHIFT);
+        press(&mut t, KeyCode::Left, KeyModifiers::SHIFT);
+        assert_eq!(selected(&t).as_deref(), Some(" 😀"));
+    }
+
+    #[test]
+    fn splice_replaces_text_and_places_the_cursor() {
+        let mut t = TextInput::with_text("abcdef");
+        t.select(0, 2);
+        t.splice(2, 4, "XYZ", 4);
+        assert_eq!(t.text(), "abXYZef");
+        assert_eq!(t.cursor(), 4);
+        assert_eq!(t.selection(), None);
     }
 }
