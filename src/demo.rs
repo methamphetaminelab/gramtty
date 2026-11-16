@@ -72,6 +72,15 @@ const PALETTE: TermPalette = TermPalette {
     ],
 };
 
+const SNIPPET: &str = "Sure, here is the new signature:\n```rust\n// borrows, no allocation\nfn parse_header(b: &[u8]) -> Hdr {\n    let (h, rest) = b.split_at(8);\n    Hdr { h, rest }\n}\n```";
+const RELEASE: &str = "Tagged **0.4.0**, it is __much__ faster, thanks Maya";
+const RELEASE_SENT: &str = "Tagged **0.4.0**, it is __much__ faster, thanks <u>Maya</u>";
+const TRANSCRIPT: [(&str, f64); 4] = [
+    ("Morning everyone!", 3.0),
+    ("Morning everyone! I will bring the first aid kit and two thermoses,", 11.0),
+    ("Morning everyone! I will bring the first aid kit and two thermoses, can someone take the rope?", 17.0),
+    ("Morning everyone! I will bring the first aid kit and two thermoses, can someone take the rope? See you at eight.", 22.0),
+];
 const REPLY: &str = "What a view! I will bring the stove and hot tea";
 const PICKUP: &str = "Leaving at 7:30 sharp, I will pick everyone up";
 const DRAGGED: &str = "Perfect, then we are all set!";
@@ -276,6 +285,19 @@ impl Demo {
         self.feed();
     }
 
+    fn chord(&mut self, code: KeyCode, mods: KeyModifiers) {
+        self.app
+            .handle(Event::Input(TermEvent::Key(KeyEvent::new(code, mods))));
+        self.feed();
+    }
+
+    fn listen(&mut self, secs: f64, ms: u64) {
+        if let Some(fake) = self.app.bg.fake_mut() {
+            fake.status.pos = secs;
+        }
+        self.shot(ms);
+    }
+
     fn keys(&mut self, code: KeyCode, times: usize, ms: u64) {
         for _ in 0..times {
             self.press(code);
@@ -334,10 +356,13 @@ impl Demo {
             return;
         };
         self.mouse(MouseEventKind::Down(MouseButton::Left));
+        let span = f64::from((x - from).max(1));
         for at in from + 1..=x {
             self.pointer = Some((at, y));
             self.mouse(MouseEventKind::Drag(MouseButton::Left));
-            self.step(ms, serde_json::json!({ "glide": "line" }));
+            let edge = (2.0 * f64::from(at - from) / span - 1.0).powi(2);
+            let slow = (ms as f64 * (1.0 + 1.5 * edge)) as u64;
+            self.step(slow, serde_json::json!({ "glide": "line" }));
         }
     }
 
@@ -411,7 +436,7 @@ impl Demo {
             .unwrap();
         self.order += 1;
         let order = self.order;
-        let open = self.app.open_chat == Some(chat);
+        let open = self.app.open_chat == Some(chat) || self.app.side_chat() == Some(chat);
         let c = self.app.chats.get_mut(&chat).unwrap();
         for p in &mut c.positions {
             p.order = order;
@@ -487,6 +512,12 @@ fn text(id: i64, chat: i64, sender: i64, date: i64, body: &str) -> Msg {
         deleted: false,
         meta: Default::default(),
     }
+}
+
+fn rich(id: i64, chat: i64, sender: i64, date: i64, source: &str) -> Msg {
+    let mut m = text(id, chat, sender, date, "");
+    m.body = crate::markup::parse(source).rich;
+    m
 }
 
 fn post(id: i64, chat: i64, date: i64, body: &str) -> Msg {
@@ -720,6 +751,15 @@ fn story(chat: i64, now: i64) -> Vec<Msg> {
                 at(26),
                 "Deal. Speaking of which, did you see the plan in Weekend Hikers?",
             );
+            let snippet = rich(9, chat, ME, at(12), SNIPPET);
+            let done = rich(10, chat, ME, now + 90, RELEASE_SENT);
+            let party = text(
+                11,
+                chat,
+                MAYA,
+                now + 150,
+                "Amazing! Hot chocolate at the top is on me.",
+            );
             vec![
                 text(
                     1,
@@ -735,6 +775,9 @@ fn story(chat: i64, now: i64) -> Vec<Msg> {
                 merge,
                 release,
                 hike,
+                snippet,
+                done,
+                party,
             ]
         }
         LANTERN => {
@@ -928,6 +971,7 @@ fn chat(id: i64, title: &str, kind: ChatKind, order: i64, lists: &[ListId], now:
     match id {
         HIKERS => msgs.truncate(11),
         LANTERN => msgs.truncate(7),
+        MAYA_CHAT => msgs.truncate(9),
         _ => {}
     }
     let last_id = msgs.last().map_or(0, |m| m.id);
@@ -1119,6 +1163,7 @@ fn demo_frames() {
     crate::termcolors::set(Some(PALETTE));
     let now = clock();
     let mut d = Demo::start(out, now);
+    d.app.bg = crate::audio::Background::fake();
     d.caption = "Chats, folders, live updates";
     d.app.enter_chat(MAYA_CHAT);
     d.feed();
@@ -1148,10 +1193,10 @@ fn demo_frames() {
     d.typing(HIKERS, TOBIAS, Activity::ChoosingSticker);
     d.shot(700);
     d.arrive(HIKERS, 14);
-    d.shot(1500);
+    d.shot(1000);
     d.glide(84, 15, 420);
     let lines = d.wheel(true, 60, 60);
-    d.shot(1000);
+    d.shot(700);
     d.wheel(false, lines, 30);
     d.shot(300);
 
@@ -1160,9 +1205,9 @@ fn demo_frames() {
     d.glide(x + 12, y - 5, 450);
     d.click(360);
     d.press(KeyCode::Char('v'));
-    d.shot(1700);
+    d.shot(1300);
     d.press(KeyCode::Esc);
-    d.shot(300);
+    d.shot(250);
 
     d.caption = "React and reply";
     d.hide_pointer();
@@ -1171,17 +1216,17 @@ fn demo_frames() {
         r.loading = false;
         r.emojis = EMOJIS.iter().map(|e| (*e).to_owned()).collect();
     }
-    d.shot(600);
+    d.shot(400);
     d.keys(KeyCode::Char('l'), 4, 120);
-    d.shot(350);
+    d.shot(250);
     d.press(KeyCode::Enter);
     d.app.popup = None;
     if let Some(m) = d.app.histories.get_mut(&HIKERS).and_then(|h| h.get_mut(13)) {
         m.reactions = vec![reaction("😍", 1, true)];
     }
-    d.shot(700);
+    d.shot(500);
     d.press(KeyCode::Char('R'));
-    d.shot(400);
+    d.shot(300);
     d.type_text(REPLY);
     d.shot(300);
     d.press(KeyCode::Enter);
@@ -1189,9 +1234,9 @@ fn demo_frames() {
     d.shot(500);
     d.app.chats.get_mut(&HIKERS).unwrap().last_read_outbox = 15;
     d.typing(HIKERS, MAYA, Activity::Typing);
-    d.shot(1000);
+    d.shot(800);
     d.arrive(HIKERS, 16);
-    d.shot(700);
+    d.shot(500);
 
     d.caption = "Mouse selection copies text";
     d.press(KeyCode::Esc);
@@ -1208,6 +1253,115 @@ fn demo_frames() {
     )));
     d.glide(x + 36, y - 2, 390);
     d.shot(510);
+
+    d.caption = "Background player, local transcription";
+    d.hide_pointer();
+    d.keys(KeyCode::Char('k'), 8, 70);
+    d.shot(500);
+    d.app.settings.transcription.command = vec![
+        "whisper-cli".to_owned(),
+        "-f".to_owned(),
+        "{file}".to_owned(),
+    ];
+    d.press(KeyCode::Char('v'));
+    d.shot(300);
+    d.app.handle(Event::File(FileRef {
+        id: 32,
+        size: 96_000,
+        path: "/demo/priya.ogg".to_owned(),
+        done: true,
+        active: false,
+        downloaded: 96_000,
+        uploading: false,
+        uploaded: 0,
+    }));
+    d.listen(1.0, 400);
+    d.listen(3.0, 400);
+    d.chord(KeyCode::Char('T'), KeyModifiers::SHIFT);
+    d.listen(4.5, 350);
+    for (partial, secs) in TRANSCRIPT {
+        d.app.handle(Event::TranscriptPartial {
+            chat_id: HIKERS,
+            msg_id: 9,
+            text_so_far: partial.to_owned(),
+            done_secs: Some(secs),
+        });
+        d.listen(secs * 0.6, 700);
+    }
+    d.app.handle(Event::Transcript {
+        chat_id: HIKERS,
+        msg_id: 9,
+        result: Ok(TRANSCRIPT[3].0.to_owned()),
+    });
+    d.listen(15.0, 1200);
+    d.press(KeyCode::Char(' '));
+    d.press(KeyCode::Char('x'));
+    d.app.status = None;
+    d.shot(600);
+
+    d.caption = "Code blocks with syntax highlighting";
+    let (x, y) = d.find("Maya Lindqvist");
+    d.pointer = Some((60, 20));
+    d.shot(150);
+    d.glide(x + 5, y, 450);
+    d.click(300);
+    d.hide_pointer();
+    d.shot(1600);
+
+    d.caption = "Formatting shown live as you type";
+    d.shot(300);
+    d.type_text(RELEASE);
+    d.shot(600);
+    for _ in 0..4 {
+        d.chord(KeyCode::Left, KeyModifiers::SHIFT);
+        d.shot(60);
+    }
+    d.shot(300);
+    d.chord(KeyCode::Char('t'), KeyModifiers::CONTROL);
+    d.shot(1000);
+    d.press(KeyCode::Char('u'));
+    d.shot(800);
+    assert_eq!(d.app.composer.input.text(), RELEASE_SENT);
+    d.press(KeyCode::Enter);
+    d.arrive(MAYA_CHAT, 10);
+    d.shot(1100);
+    d.press(KeyCode::Esc);
+    d.shot(200);
+
+    d.caption = "Two chats side by side";
+    d.chord(KeyCode::Char('w'), KeyModifiers::CONTROL);
+    d.press(KeyCode::Char('v'));
+    d.shot(600);
+    let (x, y) = d.find("Weekend Hikers");
+    d.pointer = Some((60, 20));
+    d.shot(150);
+    d.glide(x + 6, y, 450);
+    d.click(300);
+    d.press(KeyCode::Esc);
+    d.hide_pointer();
+    d.shot(600);
+    for key in ['2', '1'] {
+        d.press(KeyCode::Char(' '));
+        d.press(KeyCode::Char(key));
+        d.shot(350);
+    }
+    d.shot(800);
+    d.typing(MAYA_CHAT, MAYA, Activity::Typing);
+    d.shot(700);
+    d.arrive(MAYA_CHAT, 11);
+    d.shot(1300);
+    d.chord(KeyCode::Char('w'), KeyModifiers::CONTROL);
+    d.press(KeyCode::Char('w'));
+    d.shot(1000);
+    d.chord(KeyCode::Char('w'), KeyModifiers::CONTROL);
+    d.press(KeyCode::Char('q'));
+    d.shot(400);
+    for key in ['1', '2'] {
+        d.press(KeyCode::Char(' '));
+        d.press(KeyCode::Char(key));
+        d.shot(200);
+    }
+    d.shot(300);
 
     d.caption = "Search across everything";
     d.hide_pointer();
@@ -1246,7 +1400,7 @@ fn demo_frames() {
     d.caption = "Every key binding one keystroke away";
     d.press(KeyCode::Char('?'));
     d.shot(700);
-    d.keys(KeyCode::Char('j'), 12, 60);
+    d.keys(KeyCode::Char('j'), 10, 50);
     d.shot(700);
     d.press(KeyCode::Esc);
     d.shot(250);

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import math
+import random
 import subprocess
 import sys
 import tempfile
@@ -58,6 +59,53 @@ def mix(a, b, t):
 def ease(t):
     t = min(1.0, max(0.0, t))
     return t * t * (3 - 2 * t)
+
+
+def jerk(t):
+    t = min(1.0, max(0.0, t))
+    return t * t * t * (10 - 15 * t + 6 * t * t)
+
+
+def lerp(a, b, t):
+    return (a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t)
+
+
+def bezier(a, c, b, t):
+    return lerp(lerp(a, c, t), lerp(c, b, t), t)
+
+
+def travel_ms(dist):
+    return 110 + 120 * math.log2(1 + dist / 30)
+
+
+class Move:
+    def __init__(self, origin, target, seed):
+        rnd = random.Random(seed)
+        dx, dy = target[0] - origin[0], target[1] - origin[1]
+        self.origin, self.target = origin, target
+        self.dist = math.hypot(dx, dy)
+        self.unit = (dx / self.dist, dy / self.dist) if self.dist else (0.0, 0.0)
+        bend = rnd.choice((-1, 1)) * self.dist * (0.05 + 0.11 * rnd.random()) * min(1.0, self.dist / 160)
+        mid = lerp(origin, target, 0.5)
+        self.control = (mid[0] - self.unit[1] * bend, mid[1] + self.unit[0] * bend)
+        self.overshoot = min(7.0, self.dist * 0.035) if self.dist > 120 else 0.0
+        self.past = (target[0] + self.unit[0] * self.overshoot, target[1] + self.unit[1] * self.overshoot)
+        self.ms = travel_ms(self.dist)
+
+    def at(self, t):
+        t = min(1.0, max(0.0, t))
+        if not self.overshoot:
+            return bezier(self.origin, self.control, self.target, jerk(1 - (1 - t) ** 1.7))
+        if t < 0.84:
+            return bezier(self.origin, self.control, self.past, jerk(1 - (1 - t / 0.84) ** 1.7))
+        return lerp(self.past, self.target, jerk((t - 0.84) / 0.16))
+
+
+def settle_offset(frame, unit):
+    if frame >= 10:
+        return (0.0, 0.0)
+    push = 1.6 * math.exp(-frame * 0.35) * math.cos(frame * 1.2)
+    return (unit[0] * push, unit[1] * push)
 
 
 class Fonts:
@@ -638,11 +686,37 @@ def frames(steps, meta, fonts):
             stage.origin[1] + cell[1] * CELL_H + CELL_H / 2,
         )
 
+    offset = (0.0, 0.0)
+    last_cell = None
+    unit = (0.0, 0.0)
+    rest = 99
+
     for index, step in enumerate(steps):
         scene = Scene(step, meta, fonts, cache)
         count = max(1, round(step["ms"] / TICK))
-        target = spot(step["pointer"]) if step["pointer"] else None
-        origin = pointer_at if pointer_at and target else target
+        cell = step["pointer"]
+        glide = step.get("glide")
+        move = None
+        base = None
+        if cell:
+            rnd = random.Random(index)
+            fresh = pointer_at is None
+            if fresh or glide == "ease":
+                offset = (rnd.uniform(-3, 3), rnd.uniform(-4, 4))
+            center = spot(cell)
+            base = (center[0] + offset[0], center[1] + offset[1])
+            if fresh:
+                side = rnd.choice((-1, 1))
+                move = Move((base[0] + 70 * side, base[1] + 44), base, index)
+            elif glide == "ease":
+                move = Move(pointer_at, base, index)
+            elif glide == "line":
+                move = (pointer_at, (base[0], base[1] + 1.5 * math.sin(base[0] / 21)))
+            elif cell == last_cell:
+                base = pointer_at
+            if isinstance(move, Move):
+                count = max(count, math.ceil(move.ms / TICK) + 3)
+        last_cell = cell
         cursor = step["cursor"]
         if cursor != cursor_seen[0]:
             cursor_seen = (cursor, clock)
@@ -650,17 +724,28 @@ def frames(steps, meta, fonts):
             local = i * TICK
             t = clock / 1000
             term = scene.image(t)
-            if target:
-                progress = (i + 1) / count
-                glide = step.get("glide")
-                amount = ease(progress) if glide == "ease" else progress if glide == "line" else 1.0
-                pointer_at = (
-                    origin[0] + (target[0] - origin[0]) * amount,
-                    origin[1] + (target[1] - origin[1]) * amount,
-                )
+            if base:
+                if isinstance(move, Move):
+                    progress = (i + 1) * TICK / move.ms
+                    pointer_at = move.at(progress)
+                    unit = move.unit
+                    if progress < 1:
+                        rest = 99
+                    elif rest == 99:
+                        rest = 0
+                    else:
+                        rest += 1
+                elif move:
+                    pointer_at = lerp(move[0], move[1], (i + 1) / count)
+                    rest = 99
+                else:
+                    pointer_at = base
+                    rest = rest + 1 if rest < 99 else rest
                 pointer_alpha = min(1.0, pointer_alpha + 0.25)
             else:
                 pointer_alpha = max(0.0, pointer_alpha - 0.25)
+                if pointer_at:
+                    pointer_at = (pointer_at[0] + 3, pointer_at[1] + 2)
                 if pointer_alpha == 0:
                     pointer_at = None
             wanted = step.get("caption", "")
@@ -671,13 +756,17 @@ def frames(steps, meta, fonts):
             else:
                 chip_alpha = min(1.0, chip_alpha + 0.2)
             lit = cursor and (step.get("typing") or (clock - cursor_seen[1]) % BLINK_MS < BLINK_MS // 2)
+            shown = None
+            if pointer_at:
+                drift = settle_offset(rest, unit)
+                shown = (pointer_at[0] + drift[0], pointer_at[1] + drift[1])
             wave = None
-            if step.get("click") and pointer_at and local < 300:
-                wave = (pointer_at, local / 300)
+            if step.get("click") and shown and local < 300:
+                wave = (shown, local / 300)
             look = {
                 "cursor": cursor if lit else None,
                 "ripple": wave,
-                "pointer": (pointer_at, pointer_alpha) if pointer_at and pointer_alpha > 0 else None,
+                "pointer": (shown, pointer_alpha) if shown and pointer_alpha > 0 else None,
                 "chip": (chip_text, chip_alpha) if chip_text and chip_alpha > 0 else None,
             }
             token = (index, repr(look), int(clock / ART_TICK) if scene.moving else None)
