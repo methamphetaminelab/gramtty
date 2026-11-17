@@ -38,7 +38,7 @@ Terminal Telegram client in Rust on TDLib.
 - Command line control of the running client (`gramtty send`, `unread`, `chats`, `open`) and message hooks
 - Open, Mark as read and Reply right from the desktop notification (Linux)
 - Privacy: "don't mark as read", ghost mode (no online status, typing or read receipts)
-- Opt-in, local-only history of messages deleted by others and earlier versions of edited ones (not kept for protected or secret chats)
+- Opt-in, local-only history of deleted messages (others' only, or your own too) and earlier versions of edited ones (not kept for protected or secret chats)
 - Themes (presets, including one that follows the terminal palette, and a custom `theme.toml`), six message layouts, border styles, avatar shapes
 - Remappable keys
 
@@ -157,7 +157,7 @@ Vim-style. `?` lists every key binding by context, your remaps included. `Space`
 | `Ctrl-d` `Ctrl-u`, `PgDn` `PgUp` | scroll |
 | `J` `K` | scroll the messages without moving the selection |
 | `gg` `G` | top, bottom |
-| `/` | filter the pane; in messages, search the chat |
+| `/` | filter the pane (chats: best matches first, by title or @username); in messages, search the chat |
 | `Enter` | open chat or topic; on a message, its action menu |
 | `Space Space` | search: chats, contacts, public channels and bots, messages |
 | `Space /` | search messages in all chats |
@@ -177,6 +177,7 @@ Vim-style. `?` lists every key binding by context, your remaps included. `Space`
 | `Space s` | stickers and GIFs (composer: `Ctrl-s`, `Ctrl-g`) |
 | `Space k` | bot buttons (composer: `Ctrl-k`) |
 | `]u` `]m` `]r` | next unread chat, mention or reply, reaction |
+| `U` | show only unread chats (unread ones are also marked with a bar on the left) |
 | `gp`, `Space P` | jump to pinned message, list pinned messages |
 | `Space n` | notification inbox |
 | `Space m` | mark chat read |
@@ -186,7 +187,7 @@ Vim-style. `?` lists every key binding by context, your remaps included. `Space`
 | `Space 1` `2` `4` | toggle folders, chats, info panes |
 | `Space r` | redraw |
 | `Space M` | recent notices and errors |
-| `Space o` | options |
+| `Space o` | options: `j` `k` move, `Tab` next section, `h` `l` change, `Enter` toggle, `/` find an option |
 | `Space L` | log out |
 | `q` | quit (asks first while files upload or a voice message records); in a popup, close it |
 | `Ctrl-c` | quit |
@@ -304,7 +305,7 @@ Main options:
 
 - `notifications.desktop`, `sound`, `volume` (0-100), `sound_file`: notifications and their sound
 - `privacy.dont_mark_read`, `ghost_mode`: read receipts and online status
-- `privacy.keep_deleted`, `keep_deleted_limit` (default 5000): local history of deleted and edited messages
+- `privacy.keep_deleted`, `keep_deleted_limit` (default 5000): local history of deleted and edited messages; `keep_deleted_own` also shows your own deleted messages
 - `privacy.hide_blocked`, `hide_stories`, `hide_phone`
 - `appearance.theme`: `terminal` (default), `default`, `high-contrast`, `light`, `mono`, `custom`
 - `appearance.layout`: `classic`, `cards`, `compact`, `minimal`, `split`, `bubbles` (default)
