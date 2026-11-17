@@ -7,7 +7,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::app::{
     App, LogView, MembersView, MenuItem, OPTION_GROUPS, OPTIONS, Popup, ProfileView,
-    ReactionPicker, SearchView, option_key,
+    ReactionPicker, SearchView, option_matches,
 };
 use crate::format;
 use crate::keymap::HelpLine;
@@ -423,41 +423,27 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, popup: &Popup) {
                 lines,
             );
         }
-        Popup::Options { sel } => {
+        Popup::Options { sel, filter } => {
             let width = 72u16.min(area.width.saturating_sub(2)).max(1);
             let w = width.saturating_sub(2) as usize;
             let sel = (*sel).min(OPTIONS.len() - 1);
-            let current = crate::app::option_group(sel);
-            let items = OPTION_GROUPS[current].1;
-            let left_w = OPTION_GROUPS
-                .iter()
-                .map(|(name, _)| name.width())
-                .max()
-                .unwrap_or(0)
-                + 1;
-            let sep = if w >= 62 { " │ " } else { "│" };
-            let right_w = w.saturating_sub(left_w + sep.width());
+            let matches = option_matches(filter.as_ref().map_or("", |f| f.text()));
             let mut list = Vec::new();
             let mut sel_row = 0;
-            let tallest_group = OPTION_GROUPS
-                .iter()
-                .map(|(_, items)| items.len())
-                .max()
-                .unwrap_or(0);
-            for r in 0..OPTION_GROUPS.len().max(tallest_group) {
-                let mut spans = vec![match OPTION_GROUPS.get(r) {
-                    Some((name, _)) => Span::styled(
-                        format!(" {name:<width$}", width = left_w - 1),
-                        if r == current {
-                            theme::picker_selection()
-                        } else {
-                            theme::muted()
-                        },
-                    ),
-                    None => Span::raw(" ".repeat(left_w)),
-                }];
-                spans.push(Span::styled(sep, theme::border()));
-                if let Some(&i) = items.get(r) {
+            for (name, items) in OPTION_GROUPS.iter() {
+                let rows: Vec<usize> = items
+                    .iter()
+                    .copied()
+                    .filter(|i| matches.contains(i))
+                    .collect();
+                if rows.is_empty() {
+                    continue;
+                }
+                list.push(Line::from(Span::styled(
+                    format!(" {name}"),
+                    theme::active_field(),
+                )));
+                for i in rows {
                     let (label, _) = OPTIONS[i];
                     let value = app.option_value(i);
                     let text = if value.starts_with('[') {
@@ -468,20 +454,11 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, popup: &Popup) {
                     if i == sel {
                         sel_row = list.len();
                     }
-                    spans.extend(
-                        row_line(
-                            vec![
-                                Span::styled(format!("{} ", option_key(i)), theme::active_field()),
-                                Span::raw(text),
-                            ],
-                            i == sel,
-                            true,
-                            right_w,
-                        )
-                        .spans,
-                    );
+                    list.push(row_line(vec![Span::raw(text)], i == sel, true, w));
                 }
-                list.push(Line::from(spans));
+            }
+            if list.is_empty() {
+                list.push(muted(" No matching options"));
             }
             let desc_w = w.saturating_sub(2);
             let desc_rows = wrap_words(OPTIONS[sel].1, desc_w);
@@ -492,7 +469,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, popup: &Popup) {
                 .unwrap_or(0);
             let inner_h = (area.height as usize).saturating_sub(2);
             let slots = tallest.min(inner_h.saturating_sub(6).max(1));
-            let list_room = inner_h.saturating_sub(slots + 2).max(1);
+            let list_room = inner_h.saturating_sub(slots + 2).clamp(1, 18);
             let start = if list.len() > list_room {
                 sel_row
                     .saturating_sub(list_room / 2)
@@ -502,7 +479,13 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, popup: &Popup) {
             };
             let mut lines: Vec<Line<'static>> =
                 list.into_iter().skip(start).take(list_room).collect();
-            lines.push(Line::from(""));
+            lines.push(match filter {
+                Some(f) => Line::from(vec![
+                    Span::styled(" /", theme::active_field()),
+                    Span::raw(format!(" {}▏", f.text())),
+                ]),
+                None => Line::from(""),
+            });
             let ghost = app.settings.privacy.ghost_mode;
             let shown = desc_rows.len().min(slots);
             for (n, row) in desc_rows.iter().take(shown).enumerate() {
@@ -527,7 +510,11 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, popup: &Popup) {
                 frame,
                 centered(area, width, h),
                 "Options",
-                "Tab category · j/k move · h/l change · saved to config.toml",
+                if filter.is_some() {
+                    "type to filter · ↑/↓ move · Enter toggle · Esc clear"
+                } else {
+                    "j/k move · Tab section · h/l change · Enter · / filter"
+                },
                 lines,
             );
         }

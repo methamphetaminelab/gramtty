@@ -446,6 +446,7 @@ pub struct Privacy {
     pub dont_mark_read: bool,
     pub ghost_mode: bool,
     pub keep_deleted: bool,
+    pub keep_deleted_own: bool,
     pub keep_deleted_limit: usize,
     pub hide_blocked: bool,
     pub hide_stories: bool,
@@ -460,6 +461,7 @@ impl Default for Privacy {
             dont_mark_read: false,
             ghost_mode: false,
             keep_deleted: false,
+            keep_deleted_own: false,
             keep_deleted_limit: KEEP_DELETED_LIMIT,
             hide_blocked: false,
             hide_stories: false,
@@ -689,6 +691,16 @@ mod tests {
             "HASH is set but ID is not; set both or neither"
         );
         assert_eq!(err(Some("x"), Some("abc")), "ID is not a number");
+    }
+
+    #[test]
+    fn keep_deleted_own_defaults_off_and_round_trips() {
+        let d = Settings::parse("", &mut Vec::new()).unwrap();
+        assert!(!d.privacy.keep_deleted_own);
+        let on = Settings::parse("[privacy]\nkeep_deleted_own = true\n", &mut Vec::new()).unwrap();
+        assert!(on.privacy.keep_deleted_own);
+        let back = Settings::parse(&on.to_toml().unwrap(), &mut Vec::new()).unwrap();
+        assert!(back.privacy.keep_deleted_own);
     }
 
     #[test]

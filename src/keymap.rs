@@ -302,6 +302,7 @@ pub enum Action {
     OpenOptions,
     JumpToPinned,
     OpenNextUnread,
+    ToggleUnreadOnly,
     JumpToNextMention,
     JumpToNextReaction,
     CopyQuote,
@@ -539,6 +540,7 @@ impl Action {
             Action::OpenOptions => (Group::Account, 1),
             Action::JumpToPinned => (Group::Navigate, 23),
             Action::OpenNextUnread => (Group::Navigate, 24),
+            Action::ToggleUnreadOnly => (Group::Navigate, 32),
             Action::JumpToNextMention => (Group::Navigate, 25),
             Action::JumpToNextReaction => (Group::Navigate, 28),
             Action::CopyQuote => (Group::Message, 13),
@@ -592,6 +594,7 @@ impl Action {
             Action::Quit => (Section::Global, 27),
             Action::LogOut => (Section::Global, 28),
             Action::OpenNextUnread => (Section::Chats, 0),
+            Action::ToggleUnreadOnly => (Section::Chats, 10),
             Action::JumpToNextMention => (Section::Chats, 1),
             Action::JumpToNextReaction => (Section::Chats, 2),
             Action::MarkChatRead => (Section::Chats, 3),
@@ -648,7 +651,7 @@ impl Action {
         matches!(self, Action::LogOut | Action::DeleteMessage)
     }
 
-    pub const ALL: [Action; 79] = [
+    pub const ALL: [Action; 80] = [
         Action::StartComposer,
         Action::OpenPaneFilter,
         Action::ClosePopup,
@@ -710,6 +713,7 @@ impl Action {
         Action::OpenOptions,
         Action::JumpToPinned,
         Action::OpenNextUnread,
+        Action::ToggleUnreadOnly,
         Action::JumpToNextMention,
         Action::JumpToNextReaction,
         Action::CopyQuote,
@@ -793,6 +797,7 @@ impl Action {
             Action::OpenOptions => "OpenOptions",
             Action::JumpToPinned => "JumpToPinnedMessage",
             Action::OpenNextUnread => "OpenNextUnread",
+            Action::ToggleUnreadOnly => "ToggleUnreadOnly",
             Action::JumpToNextMention => "JumpToNextMention",
             Action::JumpToNextReaction => "JumpToNextReaction",
             Action::CopyQuote => "CopyQuote",
@@ -881,6 +886,7 @@ impl Action {
             Action::OpenOptions => "options",
             Action::JumpToPinned => "jump to pinned message",
             Action::OpenNextUnread => "next unread chat",
+            Action::ToggleUnreadOnly => "show only unread chats",
             Action::JumpToNextMention => "next unread mention or reply",
             Action::JumpToNextReaction => "next unread reaction",
             Action::CopyQuote => "copy as quote",
@@ -965,6 +971,7 @@ impl Action {
             Action::OpenOptions => &["<leader>o"],
             Action::JumpToPinned => &["gp"],
             Action::OpenNextUnread => &["]u"],
+            Action::ToggleUnreadOnly => &["U"],
             Action::JumpToNextMention => &["]m"],
             Action::JumpToNextReaction => &["]r"],
             Action::CopyQuote | Action::TranslateMessage | Action::SaveMessage => &[],

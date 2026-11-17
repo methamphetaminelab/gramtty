@@ -1723,6 +1723,10 @@ pub fn unread() -> Style {
     pick(|c| c.unread_title)
 }
 
+pub fn accent() -> Style {
+    pick(|c| c.accent)
+}
+
 pub fn unread_badge() -> Style {
     pick(|c| c.unread_badge)
 }

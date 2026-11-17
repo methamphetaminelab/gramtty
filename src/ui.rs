@@ -562,6 +562,9 @@ fn empty_chats_text(app: &App) -> String {
     if !app.list_complete(list) {
         return "Loading chats…".to_owned();
     }
+    if app.unread_only {
+        return "No unread chats".to_owned();
+    }
     match list {
         model::ListId::Main => "No chats yet",
         model::ListId::Archive => "Archive is empty",
@@ -599,6 +602,11 @@ fn draw_chats(frame: &mut Frame, area: Rect, app: &App) {
         .folder_entries()
         .get(app.folder_sel)
         .map_or_else(|| "Chats".to_owned(), |(_, n)| n.clone());
+    let title = if app.unread_only {
+        format!("{title} · unread")
+    } else {
+        title
+    };
     let block = pane_block(format!(" {title} "), focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -681,10 +689,38 @@ fn chat_badge(app: &App, c: &model::ChatInfo, muted: bool) -> (String, Style) {
             badge.push_str(&format!(" {} {n}", g.unread_dot));
         }
         if c.mentions == 0 && !muted {
-            style = theme::unread_badge();
+            style = unread_accent();
         }
     }
     (badge, style)
+}
+
+fn unread_accent() -> Style {
+    let badge = theme::unread_badge();
+    if badge.fg.is_some() || badge.bg.is_some() {
+        badge
+    } else {
+        theme::accent().patch(badge)
+    }
+}
+
+fn mark_unread(lines: &mut [Line<'static>], muted: bool, selected: bool) {
+    let width = theme::selection_marker().width();
+    if selected || width == 0 {
+        return;
+    }
+    let style = if muted {
+        theme::muted()
+    } else {
+        unread_accent()
+    };
+    let last = lines.len().saturating_sub(1);
+    for (i, line) in lines.iter_mut().enumerate() {
+        let glyph = if i > 0 && i == last { "▘" } else { "▌" };
+        if let Some(first) = line.spans.first_mut() {
+            *first = Span::styled(format!("{glyph}{}", " ".repeat(width - 1)), style);
+        }
+    }
 }
 
 fn typing_preview(app: &App, c: &model::ChatInfo) -> Option<String> {
@@ -869,6 +905,9 @@ fn chat_lines(
         spans.extend(extras);
         lines.push(row_line(spans, selected, false, w));
     }
+    if app.has_unread(c.id) {
+        mark_unread(&mut lines, muted, selected && focused);
+    }
     (lines, Some(text))
 }
 
@@ -911,7 +950,7 @@ fn topic_line(
     if t.unread > 0 {
         badge.push_str(&format!(" {}", app.count(i64::from(t.unread))));
         if t.mentions == 0 && !muted {
-            badge_style = theme::unread_badge();
+            badge_style = unread_accent();
         }
     }
     let mut marks = String::new();
@@ -954,7 +993,12 @@ fn topic_line(
         Span::styled(marks, theme::muted()),
         Span::styled(badge, badge_style),
     ];
-    row_line(spans, selected, focused, w)
+    let mut line = [row_line(spans, selected, focused, w)];
+    if t.unread > 0 || t.mentions > 0 {
+        mark_unread(&mut line, muted, selected && focused);
+    }
+    let [line] = line;
+    line
 }
 
 fn sender_id(sender: Sender) -> i64 {
@@ -5980,13 +6024,16 @@ mod tests {
             assert_eq!(screen.matches(tl).count(), 4, "{style:?} no selection box");
             assert!(screen.contains('▎'), "{style:?} selection bar");
             app.msg_sel = None;
-            app.popup = Some(Popup::Options { sel: 5 });
+            app.popup = Some(Popup::Options {
+                sel: 5,
+                filter: None,
+            });
             let rows = snapshot(&mut app, 120, 30);
             let opt = &rows[row_of(&rows, " Options ")];
             assert!(opt.contains(&format!("{tl} Options")), "{opt}");
             assert!(
                 rows.iter()
-                    .any(|r| r.contains(&format!("2 Border style: {}", style.name())))
+                    .any(|r| r.contains(&format!("Border style: {}", style.name())))
             );
             app.popup = None;
             app.pending = vec![app.keymap.leader];
@@ -6000,13 +6047,27 @@ mod tests {
     }
 
     #[test]
-    fn options_popup_shows_groups_hotkeys_and_full_description() {
+    fn options_popup_shows_sections_and_full_description() {
         let mut app = bubble_app();
         app.popup = Some(Popup::Options {
             sel: crate::app::OPEN_FOCUS_OPTION,
+            filter: None,
         });
-        let rows = snapshot(&mut app, 70, 44);
-        let text = rows.join("\n");
+        let mut seen = String::new();
+        for (i, (label, _)) in crate::app::OPTIONS.iter().enumerate() {
+            app.popup = Some(Popup::Options {
+                sel: i,
+                filter: None,
+            });
+            let rows = snapshot(&mut app, 70, 44);
+            let text = rows.join("\n");
+            assert!(
+                rows.iter()
+                    .any(|r| r.contains(label.split(':').next().unwrap())),
+                "{label}\n{text}"
+            );
+            seen.push_str(&text);
+        }
         for head in [
             "Notifications",
             "Privacy",
@@ -6016,19 +6077,14 @@ mod tests {
             "Messages",
             "Navigation",
         ] {
-            assert!(text.contains(head), "{head}\n{text}");
+            assert!(seen.contains(head), "{head}");
         }
-        for (i, (label, _)) in crate::app::OPTIONS.iter().enumerate() {
-            app.popup = Some(Popup::Options { sel: i });
-            let rows = snapshot(&mut app, 70, 44);
-            let text = rows.join("\n");
-            let line = format!("{} ", crate::app::option_key(i));
-            assert!(
-                rows.iter()
-                    .any(|r| r.contains(&line) && r.contains(label.split(':').next().unwrap())),
-                "{label}\n{text}"
-            );
-        }
+        app.popup = Some(Popup::Options {
+            sel: crate::app::OPEN_FOCUS_OPTION,
+            filter: None,
+        });
+        let rows = snapshot(&mut app, 70, 44);
+        let text = rows.join("\n");
         let flat: String = rows
             .iter()
             .map(|r| r.trim_matches(|c: char| c == '│' || c == ' '))
@@ -6051,20 +6107,19 @@ mod tests {
         for (w, h) in [(100u16, 40u16), (70, 30), (60, 24)] {
             let mut first = None;
             for sel in 0..crate::app::OPTIONS.len() {
-                app.popup = Some(Popup::Options { sel });
+                app.popup = Some(Popup::Options { sel, filter: None });
                 let rows = snapshot(&mut app, w, h);
                 let top = row_of(&rows, " Options ");
                 let bottom = row_of(&rows, "j/k move");
                 let left = col_of(&rows[top], "╭ Options");
                 let right = rows[top].chars().count() - 1;
-                let entry = (h >= 40).then(|| row_of(&rows, "Notifications"));
                 let (label, _) = crate::app::OPTIONS[sel];
                 assert!(
                     rows[top..bottom].iter().any(|r| r.contains(label)),
                     "{w}x{h} sel {sel} not visible\n{}",
                     rows.join("\n")
                 );
-                let rect = (top, bottom, left, right, entry);
+                let rect = (top, bottom, left, right);
                 match first {
                     None => first = Some(rect),
                     Some(f) => assert_eq!(rect, f, "{w}x{h} sel {sel}\n{}", rows.join("\n")),
@@ -6621,11 +6676,17 @@ mod tests {
         ] {
             assert!(screen.contains(want), "{want}: {screen}");
         }
-        app.popup = Some(Popup::Options { sel: 0 });
+        app.popup = Some(Popup::Options {
+            sel: 0,
+            filter: None,
+        });
         app.settings.privacy.ghost_mode = true;
         let screen = render(&mut app, 120, 40);
         assert!(screen.contains("[x] Desktop notifications"));
-        app.popup = Some(Popup::Options { sel: 2 });
+        app.popup = Some(Popup::Options {
+            sel: 2,
+            filter: None,
+        });
         let screen = render(&mut app, 120, 40);
         assert!(screen.contains("[ ] Don't mark as read"));
         assert!(screen.contains("[x] Ghost mode"));
@@ -6771,7 +6832,10 @@ mod tests {
         assert!(render(&mut app, 120, 40).contains("Forward to"));
         for (w, h) in [(40, 12), (80, 24), (200, 60)] {
             for popup in [
-                Popup::Options { sel: 0 },
+                Popup::Options {
+                    sel: 0,
+                    filter: None,
+                },
                 Popup::Inbox { sel: 0 },
                 Popup::ConfirmUrl("u".to_owned()),
             ] {
@@ -7987,7 +8051,10 @@ mod tests {
             topic: None,
         });
         for popup in [
-            Popup::Options { sel: 6 },
+            Popup::Options {
+                sel: 6,
+                filter: None,
+            },
             Popup::Inbox { sel: 0 },
             Popup::ConfirmLogout,
             Popup::ConfirmDelete {
@@ -8007,9 +8074,12 @@ mod tests {
             let buf = buffer(&mut app, 160, 40);
             assert_all_themed(&buf, &name);
         }
-        app.popup = Some(Popup::Options { sel: 6 });
+        app.popup = Some(Popup::Options {
+            sel: 6,
+            filter: None,
+        });
         let buf = buffer(&mut app, 160, 40);
-        let (x, y) = find(&buf, &format!("❯ {}", crate::app::option_key(6)));
+        let (x, y) = find(&buf, "❯ Theme");
         assert_eq!(buf[(x, y)].fg, c.selection.0.fg.unwrap());
         app.popup = None;
 
@@ -10612,6 +10682,100 @@ mod tests {
         assert!(!chats.iter().any(|r| r.contains("new build")));
     }
 
+    fn chats_buffer(app: &mut App, w: u16) -> Buffer {
+        app.refresh_lists();
+        let mut term = Terminal::new(TestBackend::new(w, 20)).unwrap();
+        term.draw(|f| draw_chats(f, Rect::new(0, 0, w, 20), app))
+            .unwrap();
+        term.backend().buffer().clone()
+    }
+
+    fn buffer_row(buf: &Buffer, y: u16) -> String {
+        (0..buf.area.width)
+            .map(|x| buf[(x, y)].symbol().to_owned())
+            .collect()
+    }
+
+    fn buf_row_of(buf: &Buffer, needle: &str) -> u16 {
+        (0..buf.area.height)
+            .find(|y| buffer_row(buf, *y).contains(needle))
+            .unwrap_or_else(|| panic!("{needle} not found"))
+    }
+
+    #[test]
+    fn unread_chats_get_a_bar_in_the_gutter_dim_when_muted() {
+        let mut app = chat_list_app();
+        let buf = chats_buffer(&mut app, 40);
+        let y = buf_row_of(&buf, "Rust чат");
+        for (row, glyph) in [(y, "▌"), (y + 1, "▘")] {
+            assert_eq!(buf[(1, row)].symbol(), glyph, "{}", buffer_row(&buf, row));
+            assert_eq!(Some(buf[(1, row)].fg), unread_accent().fg);
+        }
+        assert!(buffer_row(&buf, y + 1).ends_with("▴ @ 3│"));
+        let y = buf_row_of(&buf, "Rust News");
+        assert_eq!(buf[(1, y)].symbol(), "▌");
+        assert_ne!(Some(buf[(1, y)].fg), unread_accent().fg);
+        let y = buf_row_of(&buf, "Carol");
+        assert_eq!(buf[(1, y)].symbol(), " ");
+        assert!(unread_accent().fg.is_some() || unread_accent().bg.is_some());
+    }
+
+    #[test]
+    fn u_toggles_unread_only_and_keeps_the_open_chat() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = chat_list_app();
+        app.open_chat = Some(11);
+        let rows = screen_rows(&mut app, 100, 30);
+        assert!(rows.iter().any(|r| r.contains("Carol")));
+        press(&mut app, KeyCode::Char('U'), KeyModifiers::SHIFT);
+        assert!(app.unread_only);
+        let rows = screen_rows(&mut app, 100, 30);
+        assert!(rows.iter().any(|r| r.contains("All chats · unread")));
+        assert!(rows.iter().any(|r| r.contains("Rust чат")));
+        assert!(rows.iter().any(|r| r.contains("Rust News")));
+        assert!(rows.iter().any(|r| r.contains("Bob Stone")));
+        assert!(!rows.iter().any(|r| r.contains("Carol")));
+        assert!(!rows.iter().any(|r| r.contains("Dave")));
+        press(&mut app, KeyCode::Char('U'), KeyModifiers::SHIFT);
+        assert!(!app.unread_only);
+        let rows = screen_rows(&mut app, 100, 30);
+        assert!(!rows.iter().any(|r| r.contains("· unread")));
+        assert!(rows.iter().any(|r| r.contains("Carol")));
+    }
+
+    #[test]
+    fn unread_only_with_nothing_unread_says_so() {
+        let mut app = chat_list_app();
+        for id in [10, 12] {
+            app.chats.get_mut(&id).unwrap().unread = 0;
+            app.chats.get_mut(&id).unwrap().mentions = 0;
+        }
+        app.open_chat = None;
+        app.handle(Event::ChatListLoaded(model::ListId::Main));
+        app.unread_only = true;
+        let rows = screen_rows(&mut app, 100, 30);
+        assert!(
+            rows.iter().any(|r| r.contains("No unread chats")),
+            "{}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn chat_filter_ranks_prefix_matches_before_later_ones() {
+        let mut app = chat_list_app();
+        app.chats.get_mut(&13).unwrap().title = "Old Carl".to_owned();
+        app.chats.get_mut(&14).unwrap().title = "Carl".to_owned();
+        app.refresh_lists();
+        app.filter = Some(crate::app::Filter {
+            pane: Pane::Chats,
+            input: crate::input::TextInput::with_text("car"),
+            active: true,
+        });
+        let ids = app.visible_chats();
+        assert_eq!(ids, vec![14, 13]);
+    }
+
     #[test]
     fn a_draft_left_in_the_composer_shows_in_the_chat_row_until_it_is_cleared() {
         use crossterm::event::{KeyCode, KeyModifiers};
@@ -10732,7 +10896,7 @@ mod tests {
         let rows = screen_rows(&mut app, 100, 30);
         let chats = pane_text(&rows, 19, 31);
         assert!(
-            chats.iter().any(|r| r == "  Rust чат"),
+            chats.iter().any(|r| r == "▌ Rust чат"),
             "{}",
             chats.join("\n")
         );
@@ -12475,7 +12639,10 @@ mod repaint_tests {
         );
         assert!(p.most_images >= 1);
         assert!(rig.app.media.anim.live_ids().is_empty());
-        rig.app.popup = Some(Popup::Options { sel: 0 });
+        rig.app.popup = Some(Popup::Options {
+            sel: 0,
+            filter: None,
+        });
         rig.frame();
         assert_eq!(rig.app.redraw_due, None);
         let mut written = 0;

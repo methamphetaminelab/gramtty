@@ -283,6 +283,7 @@ pub enum Popup {
     ConfirmJoin(td::Invite),
     Options {
         sel: usize,
+        filter: Option<TextInput>,
     },
     Inbox {
         sel: usize,
@@ -521,7 +522,7 @@ pub struct ButtonsView {
     pub sel: usize,
 }
 
-pub const OPTIONS: [(&str, &str); 33] = [
+pub const OPTIONS: [(&str, &str); 34] = [
     (
         "Desktop notifications",
         "System notifications for new messages in unmuted chats and mentions",
@@ -584,7 +585,7 @@ pub const OPTIONS: [(&str, &str); 33] = [
     ),
     (
         "Keep deleted messages",
-        "Keep messages deleted by others and earlier versions of edited ones on this device only; never in protected or secret chats",
+        "Keep deleted messages and earlier versions of edited ones on this device only; never in protected or secret chats",
     ),
     (
         "Clear saved deleted messages",
@@ -654,6 +655,10 @@ pub const OPTIONS: [(&str, &str); 33] = [
         "Notification actions",
         "Open, Mark as read and Reply buttons on desktop notifications (Linux, needs libnotify with --action)",
     ),
+    (
+        "Keep my own deleted messages",
+        "Also show your own messages after they are deleted; off keeps only messages deleted by others",
+    ),
 ];
 
 pub const OPTION_GROUPS: [(&str, &[usize]); 7] = [
@@ -667,6 +672,7 @@ pub const OPTION_GROUPS: [(&str, &[usize]); 7] = [
             1,
             2,
             KEEP_DELETED_OPTION,
+            KEEP_DELETED_OWN_OPTION,
             CLEAR_DELETED_OPTION,
             HIDE_BLOCKED_OPTION,
             HIDE_STORIES_OPTION,
@@ -729,15 +735,17 @@ pub fn option_order() -> impl Iterator<Item = usize> {
         .flat_map(|(_, items)| items.iter().copied())
 }
 
-pub fn option_key(index: usize) -> char {
-    let items = OPTION_GROUPS[option_group(index)].1;
-    let row = items.iter().position(|i| *i == index).unwrap_or(0);
-    char::from_digit(row as u32 + 1, 10).unwrap_or(' ')
-}
-
-pub fn option_for_key(group: usize, c: char) -> Option<usize> {
-    let row = c.to_digit(10)?.checked_sub(1)?;
-    OPTION_GROUPS.get(group)?.1.get(row as usize).copied()
+pub fn option_matches(filter: &str) -> Vec<usize> {
+    let f = filter.trim().to_lowercase();
+    option_order()
+        .filter(|&i| {
+            let (label, desc) = OPTIONS[i];
+            f.is_empty()
+                || label.to_lowercase().contains(&f)
+                || desc.to_lowercase().contains(&f)
+                || OPTION_GROUPS[option_group(i)].0.to_lowercase().contains(&f)
+        })
+        .collect()
 }
 
 pub const SOUND_OPTION: usize = 3;
@@ -771,6 +779,7 @@ pub const COMPACT_CHATS_OPTION: usize = 29;
 pub const ACTIONS_OPTION: usize = 32;
 pub const VOICE_SPEED_OPTION: usize = 30;
 pub const MPRIS_OPTION: usize = 31;
+pub const KEEP_DELETED_OWN_OPTION: usize = 33;
 
 pub struct FilePicker {
     pub input: TextInput,
@@ -856,6 +865,7 @@ pub struct App {
     pub show_info: bool,
     pub folder_sel: usize,
     pub chat_sel: usize,
+    pub unread_only: bool,
     pub filter: Option<Filter>,
     pub open_chat: Option<i64>,
     pub histories: HashMap<i64, History>,
@@ -1025,6 +1035,7 @@ impl App {
             show_info: false,
             folder_sel: 0,
             chat_sel: 0,
+            unread_only: false,
             filter: None,
             open_chat: None,
             histories: HashMap::new(),
@@ -3025,9 +3036,24 @@ impl App {
             Action::OpenBotKeyboard => self.open_buttons(),
             Action::FormatText => self.open_format_menu(),
             Action::EditInEditor => self.editor_request = self.composer.active,
-            Action::OpenOptions => self.popup = Some(Popup::Options { sel: 0 }),
+            Action::OpenOptions => {
+                self.popup = Some(Popup::Options {
+                    sel: 0,
+                    filter: None,
+                })
+            }
             Action::OpenNextUnread => {
                 self.open_next_unread();
+            }
+            Action::ToggleUnreadOnly => {
+                let row = self.selected_row();
+                self.unread_only = !self.unread_only;
+                match row {
+                    Some(row) => self.select_row(row),
+                    None => self.chat_sel = 0,
+                }
+                let last = self.chat_rows().len().saturating_sub(1);
+                self.chat_sel = self.chat_sel.min(last);
             }
             Action::JumpToNextMention => self.jump_next_unread(Unread::Mention),
             Action::JumpToNextReaction => self.jump_next_unread(Unread::Reaction),
@@ -3210,18 +3236,37 @@ impl App {
 
     pub fn visible_chats(&self) -> Vec<i64> {
         let list = self.current_list();
-        let ids = self.list_cache.get(&list).cloned().unwrap_or_default();
-        match self.filter.as_ref().filter(|f| f.pane == Pane::Chats) {
-            Some(f) if !f.input.is_empty() => ids
-                .into_iter()
-                .filter(|id| {
-                    self.chats
-                        .get(id)
-                        .is_some_and(|c| model::fuzzy_score(f.input.text(), &c.title).is_some())
-                })
-                .collect(),
-            _ => ids,
+        let mut ids = self.list_cache.get(&list).cloned().unwrap_or_default();
+        if self.unread_only {
+            ids.retain(|id| self.open_chat == Some(*id) || self.has_unread(*id));
         }
+        let Some(f) = self
+            .filter
+            .as_ref()
+            .filter(|f| f.pane == Pane::Chats && !f.input.is_empty())
+        else {
+            return ids;
+        };
+        let query = f.input.text();
+        let mut scored: Vec<(i32, i64)> = ids
+            .into_iter()
+            .filter_map(|id| {
+                let c = self.chats.get(&id)?;
+                let title = model::fuzzy_score(query, &c.title);
+                let name = match c.kind {
+                    ChatKind::Private(uid) => self.user_meta.get(&uid).and_then(|m| {
+                        m.usernames
+                            .iter()
+                            .filter_map(|u| model::fuzzy_score(query, u))
+                            .max()
+                    }),
+                    _ => None,
+                };
+                title.max(name).map(|score| (score, id))
+            })
+            .collect();
+        scored.sort_by_key(|(score, _)| std::cmp::Reverse(*score));
+        scored.into_iter().map(|(_, id)| id).collect()
     }
 
     pub fn chat_rows(&self) -> Vec<Row> {
@@ -6157,7 +6202,7 @@ impl App {
         shown_items(entries)
     }
 
-    fn has_unread(&self, chat: i64) -> bool {
+    pub fn has_unread(&self, chat: i64) -> bool {
         let (mentions, reactions) = self.unread_counts(chat, None);
         self.chat_unread(chat) > 0 || mentions > 0 || reactions > 0
     }
@@ -7016,7 +7061,10 @@ impl App {
             Popup::Search(sv) if sv.listing() || !edge => sv.sel = step(sv.sel, delta, sv.rows()),
             Popup::Find(fv) if !edge => fv.sel = step(fv.sel, delta, typed_len),
             Popup::Buttons(b) => b.sel = step(b.sel, delta, b.keyboard.buttons().len()),
-            Popup::Options { sel } => *sel = shift_option(*sel, delta),
+            Popup::Options { sel, filter } => {
+                let list = option_matches(filter.as_ref().map_or("", |f| f.text()));
+                *sel = shift_option(*sel, delta, &list)
+            }
             Popup::Inbox { sel } => *sel = step(*sel, delta, inbox_len),
             Popup::Ttl { choices, sel, .. } => *sel = step(*sel, delta, choices.len()),
             Popup::Links { links, sel } => *sel = step(*sel, delta, links.len()),
@@ -7234,12 +7282,14 @@ impl App {
                 KeyCode::Char('y') => {
                     self.popup = Some(Popup::Options {
                         sel: CLEAR_DELETED_OPTION,
+                        filter: None,
                     });
                     self.clear_deleted();
                 }
                 KeyCode::Char('n') | KeyCode::Char('q') | KeyCode::Esc | KeyCode::Enter => {
                     self.popup = Some(Popup::Options {
                         sel: CLEAR_DELETED_OPTION,
+                        filter: None,
                     })
                 }
                 _ => {}
@@ -8532,6 +8582,7 @@ impl App {
             SECONDS_OPTION => check(self.seconds()),
             EXACT_OPTION => check(self.settings.appearance.exact_numbers),
             KEEP_DELETED_OPTION => check(self.settings.privacy.keep_deleted),
+            KEEP_DELETED_OWN_OPTION => check(self.settings.privacy.keep_deleted_own),
             CLEAR_DELETED_OPTION => match self.archive.len() {
                 0 => "nothing saved".to_owned(),
                 n => format!("{n} saved"),
@@ -8598,6 +8649,7 @@ impl App {
             self.settings.appearance.exact_numbers,
             self.settings.privacy.hide_blocked,
             self.settings.privacy.keep_deleted,
+            self.settings.privacy.keep_deleted_own,
         )
             .hash(&mut h);
         h.finish()
@@ -8818,7 +8870,14 @@ impl App {
                 let p = &mut self.settings.privacy;
                 p.keep_deleted = flip(p.keep_deleted);
                 if !p.keep_deleted {
-                    self.drop_deleted_from_view();
+                    self.drop_deleted_from_view(|_| true);
+                }
+            }
+            KEEP_DELETED_OWN_OPTION => {
+                let p = &mut self.settings.privacy;
+                p.keep_deleted_own = flip(p.keep_deleted_own);
+                if !p.keep_deleted_own {
+                    self.drop_deleted_from_view(|m| m.outgoing);
                 }
             }
             CLEAR_DELETED_OPTION => {
@@ -9155,35 +9214,57 @@ impl App {
                 }
                 _ => {}
             },
-            Popup::Options { sel } => match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => self.popup = None,
-                KeyCode::Tab | KeyCode::BackTab => {
-                    let n = OPTION_GROUPS.len();
-                    let step = if key.code == KeyCode::Tab { 1 } else { n - 1 };
-                    *sel = OPTION_GROUPS[(option_group(*sel) + step) % n].1[0];
-                }
-                KeyCode::Char('j') | KeyCode::Down => *sel = shift_option(*sel, 1),
-                KeyCode::Char('k') | KeyCode::Up => *sel = shift_option(*sel, -1),
-                KeyCode::Enter | KeyCode::Char(' ') => {
-                    let i = *sel;
-                    self.toggle_option(i);
-                }
-                KeyCode::Char('h') | KeyCode::Left => {
-                    let i = *sel;
-                    self.change_option(i, Some(false));
-                }
-                KeyCode::Char('l') | KeyCode::Right => {
-                    let i = *sel;
-                    self.change_option(i, Some(true));
-                }
-                KeyCode::Char(c) => {
-                    if let Some(i) = option_for_key(option_group(*sel), c) {
-                        *sel = i;
+            Popup::Options { sel, filter } => {
+                let list = option_matches(filter.as_ref().map_or("", |f| f.text()));
+                match key.code {
+                    KeyCode::Esc if filter.is_some() => *filter = None,
+                    KeyCode::Esc => self.popup = None,
+                    KeyCode::Down => *sel = shift_option(*sel, 1, &list),
+                    KeyCode::Up => *sel = shift_option(*sel, -1, &list),
+                    KeyCode::Enter => {
+                        let i = *sel;
+                        if list.contains(&i) {
+                            self.toggle_option(i);
+                        }
+                    }
+                    _ if filter.is_some() => {
+                        if let Some(f) = filter
+                            && let Edit::Changed = f.handle_key(&key, false)
+                        {
+                            let list = option_matches(f.text());
+                            if !list.contains(sel)
+                                && let Some(&first) = list.first()
+                            {
+                                *sel = first;
+                            }
+                        }
+                    }
+                    KeyCode::Char('q') => self.popup = None,
+                    KeyCode::Char('/') => *filter = Some(TextInput::with_text("")),
+                    KeyCode::Tab | KeyCode::BackTab => {
+                        let n = OPTION_GROUPS.len();
+                        let step = if key.code == KeyCode::Tab { 1 } else { n - 1 };
+                        *sel = OPTION_GROUPS[(option_group(*sel) + step) % n].1[0];
+                    }
+                    KeyCode::Char('j') => *sel = shift_option(*sel, 1, &list),
+                    KeyCode::Char('k') => *sel = shift_option(*sel, -1, &list),
+                    KeyCode::Char('g') | KeyCode::Home => *sel = list[0],
+                    KeyCode::Char('G') | KeyCode::End => *sel = list[list.len() - 1],
+                    KeyCode::Char(' ') => {
+                        let i = *sel;
                         self.toggle_option(i);
                     }
+                    KeyCode::Char('h') | KeyCode::Left => {
+                        let i = *sel;
+                        self.change_option(i, Some(false));
+                    }
+                    KeyCode::Char('l') | KeyCode::Right => {
+                        let i = *sel;
+                        self.change_option(i, Some(true));
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             Popup::Inbox { sel } => {
                 let n = self.inbox.len();
                 match key.code {
@@ -9390,7 +9471,7 @@ impl App {
         }
     }
 
-    fn drop_deleted_from_view(&mut self) {
+    fn drop_deleted_from_view(&mut self, drop: impl Fn(&Msg) -> bool) {
         let Some(chat_id) = self.open_chat else {
             return;
         };
@@ -9400,7 +9481,7 @@ impl App {
         let ids: Vec<i64> = h
             .msgs()
             .iter()
-            .filter(|m| m.deleted)
+            .filter(|m| m.deleted && drop(m))
             .map(|m| m.id)
             .collect();
         if ids.is_empty() {
@@ -9415,7 +9496,7 @@ impl App {
     fn clear_deleted(&mut self) {
         match self.archive.clear() {
             Ok(n) => {
-                self.drop_deleted_from_view();
+                self.drop_deleted_from_view(|_| true);
                 self.set_status(format!("cleared {n} saved items"), false);
             }
             Err(e) => self.set_status(td::failed("clear saved deleted messages", &e), true),
@@ -9433,11 +9514,17 @@ impl App {
             return msgs;
         };
         let have: std::collections::HashSet<i64> = msgs.iter().map(|m| m.id).collect();
+        let own = self.settings.privacy.keep_deleted_own;
         msgs.extend(
             self.archive
                 .deleted_between(chat_id, lo, hi)
                 .into_iter()
-                .filter(|m| !have.contains(&m.id) && h.index_of(m.id).is_none() && h.accepts(m)),
+                .filter(|m| {
+                    (own || !m.outgoing)
+                        && !have.contains(&m.id)
+                        && h.index_of(m.id).is_none()
+                        && h.accepts(m)
+                }),
         );
         msgs.sort_by_key(|m| std::cmp::Reverse(m.id));
         msgs
@@ -9454,7 +9541,11 @@ impl App {
                 continue;
             };
             match self.archive.record_deleted(&m, now) {
-                Ok(_) => kept.push(*id),
+                Ok(_) => {
+                    if self.settings.privacy.keep_deleted_own || !m.outgoing {
+                        kept.push(*id);
+                    }
+                }
                 Err(e) => {
                     self.set_status(td::failed("keep the deleted message", &e), true);
                     break;
@@ -9562,10 +9653,12 @@ impl App {
     }
 }
 
-fn shift_option(cur: usize, delta: isize) -> usize {
-    let order: Vec<usize> = option_order().collect();
-    let pos = order.iter().position(|i| *i == cur).unwrap_or(0);
-    order[step(pos, delta, order.len())]
+fn shift_option(cur: usize, delta: isize, list: &[usize]) -> usize {
+    if list.is_empty() {
+        return cur;
+    }
+    let pos = list.iter().position(|i| *i == cur).unwrap_or(0);
+    list[step(pos, delta, list.len())]
 }
 
 fn step(cur: usize, delta: isize, len: usize) -> usize {
@@ -9675,14 +9768,20 @@ mod tests {
         app.handle(Event::Input(TermEvent::Key(KeyEvent::new(code, mods))));
     }
 
-    fn pick_option(app: &mut App, index: usize) {
-        for _ in 0..OPTION_GROUPS.len() {
-            match &app.popup {
-                Some(Popup::Options { sel }) if option_group(*sel) == option_group(index) => break,
-                _ => press(app, K::Tab, M::NONE),
+    fn goto_option(app: &mut App, index: usize) {
+        press(app, K::Char('g'), M::NONE);
+        for _ in 0..OPTIONS.len() {
+            if matches!(&app.popup, Some(Popup::Options { sel, .. }) if *sel == index) {
+                return;
             }
+            press(app, K::Char('j'), M::NONE);
         }
-        press(app, K::Char(option_key(index)), M::NONE);
+        panic!("option {index} not reachable");
+    }
+
+    fn pick_option(app: &mut App, index: usize) {
+        goto_option(app, index);
+        press(app, K::Char(' '), M::NONE);
     }
 
     fn leader(app: &mut App, c: char) {
@@ -9986,13 +10085,12 @@ mod tests {
     }
 
     #[test]
-    fn compact_chat_list_toggles_with_its_row_digit_in_the_chat_list_group() {
+    fn compact_chat_list_toggles_in_the_chat_list_group() {
         let (mut app, _log) = fake_app(Settings::default());
         assert_eq!(
             OPTION_GROUPS[option_group(COMPACT_CHATS_OPTION)].0,
             "Chat list"
         );
-        assert_eq!(option_key(COMPACT_CHATS_OPTION), '4');
         leader(&mut app, 'o');
         press(&mut app, K::Char('o'), M::NONE);
         assert!(!app.settings.appearance.compact_chat_list);
@@ -10000,14 +10098,16 @@ mod tests {
         pick_option(&mut app, COMPACT_CHATS_OPTION);
         assert!(app.settings.appearance.compact_chat_list);
         assert_eq!(app.option_value(COMPACT_CHATS_OPTION), "[x]");
-        assert!(matches!(app.popup, Some(Popup::Options { sel }) if sel == COMPACT_CHATS_OPTION));
+        assert!(
+            matches!(app.popup, Some(Popup::Options { sel, .. }) if sel == COMPACT_CHATS_OPTION)
+        );
         assert!(
             app.settings
                 .to_toml()
                 .unwrap()
                 .contains("compact_chat_list = true")
         );
-        press(&mut app, K::Char('4'), M::NONE);
+        pick_option(&mut app, COMPACT_CHATS_OPTION);
         assert!(!app.settings.appearance.compact_chat_list);
     }
 
@@ -10372,8 +10472,7 @@ mod tests {
         app.apply_online();
         leader(&mut app, 'o');
         assert!(matches!(app.popup, Some(Popup::Options { .. })));
-        press(&mut app, K::Tab, M::NONE);
-        press(&mut app, K::Char('2'), M::NONE);
+        pick_option(&mut app, 2);
         assert!(app.settings.privacy.ghost_mode);
         assert!(!app.settings.auto_read());
         assert_eq!(count(&log, "go offline"), 1);
@@ -10382,21 +10481,20 @@ mod tests {
         press(&mut app, K::Char('k'), M::NONE);
         press(&mut app, K::Enter, M::NONE);
         assert!(app.settings.privacy.dont_mark_read);
-        press(&mut app, K::Char('2'), M::NONE);
+        pick_option(&mut app, 2);
         assert!(!app.settings.privacy.ghost_mode);
         assert_eq!(count(&log, "go online"), 2);
         assert!(!app.settings.auto_read());
         assert_eq!(app.message_layout(), MessageLayout::Bubbles);
         assert_eq!(app.option_value(LAYOUT_OPTION), "bubbles");
-        press(&mut app, K::Tab, M::NONE);
         for name in [
             "classic", "cards", "compact", "minimal", "split", "bubbles", "classic",
         ] {
-            press(&mut app, K::Char('3'), M::NONE);
+            pick_option(&mut app, LAYOUT_OPTION);
             assert_eq!(app.option_value(LAYOUT_OPTION), name);
             assert_eq!(app.frame_theme().layout.message_layout.name(), name);
         }
-        press(&mut app, K::Char('3'), M::NONE);
+        pick_option(&mut app, LAYOUT_OPTION);
         assert_eq!(app.settings.appearance.layout, Some(MessageLayout::Cards));
         assert!(
             app.settings
@@ -10405,7 +10503,7 @@ mod tests {
                 .contains("layout = \"cards\"")
         );
         press(&mut app, K::Char('j'), M::NONE);
-        assert!(matches!(app.popup, Some(Popup::Options { sel }) if sel == AVATAR_OPTION));
+        assert!(matches!(app.popup, Some(Popup::Options { sel, .. }) if sel == AVATAR_OPTION));
         assert_eq!(app.option_value(AVATAR_OPTION), "square");
         assert_eq!(
             app.frame_theme().layout.avatar_shape,
@@ -10423,9 +10521,9 @@ mod tests {
             assert_eq!(app.option_value(AVATAR_OPTION), name);
             assert_eq!(app.frame_theme().layout.avatar_shape.name(), name);
         }
-        press(&mut app, K::Char('4'), M::NONE);
+        pick_option(&mut app, AVATAR_OPTION);
         assert_eq!(app.option_value(AVATAR_OPTION), "square");
-        assert!(matches!(app.popup, Some(Popup::Options { sel }) if sel == AVATAR_OPTION));
+        assert!(matches!(app.popup, Some(Popup::Options { sel, .. }) if sel == AVATAR_OPTION));
         press(&mut app, K::Char('l'), M::NONE);
         assert!(
             app.settings
@@ -10440,7 +10538,7 @@ mod tests {
         assert_eq!(app.option_value(LAYOUT_OPTION), "cards");
         press(&mut app, K::Char('j'), M::NONE);
         press(&mut app, K::Char('j'), M::NONE);
-        assert!(matches!(app.popup, Some(Popup::Options { sel }) if sel == WRITE_THEME_OPTION));
+        assert!(matches!(app.popup, Some(Popup::Options { sel, .. }) if sel == WRITE_THEME_OPTION));
         press(&mut app, K::Char('l'), M::NONE);
         assert!(
             app.status
@@ -10449,18 +10547,16 @@ mod tests {
         );
         assert_eq!(app.option_value(BORDER_OPTION), "plain");
         for name in ["thick", "double", "rounded", "plain"] {
-            press(&mut app, K::Char('2'), M::NONE);
+            pick_option(&mut app, BORDER_OPTION);
             assert_eq!(app.option_value(BORDER_OPTION), name);
         }
-        press(&mut app, K::Char('2'), M::NONE);
+        pick_option(&mut app, BORDER_OPTION);
         assert_eq!(app.border_style(), crate::config::BorderStyle::Thick);
         assert_eq!(app.message_layout(), MessageLayout::Cards);
-        press(&mut app, K::BackTab, M::NONE);
-        press(&mut app, K::BackTab, M::NONE);
-        press(&mut app, K::Char('2'), M::NONE);
+        pick_option(&mut app, SOUND_OPTION);
         assert!(!app.settings.notifications.sound);
         assert_eq!(app.option_value(SOUND_OPTION), "[ ]");
-        press(&mut app, K::Char('3'), M::NONE);
+        pick_option(&mut app, VOLUME_OPTION);
         assert_eq!(app.settings.volume(), 80);
         press(&mut app, K::Char('h'), M::NONE);
         press(&mut app, K::Char('h'), M::NONE);
@@ -10474,7 +10570,7 @@ mod tests {
         press(&mut app, K::Left, M::NONE);
         assert_eq!(app.settings.volume(), 0);
         press(&mut app, K::Char('k'), M::NONE);
-        assert!(matches!(app.popup, Some(Popup::Options { sel }) if sel == SOUND_OPTION));
+        assert!(matches!(app.popup, Some(Popup::Options { sel, .. }) if sel == SOUND_OPTION));
         press(&mut app, K::Char('l'), M::NONE);
         assert!(app.settings.notifications.sound);
         press(&mut app, K::Char('l'), M::NONE);
@@ -12334,18 +12430,18 @@ mod tests {
         leader(&mut app, 'o');
         assert_eq!(app.option_value(OPEN_FOCUS_OPTION), "smart");
         press(&mut app, K::BackTab, M::NONE);
-        assert!(matches!(app.popup, Some(Popup::Options { sel }) if sel == OPEN_FOCUS_OPTION));
-        press(&mut app, K::Char('1'), M::NONE);
+        assert!(matches!(app.popup, Some(Popup::Options { sel, .. }) if sel == OPEN_FOCUS_OPTION));
+        press(&mut app, K::Char(' '), M::NONE);
         assert_eq!(app.settings.navigation.open_chat_focus, OpenFocus::Composer);
         assert_eq!(app.option_value(OPEN_FOCUS_OPTION), "composer");
-        press(&mut app, K::Char('1'), M::NONE);
-        press(&mut app, K::Char('1'), M::NONE);
+        press(&mut app, K::Char(' '), M::NONE);
+        press(&mut app, K::Char(' '), M::NONE);
         assert_eq!(app.option_value(OPEN_FOCUS_OPTION), "smart");
         assert_eq!(app.option_value(AFTER_SEND_OPTION), "[ ]");
-        press(&mut app, K::Char('2'), M::NONE);
+        pick_option(&mut app, AFTER_SEND_OPTION);
         assert!(app.settings.navigation.after_send_next_unread);
         assert_eq!(app.option_value(AFTER_SEND_OPTION), "[x]");
-        assert!(matches!(app.popup, Some(Popup::Options { sel: 9 })));
+        assert!(matches!(app.popup, Some(Popup::Options { sel: 9, .. })));
     }
 
     #[test]
@@ -12358,19 +12454,19 @@ mod tests {
         for _ in 0..4 {
             press(&mut app, K::Tab, M::NONE);
         }
-        assert!(matches!(app.popup, Some(Popup::Options { sel }) if sel == ANIMATIONS_OPTION));
-        press(&mut app, K::Char('1'), M::NONE);
+        assert!(matches!(app.popup, Some(Popup::Options { sel, .. }) if sel == ANIMATIONS_OPTION));
+        press(&mut app, K::Char(' '), M::NONE);
         assert_eq!(
             app.settings.media.animations,
             crate::config::Animations::Selected
         );
-        assert!(matches!(app.popup, Some(Popup::Options { sel }) if sel == ANIMATIONS_OPTION));
+        assert!(matches!(app.popup, Some(Popup::Options { sel, .. }) if sel == ANIMATIONS_OPTION));
         press(&mut app, K::Char('l'), M::NONE);
         assert_eq!(app.option_value(ANIMATIONS_OPTION), "off");
         press(&mut app, K::Char('h'), M::NONE);
         press(&mut app, K::Char('h'), M::NONE);
         assert_eq!(app.option_value(ANIMATIONS_OPTION), "all visible");
-        press(&mut app, K::Char('2'), M::NONE);
+        pick_option(&mut app, MAX_ANIMATIONS_OPTION);
         assert_eq!(app.settings.media.max_animations(), 5);
         press(&mut app, K::Char('h'), M::NONE);
         press(&mut app, K::Char('h'), M::NONE);
@@ -12379,30 +12475,96 @@ mod tests {
         assert_eq!(app.settings.media.max_animations(), 4);
         press(&mut app, K::Char('j'), M::NONE);
         assert!(
-            matches!(app.popup, Some(Popup::Options { sel }) if sel == PAUSE_ANIMATIONS_OPTION)
+            matches!(app.popup, Some(Popup::Options { sel, .. }) if sel == PAUSE_ANIMATIONS_OPTION)
         );
         press(&mut app, K::Tab, M::NONE);
-        assert!(matches!(app.popup, Some(Popup::Options { sel }) if sel == TRANSLATE_OPTION));
+        assert!(matches!(app.popup, Some(Popup::Options { sel, .. }) if sel == TRANSLATE_OPTION));
         press(&mut app, K::BackTab, M::NONE);
-        assert!(matches!(app.popup, Some(Popup::Options { sel }) if sel == ANIMATIONS_OPTION));
-        press(&mut app, K::Char('3'), M::NONE);
+        assert!(matches!(app.popup, Some(Popup::Options { sel, .. }) if sel == ANIMATIONS_OPTION));
+        pick_option(&mut app, PAUSE_ANIMATIONS_OPTION);
         assert!(!app.settings.media.pause_unfocused);
         assert_eq!(app.option_value(PAUSE_ANIMATIONS_OPTION), "[ ]");
         assert!(
-            matches!(app.popup, Some(Popup::Options { sel }) if sel == PAUSE_ANIMATIONS_OPTION)
+            matches!(app.popup, Some(Popup::Options { sel, .. }) if sel == PAUSE_ANIMATIONS_OPTION)
         );
-        for (group, (_, items)) in OPTION_GROUPS.iter().enumerate() {
-            for (row, i) in items.iter().enumerate() {
-                let key = char::from_digit(row as u32 + 1, 10).unwrap();
-                assert_eq!(option_key(*i), key, "keys follow the rows of a group");
-                assert_eq!(option_for_key(group, key), Some(*i));
-            }
-            assert_eq!(option_for_key(group, '0'), None);
-        }
         let order: Vec<usize> = option_order().collect();
         for i in 0..OPTIONS.len() {
             assert_eq!(order.iter().filter(|o| **o == i).count(), 1, "option {i}");
         }
+    }
+
+    #[test]
+    fn options_navigation_is_one_clamped_list_with_sections() {
+        let (mut app, _log) = fake_app(Settings::default());
+        leader(&mut app, 'o');
+        press(&mut app, K::Char('k'), M::NONE);
+        assert!(matches!(app.popup, Some(Popup::Options { sel: 0, .. })));
+        press(&mut app, K::Char('G'), M::NONE);
+        let last = option_order().last().unwrap();
+        assert!(matches!(app.popup, Some(Popup::Options { sel, .. }) if sel == last));
+        press(&mut app, K::Char('j'), M::NONE);
+        assert!(matches!(app.popup, Some(Popup::Options { sel, .. }) if sel == last));
+        press(&mut app, K::Home, M::NONE);
+        assert!(matches!(app.popup, Some(Popup::Options { sel: 0, .. })));
+        press(&mut app, K::Tab, M::NONE);
+        let privacy = OPTION_GROUPS[1].1[0];
+        assert!(matches!(app.popup, Some(Popup::Options { sel, .. }) if sel == privacy));
+        press(&mut app, K::BackTab, M::NONE);
+        press(&mut app, K::BackTab, M::NONE);
+        assert!(matches!(app.popup, Some(Popup::Options { sel, .. }) if sel == OPEN_FOCUS_OPTION));
+        for _ in 0..OPTIONS.len() {
+            let before = match &app.popup {
+                Some(Popup::Options { sel, .. }) => *sel,
+                _ => unreachable!(),
+            };
+            press(&mut app, K::Char('k'), M::NONE);
+            let Some(Popup::Options { sel, .. }) = &app.popup else {
+                unreachable!()
+            };
+            assert!(*sel < OPTIONS.len() && (*sel != before || before == 0));
+        }
+    }
+
+    #[test]
+    fn options_filter_narrows_the_list_and_enter_toggles_the_match() {
+        let (mut app, _log) = fake_app(Settings::default());
+        leader(&mut app, 'o');
+        press(&mut app, K::Char('/'), M::NONE);
+        assert!(matches!(
+            &app.popup,
+            Some(Popup::Options {
+                filter: Some(_),
+                ..
+            })
+        ));
+        for c in "ghost".chars() {
+            press(&mut app, K::Char(c), M::NONE);
+        }
+        assert!(matches!(app.popup, Some(Popup::Options { sel: 2, .. })));
+        assert!(!app.settings.privacy.ghost_mode);
+        press(&mut app, K::Enter, M::NONE);
+        assert!(app.settings.privacy.ghost_mode);
+        press(&mut app, K::Backspace, M::NONE);
+        press(&mut app, K::Backspace, M::NONE);
+        press(&mut app, K::Backspace, M::NONE);
+        press(&mut app, K::Backspace, M::NONE);
+        press(&mut app, K::Backspace, M::NONE);
+        for c in "zzzz".chars() {
+            press(&mut app, K::Char(c), M::NONE);
+        }
+        assert!(option_matches("zzzz").is_empty());
+        press(&mut app, K::Enter, M::NONE);
+        assert!(app.settings.privacy.ghost_mode);
+        press(&mut app, K::Esc, M::NONE);
+        assert!(matches!(
+            app.popup,
+            Some(Popup::Options { filter: None, .. })
+        ));
+        press(&mut app, K::Esc, M::NONE);
+        assert!(app.popup.is_none());
+        assert_eq!(option_matches("privacy").len(), OPTION_GROUPS[1].1.len());
+        assert!(option_matches("Border").contains(&BORDER_OPTION));
+        assert_eq!(option_matches("").len(), OPTIONS.len());
     }
 
     #[test]
@@ -13185,15 +13347,100 @@ mod tests {
 
         app.settings = keeping();
         open_with_history(&mut app, 10);
-        app.popup = Some(Popup::Options { sel: 0 });
+        app.popup = Some(Popup::Options {
+            sel: 0,
+            filter: None,
+        });
         assert_eq!(app.option_value(CLEAR_DELETED_OPTION), "2 saved");
         pick_option(&mut app, CLEAR_DELETED_OPTION);
         assert!(matches!(app.popup, Some(Popup::ConfirmClearDeleted)));
         press(&mut app, K::Char('y'), M::NONE);
         assert_eq!(app.archive.len(), 0);
         assert!(!path.exists());
-        assert!(matches!(app.popup, Some(Popup::Options { sel }) if sel == CLEAR_DELETED_OPTION));
+        assert!(
+            matches!(app.popup, Some(Popup::Options { sel, .. }) if sel == CLEAR_DELETED_OPTION)
+        );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn own_deleted_messages_are_shown_only_when_asked_for() {
+        let (mut app, _log) = fake_app(keeping());
+        open_with_history(&mut app, 10);
+        saveable(&mut app, 10, &[100, 110]);
+        app.histories
+            .get_mut(&10)
+            .unwrap()
+            .get_mut(110)
+            .unwrap()
+            .outgoing = true;
+        app.on_update(delete_update(10, &[100, 110]));
+        let h = &app.histories[&10];
+        assert!(h.get(100).is_some_and(|m| m.deleted));
+        assert!(h.get(110).is_none(), "own message is hidden while off");
+        assert_eq!(
+            app.archive.len(),
+            2,
+            "still archived, so the toggle is reversible"
+        );
+
+        app.settings.privacy.keep_deleted_own = true;
+        saveable(&mut app, 10, &[120]);
+        app.histories
+            .get_mut(&10)
+            .unwrap()
+            .get_mut(120)
+            .unwrap()
+            .outgoing = true;
+        app.on_update(delete_update(10, &[120]));
+        assert!(app.histories[&10].get(120).is_some_and(|m| m.deleted));
+
+        let enriched = |app: &App| {
+            let ids: Vec<i64> = app
+                .enrich(10, Vec::new(), 100, 120)
+                .iter()
+                .map(|m| m.id)
+                .collect();
+            ids
+        };
+        app.histories.get_mut(&10).unwrap().remove(&[100, 120]);
+        assert_eq!(enriched(&app), vec![120, 110, 100]);
+        app.settings.privacy.keep_deleted_own = false;
+        assert_eq!(enriched(&app), vec![100]);
+        app.settings.privacy.keep_deleted_own = true;
+        assert_eq!(enriched(&app), vec![120, 110, 100]);
+    }
+
+    #[test]
+    fn switching_own_deleted_off_drops_only_own_from_the_view() {
+        let mut s = keeping();
+        s.privacy.keep_deleted_own = true;
+        let (mut app, _log) = fake_app(s);
+        open_with_history(&mut app, 10);
+        saveable(&mut app, 10, &[100, 110]);
+        app.histories
+            .get_mut(&10)
+            .unwrap()
+            .get_mut(110)
+            .unwrap()
+            .outgoing = true;
+        app.on_update(delete_update(10, &[100, 110]));
+        assert!(app.histories[&10].get(110).is_some_and(|m| m.deleted));
+        app.popup = Some(Popup::Options {
+            sel: 0,
+            filter: None,
+        });
+        assert_eq!(app.option_value(KEEP_DELETED_OWN_OPTION), "[x]");
+        pick_option(&mut app, KEEP_DELETED_OWN_OPTION);
+        assert_eq!(app.option_value(KEEP_DELETED_OWN_OPTION), "[ ]");
+        assert!(app.histories[&10].get(110).is_none());
+        assert!(app.histories[&10].get(100).is_some_and(|m| m.deleted));
+        assert!(
+            app.settings
+                .to_toml()
+                .unwrap()
+                .contains("keep_deleted_own = false")
+        );
     }
 
     #[test]
@@ -13324,6 +13571,7 @@ mod tests {
         let (mut app, log) = fake_app(Settings::default());
         app.popup = Some(Popup::Options {
             sel: HIDE_BLOCKED_OPTION,
+            filter: None,
         });
         pick_option(&mut app, HIDE_BLOCKED_OPTION);
         assert!(app.settings.privacy.hide_blocked);
@@ -13385,7 +13633,10 @@ mod tests {
         open_with_history(&mut app, 10);
         app.on_update(message_update(10, 500, story.clone()));
         assert!(app.histories[&10].get(500).is_some_and(|m| m.meta.story));
-        app.popup = Some(Popup::Options { sel: 0 });
+        app.popup = Some(Popup::Options {
+            sel: 0,
+            filter: None,
+        });
         pick_option(&mut app, HIDE_STORIES_OPTION);
         assert!(app.settings.privacy.hide_stories);
         app.on_update(message_update(10, 510, story.clone()));
@@ -13409,7 +13660,10 @@ mod tests {
     #[test]
     fn ids_seconds_and_exact_number_options() {
         let (mut app, _log) = fake_app(Settings::default());
-        app.popup = Some(Popup::Options { sel: 0 });
+        app.popup = Some(Popup::Options {
+            sel: 0,
+            filter: None,
+        });
         assert!(!app.frame_theme().layout.seconds);
         pick_option(&mut app, SECONDS_OPTION);
         assert!(app.frame_theme().layout.seconds);
@@ -14391,7 +14645,10 @@ mod tests {
         assert_eq!(logged(&log, "translate ").len(), 2);
         press(&mut app, K::Esc, M::NONE);
 
-        app.popup = Some(Popup::Options { sel: 0 });
+        app.popup = Some(Popup::Options {
+            sel: 0,
+            filter: None,
+        });
         pick_option(&mut app, TRANSLATE_OPTION);
         assert_eq!(app.settings.chats.translate_to, "en");
         assert_eq!(app.option_value(TRANSLATE_OPTION), "en");
@@ -14452,7 +14709,10 @@ mod tests {
         assert_eq!(app.folder_badge(ListId::Main).as_deref(), Some("1.2K"));
         app.settings.appearance.exact_numbers = true;
         assert_eq!(app.folder_badge(ListId::Main).as_deref(), Some("1234"));
-        app.popup = Some(Popup::Options { sel: 0 });
+        app.popup = Some(Popup::Options {
+            sel: 0,
+            filter: None,
+        });
         pick_option(&mut app, FOLDER_UNMUTED_OPTION);
         assert_eq!(app.folder_badge(ListId::Main).as_deref(), Some("7"));
         pick_option(&mut app, FOLDER_COUNTER_OPTION);
@@ -14737,7 +14997,10 @@ mod tests {
         app.attach_paths(vec![photo.clone()]);
         assert!(!app.composer.attachments[0].as_file);
         app.composer.attachments.clear();
-        app.popup = Some(Popup::Options { sel: 0 });
+        app.popup = Some(Popup::Options {
+            sel: 0,
+            filter: None,
+        });
         pick_option(&mut app, PHOTOS_AS_FILES_OPTION);
         assert_eq!(app.option_value(PHOTOS_AS_FILES_OPTION), "[x]");
         app.popup = None;
@@ -14764,7 +15027,10 @@ mod tests {
             app.status,
             Some(("saved to Saved Messages".to_owned(), false))
         );
-        app.popup = Some(Popup::Options { sel: 0 });
+        app.popup = Some(Popup::Options {
+            sel: 0,
+            filter: None,
+        });
         pick_option(&mut app, SAVE_TARGET_OPTION);
         assert_eq!(app.settings.chats.save_to_chat, 10);
         assert_eq!(app.option_value(SAVE_TARGET_OPTION), "chat 10");
@@ -14776,7 +15042,10 @@ mod tests {
             logged(&log, "forward ").last().unwrap(),
             "forward 10 [300] -> 10"
         );
-        app.popup = Some(Popup::Options { sel: 0 });
+        app.popup = Some(Popup::Options {
+            sel: 0,
+            filter: None,
+        });
         pick_option(&mut app, SAVE_TARGET_OPTION);
         assert_eq!(app.settings.chats.save_to_chat, 0);
     }
