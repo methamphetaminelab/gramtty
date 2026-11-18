@@ -178,7 +178,7 @@ impl App {
             v.token = self.next_token;
             v.loading = true;
             self.td
-                .search(self.next_token, None, query, false, None, None, None);
+                .search(self.next_token, None, None, query, false, None, None, None);
         }
     }
 
@@ -299,7 +299,7 @@ impl App {
                     v.paging = true;
                     let query = v.sent.clone().unwrap_or_default();
                     self.td
-                        .search(v.token, None, query, false, None, None, Some(cursor));
+                        .search(v.token, None, None, query, false, None, None, Some(cursor));
                 }
             }
             _ => {}
@@ -389,20 +389,27 @@ impl App {
             self.set_status(format!("joining {title}…"), false);
         } else {
             self.set_status(
-                format!("{title}: not joined · Alt-Enter on it in search joins"),
+                format!("{title}: not joined · <A-Enter> on it in search joins"),
                 false,
             );
         }
     }
 
     pub(super) fn open_search(&mut self, chat_id: Option<i64>, pinned: bool) {
-        let resume = |s: &mut SearchView| chat_id.is_some() && s.chat_id == chat_id && !s.browse;
+        let topic = chat_id
+            .filter(|c| self.open_chat == Some(*c))
+            .and_then(|c| self.histories.get(&c))
+            .and_then(|h| h.topic);
+        let resume = |s: &mut SearchView| {
+            chat_id.is_some() && s.chat_id == chat_id && s.topic == topic && !s.browse
+        };
         if !pinned && let Some(sv) = self.chat_search.take_if(resume) {
             self.popup = Some(Popup::Search(sv));
             return;
         }
         let mut sv = SearchView::new(chat_id, pinned);
         sv.pinned = pinned;
+        sv.topic = topic;
         self.popup = Some(Popup::Search(sv));
         if pinned {
             self.run_search();
@@ -447,7 +454,7 @@ impl App {
         sv.token = token;
         sv.loading = true;
         self.td.search(
-            token, sv.chat_id, query, sv.pinned, sv.sender, sv.media, None,
+            token, sv.chat_id, sv.topic, query, sv.pinned, sv.sender, sv.media, None,
         );
     }
 
@@ -664,6 +671,7 @@ fn next_page(sv: &mut SearchView, td: &Td, next_token: &mut u64) {
     td.search(
         sv.token,
         sv.chat_id,
+        sv.topic,
         query,
         sv.pinned,
         sv.sender,

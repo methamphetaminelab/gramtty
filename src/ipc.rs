@@ -104,40 +104,77 @@ fn utf16_len(c: char) -> usize {
 }
 
 pub fn split_text(text: &str, limit: usize) -> Vec<String> {
+    split_ranges(text, limit)
+        .into_iter()
+        .map(|r| text[r].to_owned())
+        .collect()
+}
+
+pub fn split_rich(rich: &crate::model::RichText, limit: usize) -> Vec<crate::model::RichText> {
+    split_ranges(&rich.text, limit)
+        .into_iter()
+        .map(|r| {
+            let start = rich.text[..r.start].encode_utf16().count();
+            let end = rich.text[..r.end].encode_utf16().count();
+            let entities = rich
+                .entities
+                .iter()
+                .filter_map(|e| {
+                    let from = e.offset.max(start);
+                    let to = (e.offset + e.length).min(end);
+                    (from < to).then(|| crate::model::Entity {
+                        offset: from - start,
+                        length: to - from,
+                        kind: e.kind.clone(),
+                    })
+                })
+                .collect();
+            crate::model::RichText {
+                text: rich.text[r].to_owned(),
+                entities,
+            }
+        })
+        .collect()
+}
+
+fn split_ranges(text: &str, limit: usize) -> Vec<std::ops::Range<usize>> {
     let limit = limit.max(2);
-    let mut parts: Vec<String> = Vec::new();
-    let mut current = String::new();
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut pos = 0;
     let mut used = 0;
     for line in text.split_inclusive('\n') {
         let len: usize = line.chars().map(utf16_len).sum();
         if used + len <= limit {
-            current.push_str(line);
+            pos += line.len();
             used += len;
             continue;
         }
-        if !current.is_empty() {
-            parts.push(std::mem::take(&mut current));
+        if pos > start {
+            parts.push(start..pos);
+            start = pos;
             used = 0;
         }
         if len <= limit {
-            current.push_str(line);
+            pos += line.len();
             used = len;
             continue;
         }
         for c in line.chars() {
             let n = utf16_len(c);
             if used + n > limit {
-                parts.push(std::mem::take(&mut current));
+                parts.push(start..pos);
+                start = pos;
                 used = 0;
             }
-            current.push(c);
+            pos += c.len_utf8();
             used += n;
         }
     }
-    if !current.is_empty() {
-        parts.push(current);
+    if pos > start {
+        parts.push(start..pos);
     }
-    parts.retain(|p| !p.trim().is_empty());
+    parts.retain(|r| !text[r.clone()].trim().is_empty());
     parts
 }
 
@@ -692,6 +729,55 @@ mod tests {
         assert_eq!(parts[0], "ab\n");
         assert!(parts.iter().all(|p| utf16(p) <= 10));
         assert_eq!(parts.concat(), format!("ab\n{line}\ncd"));
+    }
+
+    #[test]
+    fn rich_split_clips_entities_to_each_part() {
+        use crate::model::{Entity, EntityKind, RichText};
+        let rich = RichText {
+            text: "aaaa\nbbbb\ncccc\n".to_owned(),
+            entities: vec![
+                Entity {
+                    offset: 2,
+                    length: 10,
+                    kind: EntityKind::Bold,
+                },
+                Entity {
+                    offset: 11,
+                    length: 2,
+                    kind: EntityKind::Italic,
+                },
+            ],
+        };
+        let parts = split_rich(&rich, 10);
+        assert_eq!(
+            parts,
+            [
+                RichText {
+                    text: "aaaa\nbbbb\n".to_owned(),
+                    entities: vec![Entity {
+                        offset: 2,
+                        length: 8,
+                        kind: EntityKind::Bold,
+                    }],
+                },
+                RichText {
+                    text: "cccc\n".to_owned(),
+                    entities: vec![
+                        Entity {
+                            offset: 0,
+                            length: 2,
+                            kind: EntityKind::Bold,
+                        },
+                        Entity {
+                            offset: 1,
+                            length: 2,
+                            kind: EntityKind::Italic,
+                        },
+                    ],
+                },
+            ]
+        );
     }
 
     #[test]

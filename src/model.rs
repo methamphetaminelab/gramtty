@@ -10,7 +10,8 @@ pub enum EntityKind {
     Link(Option<String>),
     Mention,
     MentionName(i64),
-    Quote,
+    Quote(bool),
+    CustomEmoji(i64),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -45,7 +46,7 @@ pub enum Sender {
 pub enum SendState {
     Sent,
     Pending,
-    Failed(String),
+    Failed { error: String, can_retry: bool },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -84,10 +85,48 @@ pub struct MsgMeta {
     pub can_be_saved: bool,
     pub channel_post: bool,
     pub reply_chat: i64,
+    pub reply_msg: i64,
+    pub reply_quote: Option<String>,
+    pub reply_origin: Option<Origin>,
+    pub reply_media: Option<String>,
     pub via_bot: i64,
     pub signature: String,
     pub story: bool,
     pub reactors_visible: bool,
+    pub force_reply: bool,
+    pub poll: Option<Poll>,
+    pub link_preview: Option<LinkPreview>,
+    pub comments: bool,
+    pub thread: i64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct Poll {
+    pub options: Vec<PollOption>,
+    pub voters: i32,
+    pub closed: bool,
+    pub multiple: bool,
+    pub quiz: bool,
+}
+
+impl Poll {
+    pub fn voted(&self) -> bool {
+        self.options.iter().any(|o| o.chosen)
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct PollOption {
+    pub text: String,
+    pub chosen: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct LinkPreview {
+    pub site: String,
+    pub title: String,
+    pub description: String,
+    pub above: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -111,10 +150,10 @@ pub fn reaction_chip(label: Option<&str>) -> String {
         .unwrap_or_else(|| crate::format::EMOJI_PLACEHOLDER.to_owned())
 }
 
-pub fn reactions_text(
+pub fn reaction_chips(
     reactions: &[Reaction],
     custom: &std::collections::HashMap<i64, String>,
-) -> String {
+) -> Vec<(String, bool)> {
     reactions
         .iter()
         .map(|r| {
@@ -123,15 +162,9 @@ pub fn reactions_text(
             } else {
                 custom.get(&r.custom).map(String::as_str)
             };
-            format!(
-                "{} {}{}",
-                reaction_chip(label),
-                r.count,
-                if r.chosen { "•" } else { "" }
-            )
+            (format!("{} {}", reaction_chip(label), r.count), r.chosen)
         })
-        .collect::<Vec<_>>()
-        .join("  ")
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -290,6 +323,7 @@ pub struct Attachment {
     pub name: String,
     pub mime: String,
     pub waveform: Vec<u8>,
+    pub spoiler: bool,
 }
 
 impl Attachment {
@@ -306,6 +340,7 @@ impl Attachment {
             name: String::new(),
             mime: String::new(),
             waveform: Vec::new(),
+            spoiler: false,
         }
     }
 
@@ -384,6 +419,7 @@ pub struct History {
     pub topic: Option<i32>,
     pub general: bool,
     pub error: Option<String>,
+    pub thread: i64,
 }
 
 pub const PRELOAD_MARGIN: usize = 8;
@@ -401,6 +437,9 @@ impl History {
     }
 
     pub fn accepts(&self, msg: &Msg) -> bool {
+        if self.thread != 0 {
+            return msg.meta.thread == self.thread || msg.id == self.thread;
+        }
         topic_matches(msg.topic, self.topic, self.general)
     }
 
@@ -616,6 +655,12 @@ pub enum ChatKind {
     Secret(i64),
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct NotifyPrefs {
+    pub show_preview: Option<bool>,
+    pub mentions_off: Option<bool>,
+}
+
 #[derive(Clone, Debug)]
 pub struct ChatInfo {
     pub id: i64,
@@ -638,6 +683,9 @@ pub struct ChatInfo {
     pub perms: Rights,
     pub protected: bool,
     pub reactions_off: bool,
+    pub marked_unread: bool,
+    pub notify: NotifyPrefs,
+    pub clearable: (bool, bool),
 }
 
 impl ChatInfo {
@@ -1194,6 +1242,9 @@ mod tests {
             perms: Rights::default(),
             protected: false,
             reactions_off: false,
+            marked_unread: false,
+            notify: NotifyPrefs::default(),
+            clearable: (false, false),
         };
         let mut chats = [mk(1, 10), mk(2, 30), mk(3, 20)];
         assert_eq!(sorted_chat_ids(chats.iter(), ListId::Main), vec![2, 3, 1]);
@@ -1259,26 +1310,33 @@ mod tests {
             chosen: false,
         };
         let none = std::collections::HashMap::new();
+        let text = |chips: Vec<(String, bool)>| {
+            chips
+                .into_iter()
+                .map(|(t, mine)| if mine { format!("<{t}>") } else { t })
+                .collect::<Vec<_>>()
+                .join("  ")
+        };
         assert_eq!(
-            reactions_text(
+            text(reaction_chips(
                 &[r("❤", 3, false), r("👍", 1, true), r("🔥", 1, false)],
                 &none
-            ),
-            "❤\u{FE0F} 3  👍 1•  🔥 1"
+            )),
+            "❤\u{FE0F} 3  <👍 1>  🔥 1"
         );
-        assert_eq!(reactions_text(&[custom_emoji(7, 1)], &none), "• 1");
+        assert_eq!(text(reaction_chips(&[custom_emoji(7, 1)], &none)), "• 1");
         let known = std::collections::HashMap::from([(7, "🎉".to_owned())]);
         assert_eq!(
-            reactions_text(&[custom_emoji(7, 2), r("❤", 1, false)], &known),
+            text(reaction_chips(&[custom_emoji(7, 2), r("❤", 1, false)], &known)),
             "🎉 2  ❤\u{FE0F} 1"
         );
         let blank =
             std::collections::HashMap::from([(7, String::new()), (8, "\u{E000}".to_owned())]);
         assert_eq!(
-            reactions_text(&[custom_emoji(7, 1), custom_emoji(8, 2)], &blank),
+            text(reaction_chips(&[custom_emoji(7, 1), custom_emoji(8, 2)], &blank)),
             "• 1  • 2"
         );
-        assert_eq!(reactions_text(&[], &none), "");
+        assert!(reaction_chips(&[], &none).is_empty());
         let mut m = msg(1);
         m.body = RichText::plain("hi\nthere");
         assert_eq!(preview(&m), "hi there");

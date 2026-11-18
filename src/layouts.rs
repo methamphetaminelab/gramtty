@@ -5,6 +5,7 @@ struct RunPos<'a> {
     new_day: bool,
     first: bool,
     last: bool,
+    unread: bool,
     group_chat: bool,
 }
 
@@ -22,13 +23,18 @@ fn run_pos<'a>(
     let sel = split.and_then(|c| c.sel);
     let is_sel = |i: usize| sel.is_some_and(|(s, e)| (s..e).contains(&i));
     let breaks = |a: usize, b: usize| is_sel(a) != is_sel(b) || is_sel(a);
+    let unread = starts_unread(app, msgs, range.start);
     RunPos {
         prev,
         new_day,
         first: new_day
+            || unread
             || prev.is_none_or(|p| !same_run(p, m))
             || (range.start > 0 && breaks(range.start - 1, range.start)),
-        last: next.is_none_or(|n| !same_run(last, n)) || breaks(range.end - 1, range.end),
+        last: next.is_none_or(|n| !same_run(last, n))
+            || breaks(range.end - 1, range.end)
+            || starts_unread(app, msgs, range.end),
+        unread,
         group_chat: app
             .chats
             .get(&m.chat_id)
@@ -50,6 +56,12 @@ fn lead(ctx: Ctx, pos: &RunPos, date: i64, airy: bool) -> Vec<Line<'static>> {
         }
     } else if pos.first && airy {
         lines.push(Line::default());
+    }
+    if pos.unread {
+        lines.push(unread_separator(ctx));
+        if airy {
+            lines.push(Line::default());
+        }
     }
     lines
 }
@@ -272,11 +284,12 @@ pub(super) fn minimal_block(
             theme::forwarded(),
         )));
     }
-    if let Some((sender, name, text)) = reply_parts(app, m) {
+    if let Some((sender, name, text)) = reply_parts(app, m, ctx.lang) {
         let bar = format!("{} ", th.glyphs.reply_bar);
         let room = text_w.saturating_sub(bar.width());
         let label = match (name.is_empty(), text.is_empty()) {
-            (true, _) => match ctx.lang {
+            (true, false) => text,
+            (true, true) => match ctx.lang {
                 format::Lang::Ru => "ответ".to_owned(),
                 format::Lang::En => "reply".to_owned(),
             },
@@ -430,13 +443,18 @@ fn card_need(part: &CardPart) -> usize {
     body_w.max(image_w).max(title_w)
 }
 
-pub(super) fn card_run(msgs: &[Msg], range: &std::ops::Range<usize>) -> std::ops::Range<usize> {
+pub(super) fn card_run(
+    app: &App,
+    msgs: &[Msg],
+    range: &std::ops::Range<usize>,
+) -> std::ops::Range<usize> {
+    let joined = |i: usize| same_run(&msgs[i - 1], &msgs[i]) && !starts_unread(app, msgs, i);
     let mut start = range.start;
-    while start > 0 && same_run(&msgs[start - 1], &msgs[start]) {
+    while start > 0 && joined(start) {
         start -= 1;
     }
     let mut end = range.end;
-    while end < msgs.len() && same_run(&msgs[end - 1], &msgs[end]) {
+    while end < msgs.len() && joined(end) {
         end += 1;
     }
     start..end
@@ -491,7 +509,7 @@ pub(super) fn cards_block(
         .min(room);
     let inner_max = outer_max.saturating_sub(4).max(2);
     let part = card_part(app, msgs, range.clone(), ctx, inner_max);
-    let run = card_run(msgs, &range);
+    let run = card_run(app, msgs, &range);
     let run_last = &msgs[run.end - 1];
     let footer = card_footer(app, run_last, flags(&msgs[run.clone()]), ctx.lang);
     let mut need = card_need(&part).max(spans_width(&footer));

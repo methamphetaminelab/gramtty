@@ -27,13 +27,14 @@ pub struct Cell {
 pub fn entity_style(kind: &EntityKind, style: Style) -> Style {
     match kind {
         EntityKind::Bold => style.add_modifier(Modifier::BOLD),
-        EntityKind::Italic | EntityKind::Quote => style.add_modifier(Modifier::ITALIC),
+        EntityKind::Italic | EntityKind::Quote(_) => style.add_modifier(Modifier::ITALIC),
         EntityKind::Underline => style.add_modifier(Modifier::UNDERLINED),
         EntityKind::Strike => style.add_modifier(Modifier::CROSSED_OUT),
         EntityKind::Spoiler => style.patch(theme::spoiler()),
         EntityKind::Code | EntityKind::Pre(_) => style.patch(theme::code()),
         EntityKind::Link(_) => style.patch(theme::link()),
         EntityKind::Mention | EntityKind::MentionName(_) => style.patch(theme::mention()),
+        EntityKind::CustomEmoji(_) => style,
     }
 }
 
@@ -81,7 +82,7 @@ pub fn styled_cells(rt: &RichText, base: Style) -> Vec<Cell> {
             }
             match &e.kind {
                 EntityKind::Pre(_) => block = Block::Pre,
-                EntityKind::Quote if block == Block::None => block = Block::Quote,
+                EntityKind::Quote(_) if block == Block::None => block = Block::Quote,
                 _ => {}
             }
         }
@@ -229,11 +230,19 @@ pub fn utf16_slice(text: &str, offset: usize, length: usize) -> String {
     out
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkKind {
+    Url,
+    Search,
+    Command,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Link {
     pub url: String,
     pub hidden: bool,
     pub text: String,
+    pub kind: LinkKind,
 }
 
 pub fn links(rt: &RichText) -> Vec<Link> {
@@ -242,23 +251,33 @@ pub fn links(rt: &RichText) -> Vec<Link> {
         .iter()
         .filter_map(|e| {
             let shown = utf16_slice(&rt.text, e.offset, e.length);
-            let (url, hidden) = match &e.kind {
+            let (url, hidden, kind) = match &e.kind {
                 EntityKind::Link(Some(url)) => (
                     url.clone(),
                     normalize_url(shown.trim()) != normalize_url(url),
+                    LinkKind::Url,
                 ),
-                EntityKind::Link(None) => (shown.clone(), false),
+                EntityKind::Link(None) => (shown.clone(), false, LinkKind::Url),
+                EntityKind::Mention if shown.chars().count() > 1 && shown.starts_with(['#', '$']) => {
+                    (shown.clone(), false, LinkKind::Search)
+                }
+                EntityKind::Mention if shown.chars().count() > 1 && shown.starts_with('/') => {
+                    (shown.clone(), false, LinkKind::Command)
+                }
                 EntityKind::Mention => {
                     let name = shown.strip_prefix('@').filter(|n| !n.is_empty())?;
-                    (format!("https://t.me/{name}"), false)
+                    (format!("https://t.me/{name}"), false, LinkKind::Url)
                 }
-                EntityKind::MentionName(id) => (format!("tg://user?id={id}"), false),
+                EntityKind::MentionName(id) => {
+                    (format!("tg://user?id={id}"), false, LinkKind::Url)
+                }
                 _ => return None,
             };
             Some(Link {
                 url,
                 hidden,
                 text: shown,
+                kind,
             })
         })
         .filter(|l| !l.url.is_empty() && seen.insert(l.url.clone()))
@@ -319,9 +338,19 @@ pub fn user_link(url: &str) -> Option<i64> {
 pub fn normalize_url(url: &str) -> String {
     if url.contains("://") || url.starts_with("mailto:") || url.starts_with("tg:") {
         url.to_owned()
+    } else if is_email(url) {
+        format!("mailto:{url}")
     } else {
         format!("https://{url}")
     }
+}
+
+fn is_email(s: &str) -> bool {
+    !s.contains(['/', ':', '?', '#'])
+        && !s.contains(char::is_whitespace)
+        && s.split_once('@').is_some_and(|(user, host)| {
+            !user.is_empty() && !host.is_empty() && !host.contains('@')
+        })
 }
 
 pub fn duration(secs: i32) -> String {
@@ -928,7 +957,7 @@ mod tests {
     fn newlines_and_blocks() {
         let rt = RichText {
             text: "intro\nquoted\n\nend".to_owned(),
-            entities: vec![ent(6, 6, EntityKind::Quote)],
+            entities: vec![ent(6, 6, EntityKind::Quote(false))],
         };
         let lines = render_text(&rt, Style::default(), 40);
         let texts: Vec<String> = lines.iter().map(text_of).collect();
@@ -939,7 +968,7 @@ mod tests {
     fn wrapped_rows_report_where_the_text_sits_and_how_it_joins() {
         let rt = RichText {
             text: "hello brave\nabcdefgh\n\nquoted text".to_owned(),
-            entities: vec![ent(22, 11, EntityKind::Quote)],
+            entities: vec![ent(22, 11, EntityKind::Quote(false))],
         };
         let rows: Vec<(String, Wrap)> = render_rows(&rt, Style::default(), 7)
             .iter()
@@ -992,6 +1021,15 @@ mod tests {
     }
 
     #[test]
+    fn a_bare_email_address_opens_as_mailto() {
+        assert_eq!(normalize_url("user@host.org"), "mailto:user@host.org");
+        assert_eq!(normalize_url("mailto:a@b.c"), "mailto:a@b.c");
+        assert_eq!(normalize_url("https://user@host.org"), "https://user@host.org");
+        assert_eq!(normalize_url("user@host.org/path"), "https://user@host.org/path");
+        assert_eq!(normalize_url("user:pw@host.org"), "https://user:pw@host.org");
+    }
+
+    #[test]
     fn mentions_become_telegram_links_in_text_order() {
         let rt = RichText {
             text: "@durov, Alice #tag @ t.me/rust @durov".to_owned(),
@@ -1008,11 +1046,48 @@ mod tests {
         let urls: Vec<&str> = found.iter().map(|l| l.url.as_str()).collect();
         assert_eq!(
             urls,
-            vec!["https://t.me/durov", "tg://user?id=42", "t.me/rust"]
+            vec!["https://t.me/durov", "tg://user?id=42", "#tag", "t.me/rust"]
         );
         let texts: Vec<&str> = found.iter().map(|l| l.text.as_str()).collect();
-        assert_eq!(texts, vec!["@durov", "Alice", "t.me/rust"]);
+        assert_eq!(texts, vec!["@durov", "Alice", "#tag", "t.me/rust"]);
         assert!(found.iter().all(|l| !l.hidden));
+        let kinds: Vec<LinkKind> = found.iter().map(|l| l.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                LinkKind::Url,
+                LinkKind::Url,
+                LinkKind::Search,
+                LinkKind::Url
+            ]
+        );
+    }
+
+    #[test]
+    fn hashtags_cashtags_and_bot_commands_are_actionable() {
+        let rt = RichText {
+            text: "$USD /get_info@my_bot #news # /".to_owned(),
+            entities: vec![
+                ent(0, 4, EntityKind::Mention),
+                ent(5, 16, EntityKind::Mention),
+                ent(22, 5, EntityKind::Mention),
+                ent(28, 1, EntityKind::Mention),
+                ent(30, 1, EntityKind::Mention),
+            ],
+        };
+        let found: Vec<(String, LinkKind)> =
+            links(&rt).into_iter().map(|l| (l.text, l.kind)).collect();
+        assert_eq!(
+            found,
+            vec![
+                ("$USD".to_owned(), LinkKind::Search),
+                ("/get_info@my_bot".to_owned(), LinkKind::Command),
+                ("#news".to_owned(), LinkKind::Search),
+            ]
+        );
+        let sent = crate::markup::parse("/get_info@my_bot").rich;
+        assert_eq!(sent.text, "/get_info@my_bot");
+        assert!(sent.entities.is_empty());
     }
 
     #[test]

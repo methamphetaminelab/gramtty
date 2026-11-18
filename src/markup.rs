@@ -5,6 +5,7 @@ use crate::model::{Entity, EntityKind, RichText};
 
 const MARKER_CHARS: &[char] = &['\\', '*', '_', '~', '|', '`', '[', ']', '<', '>'];
 const MENTION_PREFIX: &str = "tg://user?id=";
+const EMOJI_PREFIX: &str = "tg://emoji?id=";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Parsed {
@@ -32,7 +33,7 @@ fn is_marker_char(c: char) -> bool {
 
 fn rank(kind: &EntityKind) -> u8 {
     match kind {
-        EntityKind::Quote => 0,
+        EntityKind::Quote(_) => 0,
         EntityKind::Pre(_) => 1,
         EntityKind::Bold => 2,
         EntityKind::Italic => 3,
@@ -43,6 +44,7 @@ fn rank(kind: &EntityKind) -> u8 {
         EntityKind::MentionName(_) => 8,
         EntityKind::Code => 9,
         EntityKind::Mention => 10,
+        EntityKind::CustomEmoji(_) => 11,
     }
 }
 
@@ -60,8 +62,13 @@ fn mention_id(url: &str) -> Option<i64> {
     url.strip_prefix(MENTION_PREFIX)?.parse().ok()
 }
 
-fn is_quote_line(chars: &[char], line: (usize, usize)) -> bool {
-    chars[line.0..line.1].starts_with(&['>', ' '])
+fn quote_line(chars: &[char], line: (usize, usize)) -> Option<bool> {
+    let line = &chars[line.0..line.1];
+    if line.starts_with(&['>', '>', ' ']) {
+        Some(true)
+    } else {
+        line.starts_with(&['>', ' ']).then_some(false)
+    }
 }
 
 fn fence_at(chars: &[char], lines: &[(usize, usize)], i: usize) -> Option<(String, usize)> {
@@ -273,9 +280,13 @@ impl Builder {
         if url.is_empty() {
             return None;
         }
-        let kind = match mention_id(&url) {
-            Some(id) => EntityKind::MentionName(id),
-            None => EntityKind::Link(Some(url)),
+        let emoji = url
+            .strip_prefix(EMOJI_PREFIX)
+            .and_then(|id| id.parse().ok());
+        let kind = match (mention_id(&url), emoji) {
+            (Some(id), _) => EntityKind::MentionName(id),
+            (None, Some(id)) => EntityKind::CustomEmoji(id),
+            (None, None) => EntityKind::Link(Some(url)),
         };
         self.marker(seg, i, i + 1);
         let start = self.pos16;
@@ -326,14 +337,11 @@ pub fn parse(source: &str) -> Parsed {
             i = close + 1;
             continue;
         }
-        let quoted = is_quote_line(&chars, lines[i]);
+        let quoted = quote_line(&chars, lines[i]);
         let mut j = i;
         while j < lines.len()
-            && if quoted {
-                is_quote_line(&chars, lines[j])
-            } else {
-                !is_quote_line(&chars, lines[j]) && fence_at(&chars, &lines, j).is_none()
-            }
+            && quote_line(&chars, lines[j]) == quoted
+            && (quoted.is_some() || fence_at(&chars, &lines, j).is_none())
         {
             j += 1;
         }
@@ -342,11 +350,13 @@ pub fn parse(source: &str) -> Parsed {
             if n > 0 {
                 seg.push(('\n', lines[i + n - 1].1));
             }
-            let from = if quoted {
-                b.markers.push(line.0..line.0 + 2);
-                line.0 + 2
-            } else {
-                line.0
+            let from = match quoted {
+                Some(expandable) => {
+                    let mark = if expandable { 3 } else { 2 };
+                    b.markers.push(line.0..line.0 + mark);
+                    line.0 + mark
+                }
+                None => line.0,
             };
             seg.extend((from..line.1).map(|p| (chars[p], p)));
         }
@@ -356,11 +366,12 @@ pub fn parse(source: &str) -> Parsed {
         emitted = true;
         let begin = b.pos16;
         b.inline(&seg, 0, seg.len());
-        if quoted {
+        if let Some(expandable) = quoted {
             if let (Some(first), Some(last)) = (seg.first(), seg.last()) {
-                b.styled.push((first.1..last.1 + 1, EntityKind::Quote));
+                b.styled
+                    .push((first.1..last.1 + 1, EntityKind::Quote(expandable)));
             }
-            b.entity(begin, EntityKind::Quote);
+            b.entity(begin, EntityKind::Quote(expandable));
         }
         i = j;
     }
@@ -441,6 +452,7 @@ fn close_mark(kind: &EntityKind) -> String {
             s
         }
         EntityKind::MentionName(id) => format!("]({MENTION_PREFIX}{id})"),
+        EntityKind::CustomEmoji(id) => format!("]({EMOJI_PREFIX}{id})"),
         other => open_mark(other).to_owned(),
     }
 }
@@ -479,6 +491,7 @@ fn block_tokens(chars: &[char], base: usize, spans: Vec<Span>) -> Vec<Tok> {
                     | EntityKind::Code
                     | EntityKind::Link(Some(_))
                     | EntityKind::MentionName(_)
+                    | EntityKind::CustomEmoji(_)
             ) && s.start < end
                 && s.end > base
         })
@@ -579,6 +592,7 @@ fn render(toks: &[Tok]) -> String {
     for (i, tok) in toks.iter().enumerate() {
         let prev = i.checked_sub(1).and_then(|p| toks[p].last());
         let next = toks.get(i + 1).and_then(Tok::first);
+        let after = toks.get(i + 2).and_then(Tok::first);
         match tok {
             Tok::Raw(c) => out.push(*c),
             Tok::Mark(m) => out.push_str(m),
@@ -590,7 +604,10 @@ fn render(toks: &[Tok]) -> String {
                     '[' => closer_after[i + 1],
                     ']' => next == Some('('),
                     '<' => matches!(next, Some('u' | '/')),
-                    '>' => line_start && next == Some(' '),
+                    '>' => {
+                        line_start
+                            && (next == Some(' ') || (next == Some('>') && after == Some(' ')))
+                    }
                     _ => false,
                 };
                 if escape {
@@ -599,7 +616,7 @@ fn render(toks: &[Tok]) -> String {
                 out.push(*c);
             }
         }
-        line_start = tok.is_newline() || (line_start && matches!(tok, Tok::Mark(m) if m == "> "));
+        line_start = tok.is_newline() || (line_start && matches!(tok, Tok::Mark(m) if m == "> " || m == ">> "));
     }
     out
 }
@@ -650,7 +667,7 @@ pub fn to_source(rt: &RichText) -> String {
     }
     let quotes: Vec<&Span> = spans
         .iter()
-        .filter(|s| s.kind == EntityKind::Quote)
+        .filter(|s| matches!(s.kind, EntityKind::Quote(_)))
         .collect();
     let touches = |line: (usize, usize), s: &Span| {
         if line.1 > line.0 {
@@ -663,7 +680,7 @@ pub fn to_source(rt: &RichText) -> String {
     #[derive(PartialEq, Clone, Copy)]
     enum Kind {
         Normal,
-        Quote,
+        Quote(bool),
         Pre(usize),
     }
     let kinds: Vec<Kind> = lines
@@ -671,8 +688,8 @@ pub fn to_source(rt: &RichText) -> String {
         .map(|&l| {
             if let Some(p) = pres.iter().position(|s| touches(l, s)) {
                 Kind::Pre(p)
-            } else if quotes.iter().any(|s| touches(l, s)) {
-                Kind::Quote
+            } else if let Some(q) = quotes.iter().find(|s| touches(l, s)) {
+                Kind::Quote(q.kind == EntityKind::Quote(true))
             } else {
                 Kind::Normal
             }
@@ -698,13 +715,14 @@ pub fn to_source(rt: &RichText) -> String {
             }
             kind => {
                 let mut toks = block_tokens(&chars[cs..ce], cs, spans.clone());
-                if kind == Kind::Quote {
-                    let mut prefixed = vec![Tok::Mark("> ".to_owned())];
+                if let Kind::Quote(expandable) = kind {
+                    let mark = if expandable { ">> " } else { "> " };
+                    let mut prefixed = vec![Tok::Mark(mark.to_owned())];
                     for t in toks {
                         let nl = t.is_newline();
                         prefixed.push(t);
                         if nl {
-                            prefixed.push(Tok::Mark("> ".to_owned()));
+                            prefixed.push(Tok::Mark(mark.to_owned()));
                         }
                     }
                     toks = prefixed;
@@ -1127,7 +1145,32 @@ mod tests {
     fn quote_run_is_one_entity_without_prefixes() {
         let p = parse("> one\n> two\nafter").rich;
         assert_eq!(p.text, "one\ntwo\nafter");
-        assert_eq!(p.entities, vec![ent(0, 7, EntityKind::Quote)]);
+        assert_eq!(p.entities, vec![ent(0, 7, EntityKind::Quote(false))]);
+    }
+
+    #[test]
+    fn double_marker_quotes_are_expandable_and_split_from_plain_quotes() {
+        let p = parse(">> one\n>> two\n> three").rich;
+        assert_eq!(p.text, "one\ntwo\nthree");
+        assert_eq!(
+            p.entities,
+            vec![
+                ent(0, 7, EntityKind::Quote(true)),
+                ent(8, 5, EntityKind::Quote(false))
+            ]
+        );
+        assert_round_trip(&p);
+        assert_plain(">>no space");
+        assert_round_trip(&rich(">> not a quote", Vec::new()));
+        assert_eq!(to_source(&rich(">> not a quote", Vec::new())), "\\>> not a quote");
+    }
+
+    #[test]
+    fn custom_emoji_links_keep_their_id() {
+        let p = parse("ok [👍](tg://emoji?id=42)").rich;
+        assert_eq!(p.text, "ok 👍");
+        assert_eq!(p.entities, vec![ent(3, 2, EntityKind::CustomEmoji(42))]);
+        assert_round_trip(&p);
     }
 
     #[test]
@@ -1137,7 +1180,7 @@ mod tests {
         assert_eq!(
             p.entities,
             vec![
-                ent(0, 5, EntityKind::Quote),
+                ent(0, 5, EntityKind::Quote(false)),
                 ent(2, 1, EntityKind::Bold),
                 ent(4, 1, EntityKind::Code),
             ]
@@ -1150,7 +1193,7 @@ mod tests {
         assert_eq!(p.text, "a\nmid\nb");
         assert_eq!(
             p.entities,
-            vec![ent(0, 1, EntityKind::Quote), ent(6, 1, EntityKind::Quote)]
+            vec![ent(0, 1, EntityKind::Quote(false)), ent(6, 1, EntityKind::Quote(false))]
         );
     }
 
@@ -1188,12 +1231,14 @@ mod tests {
             EntityKind::Code,
             EntityKind::Link(Some("https://e.com/a(b)".to_owned())),
             EntityKind::MentionName(7),
-            EntityKind::Quote,
+            EntityKind::Quote(false),
+            EntityKind::Quote(true),
+            EntityKind::CustomEmoji(5_368_324_170_671_202_286),
             EntityKind::Pre(None),
             EntityKind::Pre(Some("python".to_owned())),
         ];
         for kind in kinds {
-            if !matches!(kind, EntityKind::Quote | EntityKind::Pre(_)) {
+            if !matches!(kind, EntityKind::Quote(_) | EntityKind::Pre(_)) {
                 assert_round_trip(&rich("x word y", vec![ent(2, 4, kind.clone())]));
             }
             assert_round_trip(&rich("word", vec![ent(0, 4, kind.clone())]));
@@ -1213,7 +1258,7 @@ mod tests {
         assert_round_trip(&rich(
             "a b\nc d\ne",
             vec![
-                ent(0, 7, EntityKind::Quote),
+                ent(0, 7, EntityKind::Quote(false)),
                 ent(2, 1, EntityKind::Bold),
                 ent(4, 1, EntityKind::Code),
             ],

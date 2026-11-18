@@ -1,4 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
 
 #[derive(Clone, Debug, Default)]
@@ -118,36 +119,43 @@ impl TextInput {
     }
 
     pub fn insert_str(&mut self, s: &str) {
-        for ch in s.chars() {
-            if ch != '\r' {
-                self.insert(ch);
-            }
-        }
+        self.delete_selection();
+        let clean: String = s.chars().filter(|&ch| ch != '\r').collect();
+        let b = self.byte_at(self.cursor);
+        self.text.insert_str(b, &clean);
+        self.cursor += clean.chars().count();
+    }
+
+    fn prev_boundary(&self) -> usize {
+        let b = self.byte_at(self.cursor);
+        let step = self.text[..b]
+            .graphemes(true)
+            .next_back()
+            .map_or(0, |g| g.chars().count());
+        self.cursor - step
+    }
+
+    fn next_boundary(&self) -> usize {
+        let b = self.byte_at(self.cursor);
+        let step = self.text[b..]
+            .graphemes(true)
+            .next()
+            .map_or(0, |g| g.chars().count());
+        self.cursor + step
     }
 
     pub fn backspace(&mut self) -> bool {
         if self.delete_selection() {
             return true;
         }
-        if self.cursor == 0 {
-            return false;
-        }
-        self.cursor -= 1;
-        let b = self.byte_at(self.cursor);
-        self.text.remove(b);
-        true
+        self.remove_range(self.prev_boundary(), self.cursor)
     }
 
     pub fn delete(&mut self) -> bool {
         if self.delete_selection() {
             return true;
         }
-        if self.cursor >= self.len() {
-            return false;
-        }
-        let b = self.byte_at(self.cursor);
-        self.text.remove(b);
-        true
+        self.remove_range(self.cursor, self.next_boundary())
     }
 
     pub fn delete_word(&mut self) -> bool {
@@ -270,11 +278,15 @@ impl TextInput {
     }
 
     pub fn complete_mention(&mut self, username: &str) {
+        self.complete_mention_with(&format!("@{username}"));
+    }
+
+    pub fn complete_mention_with(&mut self, source: &str) {
         let Some(start) = self.mention_start() else {
             return;
         };
         self.remove_range(start, self.cursor);
-        self.insert_str(&format!("@{username} "));
+        self.insert_str(&format!("{source} "));
     }
 
     pub fn handle_key(&mut self, key: &KeyEvent, allow_newline: bool) -> Edit {
@@ -349,11 +361,11 @@ impl TextInput {
             KeyCode::Backspace => bool_edit(self.backspace()),
             KeyCode::Delete => bool_edit(self.delete()),
             KeyCode::Left => {
-                self.cursor = self.cursor.saturating_sub(1);
+                self.cursor = self.prev_boundary();
                 Edit::Moved
             }
             KeyCode::Right => {
-                self.cursor = (self.cursor + 1).min(self.len());
+                self.cursor = self.next_boundary();
                 Edit::Moved
             }
             KeyCode::Home => self.move_to(self.line_start()),
@@ -365,47 +377,74 @@ impl TextInput {
     }
 
     pub fn cursor_position(&self, width: usize) -> (usize, usize) {
-        let before: String = self.text.chars().take(self.cursor).collect();
+        let cur = self.byte_at(self.cursor);
         let mut row = 0;
-        let mut col = 0;
-        for line in before.split('\n').enumerate() {
-            if line.0 > 0 {
-                row += 1;
-            }
-            let w = line.1.width();
-            match (w.checked_div(width), w.checked_rem(width)) {
-                (Some(r), Some(c)) => {
-                    row += r;
-                    col = c;
+        let mut start = 0;
+        for line in self.text.split('\n') {
+            let end = start + line.len();
+            let rows = wrap_line(line, width);
+            if cur <= end {
+                let mut at = start;
+                for (i, r) in rows.iter().enumerate() {
+                    let r_end = at + r.len();
+                    if cur < r_end || i + 1 == rows.len() {
+                        let col = str_width(&self.text[at..cur]);
+                        return if width > 0 && col >= width {
+                            (row + i + 1, 0)
+                        } else {
+                            (row + i, col)
+                        };
+                    }
+                    at = r_end;
                 }
-                _ => col = w,
             }
+            row += rows.len();
+            start = end + 1;
         }
-        (row, col)
+        (row, 0)
     }
 
     pub fn visual_lines(&self, width: usize) -> Vec<String> {
-        let mut out = Vec::new();
-        for line in self.text.split('\n') {
-            if width == 0 || line.width() <= width {
-                out.push(line.to_owned());
-                continue;
-            }
-            let mut cur = String::new();
-            let mut w = 0;
-            for ch in line.chars() {
-                let cw = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
-                if w + cw > width {
-                    out.push(std::mem::take(&mut cur));
-                    w = 0;
-                }
-                cur.push(ch);
-                w += cw;
-            }
-            out.push(cur);
-        }
-        out
+        self.text
+            .split('\n')
+            .flat_map(|line| wrap_line(line, width))
+            .map(str::to_owned)
+            .collect()
     }
+}
+
+fn str_width(s: &str) -> usize {
+    s.graphemes(true).map(|g| g.width()).sum()
+}
+
+fn wrap_line(line: &str, width: usize) -> Vec<&str> {
+    let mut rows = Vec::new();
+    let mut start = 0;
+    let mut used = 0;
+    let mut brk: Option<(usize, usize)> = None;
+    for (b, g) in line.grapheme_indices(true) {
+        let gw = g.width();
+        let space = g.chars().all(char::is_whitespace);
+        if width > 0 && !space && used + gw > width {
+            if let Some((at, w)) = brk.filter(|&(at, _)| at > start) {
+                rows.push(&line[start..at]);
+                start = at;
+                used -= w;
+            }
+            if used + gw > width && b > start {
+                rows.push(&line[start..b]);
+                start = b;
+                used = 0;
+            }
+            brk = None;
+        }
+        used += gw;
+        if space {
+            brk = Some((b + g.len(), used));
+        }
+    }
+    rows.push(&line[start..]);
+    rows
 }
 
 fn bool_edit(changed: bool) -> Edit {
@@ -485,6 +524,45 @@ mod tests {
         let t = TextInput::with_text("abcdef\ngh");
         assert_eq!(t.visual_lines(4), vec!["abcd", "ef", "gh"]);
         assert_eq!(t.cursor_position(4), (2, 2));
+    }
+
+    #[test]
+    fn visual_lines_wrap_by_word_and_keep_the_cursor_in_step() {
+        let mut t = TextInput::with_text("hello big world abcdefghij");
+        assert_eq!(
+            t.visual_lines(8),
+            vec!["hello ", "big ", "world ", "abcdefgh", "ij"]
+        );
+        assert_eq!(t.cursor_position(8), (4, 2));
+        t.splice(0, 0, "", 9);
+        assert_eq!(t.cursor_position(8), (1, 3));
+        t.handle_key(&key(KeyCode::Right, KeyModifiers::NONE), true);
+        assert_eq!(t.cursor_position(8), (2, 0));
+        let chars: usize = t.visual_lines(8).iter().map(|l| l.chars().count()).sum();
+        assert_eq!(chars, t.text().chars().count());
+    }
+
+    #[test]
+    fn graphemes_move_and_delete_as_one_unit() {
+        let flag = "\u{1F1FA}\u{1F1E6}";
+        let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+        let thumb = "\u{1F44D}\u{1F3FD}";
+        let heart = "\u{2764}\u{FE0F}";
+        let mut t = TextInput::with_text(&format!("a{flag}{family}{thumb}{heart}"));
+        assert_eq!(t.cursor_position(0).1, 1 + 2 + 2 + 2 + 2);
+        t.backspace();
+        assert_eq!(t.text(), format!("a{flag}{family}{thumb}"));
+        press(&mut t, KeyCode::Left, KeyModifiers::NONE);
+        press(&mut t, KeyCode::Left, KeyModifiers::SHIFT);
+        assert_eq!(selected(&t), Some(family.to_owned()));
+        press(&mut t, KeyCode::Delete, KeyModifiers::NONE);
+        assert_eq!(t.text(), format!("a{flag}{thumb}"));
+        press(&mut t, KeyCode::Left, KeyModifiers::NONE);
+        t.delete();
+        assert_eq!(t.text(), format!("a{thumb}"));
+        t.insert_str("x\r\ny");
+        assert_eq!(t.text(), format!("ax\ny{thumb}"));
+        assert_eq!(t.cursor(), 4);
     }
 
     fn selected(t: &TextInput) -> Option<String> {

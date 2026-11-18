@@ -49,6 +49,11 @@ pub enum Event {
         target: i64,
         result: Result<Vec<Msg>, String>,
     },
+    Thread {
+        channel_id: i64,
+        post_id: i64,
+        result: Result<ThreadInfo, String>,
+    },
     EditText {
         chat_id: i64,
         message_id: i64,
@@ -137,6 +142,16 @@ pub enum Event {
         result: Result<Vec<(Sender, String)>, String>,
     },
     CustomEmoji(Result<std::collections::HashMap<i64, String>, String>),
+    Replied {
+        chat_id: i64,
+        message_id: i64,
+        result: Result<Option<Msg>, String>,
+    },
+    MentionMembers {
+        chat_id: i64,
+        query: String,
+        result: Result<Vec<i64>, String>,
+    },
     Search {
         token: u64,
         result: Result<Found, String>,
@@ -413,6 +428,13 @@ pub struct Answer {
     pub url: String,
 }
 
+#[derive(Debug)]
+pub struct ThreadInfo {
+    pub chat_id: i64,
+    pub thread_id: i64,
+    pub roots: Vec<Msg>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Flags {
     pub can_be_saved: bool,
@@ -487,10 +509,58 @@ fn execute(request: &serde_json::Value) -> Result<(), String> {
 }
 
 fn formatted_from_source(source: &str) -> types::FormattedText {
-    let rich = markup::parse(source).rich;
+    formatted(markup::parse(source).rich)
+}
+
+fn formatted(rich: RichText) -> types::FormattedText {
     types::FormattedText {
-        text: rich.text,
         entities: rich.entities.iter().filter_map(to_td_entity).collect(),
+        text: rich.text,
+    }
+}
+
+async fn send_in_order(
+    chat_id: i64,
+    topic: Option<enums::MessageTopic>,
+    mut reply: Option<enums::InputMessageReplyTo>,
+    parts: Vec<RichText>,
+    clear_draft: bool,
+    silent: bool,
+    c: i32,
+) -> Result<(), types::Error> {
+    for part in parts {
+        let content = enums::InputMessageContent::InputMessageText(types::InputMessageText {
+            text: formatted(part),
+            link_preview_options: None,
+            clear_draft,
+        });
+        tdlib_rs::functions::send_message(
+            chat_id,
+            topic.clone(),
+            reply.take(),
+            send_options(silent),
+            content,
+            c,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+fn send_options(silent: bool) -> Option<types::MessageSendOptions> {
+    silent.then(|| types::MessageSendOptions {
+        disable_notification: true,
+        ..Default::default()
+    })
+}
+
+fn caption_above_media(content: &MessageContent) -> bool {
+    match content {
+        MessageContent::MessagePhoto(p) => p.show_caption_above_media,
+        MessageContent::MessageVideo(v) => v.show_caption_above_media,
+        MessageContent::MessageAnimation(a) => a.show_caption_above_media,
+        MessageContent::MessagePaidMedia(p) => p.show_caption_above_media,
+        _ => false,
     }
 }
 
@@ -730,8 +800,11 @@ fn failure_label(context: &str) -> &str {
         "close chat" => "close the chat",
         "close" => "close the session",
         "mark read" => "mark messages as read",
+        "unmark unread" => "mark the chat as read",
         "open content" => "mark the message as listened",
         "delete" => "delete the messages",
+        "vote" => "send the vote",
+        "stop poll" => "stop the poll",
         "forward" => "forward the messages",
         "react" => "set the reaction",
         "resend" => "resend the message",
@@ -753,11 +826,17 @@ fn failure_label(context: &str) -> &str {
         "pin" => "pin the message",
         "unpin" => "unpin the message",
         "save draft" => "save the draft",
+        "cancel download" => "cancel the download",
         "chat notifications" => "change the chat notifications",
         "pin chat" => "pin or unpin the chat",
         "archive chat" => "move the chat to or from the archive",
         "leave chat" => "leave the chat",
         "delete chat" => "delete the chat",
+        "block" => "block the user",
+        "unblock" => "unblock the user",
+        "clear history" => "clear the history",
+        "mark unread" => "mark the chat as unread",
+        "unpin all" => "unpin all messages",
         other => other,
     }
 }
@@ -767,6 +846,21 @@ pub struct Td {
     pub client_id: i32,
     tx: UnboundedSender<Event>,
     log: Option<RequestLog>,
+    limits: std::sync::Arc<Limits>,
+}
+
+pub struct Limits {
+    text: std::sync::atomic::AtomicUsize,
+    caption: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            text: crate::ipc::MESSAGE_LIMIT.into(),
+            caption: upload::CAPTION_MAX.into(),
+        }
+    }
 }
 
 impl Td {
@@ -775,7 +869,30 @@ impl Td {
             client_id: tdlib_rs::create_client(),
             tx,
             log: None,
+            limits: std::sync::Arc::default(),
         }
+    }
+
+    pub fn set_limit(&self, option: &str, value: i64) {
+        let Ok(value) = usize::try_from(value) else {
+            return;
+        };
+        let slot = match option {
+            "message_text_length_max" => &self.limits.text,
+            "message_caption_length_max" => &self.limits.caption,
+            _ => return,
+        };
+        if value > 0 {
+            slot.store(value, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    pub fn text_max(&self) -> usize {
+        self.limits.text.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn caption_max(&self) -> usize {
+        self.limits.caption.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -786,6 +903,7 @@ impl Td {
                 client_id: 0,
                 tx,
                 log: Some(log.clone()),
+                limits: std::sync::Arc::default(),
             },
             log,
         )
@@ -981,15 +1099,16 @@ impl Td {
         initial: bool,
         epoch: u64,
         topic: Option<i32>,
+        thread: i64,
     ) {
-        self.note(format!("history {chat_id} topic {topic:?}"));
+        self.note(format!("history {chat_id} topic {topic:?}{}", thread_note(thread)));
         if self.fake("load history") {
             return;
         }
         let c = self.client_id;
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let ev = match history_page(chat_id, from_message_id, 0, 50, topic, c).await {
+            let ev = match history_page(chat_id, from_message_id, 0, 50, topic, thread, c).await {
                 Ok(msgs) => Event::History {
                     chat_id,
                     msgs,
@@ -1006,10 +1125,17 @@ impl Td {
         });
     }
 
-    pub fn load_newer(&self, chat_id: i64, from_message_id: i64, epoch: u64, topic: Option<i32>) {
+    pub fn load_newer(
+        &self,
+        chat_id: i64,
+        from_message_id: i64,
+        epoch: u64,
+        topic: Option<i32>,
+        thread: i64,
+    ) {
         let c = self.client_id;
         self.task("load newer", async move {
-            match history_page(chat_id, from_message_id, -49, 50, topic, c).await {
+            match history_page(chat_id, from_message_id, -49, 50, topic, thread, c).await {
                 Ok(msgs) => Event::NewerHistory {
                     chat_id,
                     msgs,
@@ -1020,8 +1146,11 @@ impl Td {
         });
     }
 
-    pub fn load_around(&self, chat_id: i64, target: i64, topic: Option<i32>) {
-        self.note(format!("around {chat_id} {target} topic {topic:?}"));
+    pub fn load_around(&self, chat_id: i64, target: i64, topic: Option<i32>, thread: i64) {
+        self.note(format!(
+            "around {chat_id} {target} topic {topic:?}{}",
+            thread_note(thread)
+        ));
         let c = self.client_id;
         self.task("load around", async move {
             let result = match tdlib_rs::functions::get_message(chat_id, target, c).await {
@@ -1029,7 +1158,7 @@ impl Td {
                 Err(e) => Err(failed("open that message", &friendly_error(&e))),
                 Ok(enums::Message::Message(m)) => {
                     around_window(convert_message(m), || {
-                        history_page(chat_id, target, AROUND_OFFSET, AROUND_LIMIT, topic, c)
+                        history_page(chat_id, target, AROUND_OFFSET, AROUND_LIMIT, topic, thread, c)
                     })
                     .await
                 }
@@ -1059,20 +1188,42 @@ impl Td {
         });
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn send_text(
         &self,
         chat_id: i64,
         text: String,
         reply_to: Option<i64>,
-        edit: Option<i64>,
+        edit: Option<(i64, bool)>,
         topic: Option<i32>,
+        thread: i64,
         quote: Option<(String, i32)>,
+        silent: bool,
     ) {
         self.note(format!(
-            "send {chat_id} topic {topic:?} reply {reply_to:?} edit {edit:?}"
+            "send {chat_id} topic {topic:?}{} reply {reply_to:?} edit {:?}",
+            thread_note(thread),
+            edit.map(|(id, _)| id)
         ));
+        if silent {
+            self.note(format!("silent {chat_id}"));
+        }
         if let Some((q, pos)) = &quote {
             self.note(format!("quote {pos} {q}"));
+        }
+        if let Some((id, true)) = edit {
+            self.note(format!("edit caption {id}"));
+        }
+        let parts = match edit {
+            Some(_) => Vec::new(),
+            None => {
+                let rich = markup::parse(&text).rich;
+                let parts = crate::ipc::split_rich(&rich, self.text_max());
+                if parts.is_empty() { vec![rich] } else { parts }
+            }
+        };
+        if parts.len() > 1 {
+            self.note(format!("split into {} parts", parts.len()));
         }
         if self.fake("send") {
             return;
@@ -1081,17 +1232,30 @@ impl Td {
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let result = async {
-                let formatted = formatted_from_source(&text);
-                let content =
-                    enums::InputMessageContent::InputMessageText(types::InputMessageText {
-                        text: formatted,
-                        link_preview_options: None,
-                        clear_draft: true,
-                    });
                 match edit {
-                    Some(message_id) => {
+                    Some((message_id, false)) => {
+                        let content =
+                            enums::InputMessageContent::InputMessageText(types::InputMessageText {
+                                text: formatted_from_source(&text),
+                                link_preview_options: None,
+                                clear_draft: true,
+                            });
                         tdlib_rs::functions::edit_message_text(chat_id, message_id, content, c)
                             .await
+                            .map(drop)
+                    }
+                    Some((message_id, true)) => {
+                        let enums::Message::Message(m) =
+                            tdlib_rs::functions::get_message(chat_id, message_id, c).await?;
+                        tdlib_rs::functions::edit_message_caption(
+                            chat_id,
+                            message_id,
+                            Some(formatted_from_source(&text)),
+                            caption_above_media(&m.content),
+                            c,
+                        )
+                        .await
+                        .map(drop)
                     }
                     None => {
                         let reply = reply_to.map(|message_id| {
@@ -1107,15 +1271,8 @@ impl Td {
                                 checklist_task_id: 0,
                             })
                         });
-                        tdlib_rs::functions::send_message(
-                            chat_id,
-                            message_topic(topic),
-                            reply,
-                            None,
-                            content,
-                            c,
-                        )
-                        .await
+                        let topic = thread_topic(thread).or(message_topic(topic));
+                        send_in_order(chat_id, topic, reply, parts, true, silent, c).await
                     }
                 }
             }
@@ -1131,28 +1288,23 @@ impl Td {
         });
     }
 
-    pub fn send_plain(&self, chat_id: i64, body: RichText) {
-        self.note(format!(
-            "send plain {chat_id} {:?} {:?}",
-            body.text, body.entities
-        ));
+    pub fn send_plain(&self, chat_id: i64, bodies: Vec<RichText>, topic: Option<i32>, thread: i64) {
+        for body in &bodies {
+            self.note(format!(
+                "send plain {chat_id} {:?} {:?}{}",
+                body.text,
+                body.entities,
+                thread_note(thread)
+            ));
+        }
         if self.fake("send") {
             return;
         }
         let c = self.client_id;
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let content = enums::InputMessageContent::InputMessageText(types::InputMessageText {
-                text: types::FormattedText {
-                    text: body.text,
-                    entities: body.entities.iter().filter_map(to_td_entity).collect(),
-                },
-                link_preview_options: None,
-                clear_draft: false,
-            });
-            if let Err(e) =
-                tdlib_rs::functions::send_message(chat_id, None, None, None, content, c).await
-            {
+            let topic = thread_topic(thread).or(message_topic(topic));
+            if let Err(e) = send_in_order(chat_id, topic, None, bodies, false, false, c).await {
                 let _ = tx.send(Event::Error(failed(
                     "send the message",
                     &friendly_error(&e),
@@ -1170,6 +1322,42 @@ impl Td {
         });
     }
 
+    pub fn open_thread(&self, channel_id: i64, post_id: i64) {
+        self.note(format!("thread {channel_id} {post_id}"));
+        let c = self.client_id;
+        self.task("open comments", async move {
+            let result = tdlib_rs::functions::get_message_thread(channel_id, post_id, c)
+                .await
+                .map(|enums::MessageThreadInfo::MessageThreadInfo(t)| ThreadInfo {
+                    chat_id: t.chat_id,
+                    thread_id: t.message_thread_id,
+                    roots: t.messages.into_iter().map(convert_message).collect(),
+                })
+                .map_err(|e| friendly_error(&e));
+            Event::Thread {
+                channel_id,
+                post_id,
+                result,
+            }
+        });
+    }
+
+    pub fn set_poll_answer(&self, chat_id: i64, message_id: i64, option_ids: Vec<i32>) {
+        self.note(format!("vote {chat_id} {message_id} {option_ids:?}"));
+        let c = self.client_id;
+        self.spawn("vote", false, async move {
+            tdlib_rs::functions::set_poll_answer(chat_id, message_id, option_ids, c).await
+        });
+    }
+
+    pub fn stop_poll(&self, chat_id: i64, message_id: i64) {
+        self.note(format!("stop poll {chat_id} {message_id}"));
+        let c = self.client_id;
+        self.spawn("stop poll", false, async move {
+            tdlib_rs::functions::stop_poll(chat_id, message_id, c).await
+        });
+    }
+
     pub fn delete_messages(&self, chat_id: i64, message_ids: Vec<i64>, revoke: bool) {
         self.note(format!("delete {chat_id} {message_ids:?} {revoke}"));
         let c = self.client_id;
@@ -1180,6 +1368,14 @@ impl Td {
 
     pub fn sender(&self) -> UnboundedSender<Event> {
         self.tx.clone()
+    }
+
+    pub fn cancel_download(&self, file_id: i32) {
+        self.note(format!("cancel download {file_id}"));
+        let c = self.client_id;
+        self.spawn("cancel download", false, async move {
+            tdlib_rs::functions::cancel_download_file(file_id, false, c).await
+        });
     }
 
     pub fn download_file(&self, file_id: i32, priority: i32) {
@@ -1208,25 +1404,50 @@ async fn oldest_found(
     filter: enums::SearchMessagesFilter,
     c: i32,
 ) -> Result<Option<(i64, Option<i32>)>, String> {
-    tdlib_rs::functions::search_chat_messages(
-        chat_id,
-        message_topic(topic),
-        String::new(),
-        None,
-        0,
-        0,
-        100,
-        Some(filter),
-        c,
-    )
-    .await
-    .map(|enums::FoundChatMessages::FoundChatMessages(f)| {
-        f.messages
-            .iter()
-            .min_by_key(|m| m.id)
-            .map(|m| (m.id, msg_topic(&m.topic_id)))
-    })
-    .map_err(|e| friendly_error(&e))
+    let mut oldest: Option<(i64, Option<i32>)> = None;
+    let mut from = 0;
+    for _ in 0..UNREAD_SEARCH_PAGES {
+        let enums::FoundChatMessages::FoundChatMessages(f) =
+            tdlib_rs::functions::search_chat_messages(
+                chat_id,
+                message_topic(topic),
+                String::new(),
+                None,
+                from,
+                0,
+                100,
+                Some(filter.clone()),
+                c,
+            )
+            .await
+            .map_err(|e| friendly_error(&e))?;
+        if let Some(m) = f.messages.iter().min_by_key(|m| m.id)
+            && oldest.is_none_or(|(id, _)| m.id < id)
+        {
+            oldest = Some((m.id, msg_topic(&m.topic_id)));
+        }
+        if f.messages.is_empty() || f.next_from_message_id == 0 {
+            break;
+        }
+        from = f.next_from_message_id;
+    }
+    Ok(oldest)
+}
+
+const UNREAD_SEARCH_PAGES: usize = 10;
+
+fn thread_topic(thread: i64) -> Option<enums::MessageTopic> {
+    (thread != 0).then_some(enums::MessageTopic::Thread(types::MessageTopicThread {
+        message_thread_id: thread,
+    }))
+}
+
+fn thread_note(thread: i64) -> String {
+    if thread == 0 {
+        String::new()
+    } else {
+        format!(" thread {thread}")
+    }
 }
 
 fn message_topic(topic: Option<i32>) -> Option<enums::MessageTopic> {
@@ -1465,6 +1686,7 @@ fn stickers_of(s: enums::Stickers) -> Vec<Item> {
 }
 
 impl Td {
+    #[allow(clippy::too_many_arguments)]
     pub fn send_uploads(
         &self,
         chat_id: i64,
@@ -1473,10 +1695,18 @@ impl Td {
         reply_to: Option<i64>,
         uploads: std::path::PathBuf,
         topic: Option<i32>,
+        silent: bool,
     ) {
         self.note(format!(
             "send uploads {chat_id} topic {topic:?} reply {reply_to:?}"
         ));
+        if silent {
+            self.note(format!("silent {chat_id}"));
+        }
+        let long = !upload::caption_fits(&text, self.caption_max());
+        if long {
+            self.note("caption too long".to_owned());
+        }
         if self.fake("send uploads") {
             return;
         }
@@ -1485,7 +1715,6 @@ impl Td {
         tokio::spawn(async move {
             let mut notes = Vec::new();
             let result: Result<(), types::Error> = async {
-                let long = text.chars().count() > upload::CAPTION_MAX;
                 let mut caption = if text.trim().is_empty() || long {
                     None
                 } else {
@@ -1506,7 +1735,7 @@ impl Td {
                             chat_id,
                             message_topic(topic),
                             r,
-                            None,
+                            send_options(silent),
                             content,
                             c,
                         )
@@ -1516,7 +1745,7 @@ impl Td {
                             chat_id,
                             message_topic(topic),
                             r,
-                            None,
+                            send_options(silent),
                             contents,
                             c,
                         )
@@ -1535,7 +1764,7 @@ impl Td {
                         chat_id,
                         message_topic(topic),
                         None,
-                        None,
+                        send_options(silent),
                         content,
                         c,
                     )
@@ -1841,6 +2070,7 @@ impl Td {
         target: Option<crate::notify::Target>,
     ) {
         if self.fake("notify") {
+            self.note(format!("notify text {title} | {body}"));
             match target {
                 Some(t) => self.note(format!(
                     "notify icon {icon:?} target {} {} {:?}",
@@ -1919,6 +2149,52 @@ impl Td {
                 Err(e) => Err(friendly_error(&e)),
             };
             Event::Pinned { chat_id, result }
+        });
+    }
+
+    pub fn load_replied(&self, chat_id: i64, message_id: i64) {
+        self.note(format!("replied {chat_id} {message_id}"));
+        let c = self.client_id;
+        self.task("replied message", async move {
+            let result = match tdlib_rs::functions::get_replied_message(chat_id, message_id, c).await
+            {
+                Ok(enums::Message::Message(m)) => Ok(Some(convert_message(m))),
+                Err(e) if e.code == 404 => Ok(None),
+                Err(e) => Err(friendly_error(&e)),
+            };
+            Event::Replied {
+                chat_id,
+                message_id,
+                result,
+            }
+        });
+    }
+
+    pub fn search_mention_members(&self, chat_id: i64, topic: Option<i32>, query: String) {
+        self.note(format!("mention members {chat_id} {query}"));
+        let c = self.client_id;
+        self.task("mention members", async move {
+            let filter = enums::ChatMembersFilter::Mention(types::ChatMembersFilterMention {
+                topic_id: message_topic(topic),
+            });
+            let result =
+                tdlib_rs::functions::search_chat_members(chat_id, query.clone(), 50, Some(filter), c)
+                    .await
+                    .map(|enums::ChatMembers::ChatMembers(m)| {
+                        m.members
+                            .into_iter()
+                            .filter_map(|m| match m.member_id {
+                                enums::MessageSender::User(u) => Some(u.user_id),
+                                enums::MessageSender::Chat(_) => None,
+                            })
+                            .collect()
+                    })
+                    .map_err(|e| friendly_error(&e));
+            Event::MentionMembers {
+                chat_id,
+                query,
+                result,
+            }
         });
     }
 
@@ -2119,6 +2395,7 @@ impl Td {
         &self,
         token: u64,
         chat_id: Option<i64>,
+        topic: Option<i32>,
         query: String,
         pinned: bool,
         sender: Option<Sender>,
@@ -2126,6 +2403,9 @@ impl Td {
         from: Option<Cursor>,
     ) {
         self.note(format!("search {chat_id:?} sender {sender:?}"));
+        if topic.is_some() {
+            self.note(format!("search topic {topic:?}"));
+        }
         if let Some(cursor) = &from {
             self.note(format!("search more {cursor:?}"));
         }
@@ -2142,7 +2422,15 @@ impl Td {
                     };
                     let sender_id = sender.map(input_sender);
                     tdlib_rs::functions::search_chat_messages(
-                        chat_id, None, query, sender_id, from_id, 0, 50, filter, c,
+                        chat_id,
+                        message_topic(topic),
+                        query,
+                        sender_id,
+                        from_id,
+                        0,
+                        50,
+                        filter,
+                        c,
                     )
                     .await
                     .map(found_chat_messages)
@@ -2268,6 +2556,22 @@ impl Td {
             let filter = enums::SearchMessagesFilter::UnreadReaction;
             let result = oldest_found(chat_id, topic, filter, c).await;
             Event::Reaction { chat_id, result }
+        });
+    }
+
+    pub fn mark_chat_unread(&self, chat_id: i64) {
+        self.note(format!("mark unread {chat_id}"));
+        let c = self.client_id;
+        self.spawn("mark unread", false, async move {
+            tdlib_rs::functions::toggle_chat_is_marked_as_unread(chat_id, true, c).await
+        });
+    }
+
+    pub fn unmark_chat_unread(&self, chat_id: i64) {
+        self.note(format!("unmark unread {chat_id}"));
+        let c = self.client_id;
+        self.spawn("unmark unread", false, async move {
+            tdlib_rs::functions::toggle_chat_is_marked_as_unread(chat_id, false, c).await
         });
     }
 
@@ -2516,13 +2820,13 @@ impl Td {
         self.note(format!("mute topic {chat_id} {topic} {mute}"));
         let c = self.client_id;
         self.spawn("topic notifications", false, async move {
-            tdlib_rs::functions::set_forum_topic_notification_settings(
-                chat_id,
-                topic,
-                topic_settings(mute),
-                c,
-            )
-            .await
+            let enums::ForumTopic::ForumTopic(t) =
+                tdlib_rs::functions::get_forum_topic(chat_id, topic, c).await?;
+            let mut settings = t.notification_settings;
+            settings.use_default_mute_for = false;
+            settings.mute_for = if mute { MUTE_FOREVER } else { 0 };
+            tdlib_rs::functions::set_forum_topic_notification_settings(chat_id, topic, settings, c)
+                .await
         });
     }
 
@@ -2559,6 +2863,38 @@ impl Td {
         let c = self.client_id;
         self.spawn("leave chat", false, async move {
             tdlib_rs::functions::leave_chat(chat_id, c).await
+        });
+    }
+
+    pub fn clear_history(&self, chat_id: i64, revoke: bool) {
+        self.note(format!("clear history {chat_id} {revoke}"));
+        let c = self.client_id;
+        self.spawn("clear history", false, async move {
+            tdlib_rs::functions::delete_chat_history(chat_id, false, revoke, c).await
+        });
+    }
+
+    pub fn set_blocked(&self, user_id: i64, block: bool) {
+        self.note(format!("block {user_id} {block}"));
+        let c = self.client_id;
+        self.spawn(if block { "block" } else { "unblock" }, false, async move {
+            tdlib_rs::functions::set_message_sender_block_list(
+                input_sender(Sender::User(user_id)),
+                block.then_some(enums::BlockList::Main),
+                c,
+            )
+            .await
+        });
+    }
+
+    pub fn unpin_all(&self, chat_id: i64, topic: Option<i32>) {
+        self.note(format!("unpin all {chat_id} {topic:?}"));
+        let c = self.client_id;
+        self.spawn("unpin all", false, async move {
+            match topic {
+                Some(t) => tdlib_rs::functions::unpin_all_forum_topic_messages(chat_id, t, c).await,
+                None => tdlib_rs::functions::unpin_all_chat_messages(chat_id, c).await,
+            }
         });
     }
 
@@ -2729,9 +3065,21 @@ async fn history_page(
     offset: i32,
     limit: i32,
     topic: Option<i32>,
+    thread: i64,
     client_id: i32,
 ) -> Result<Vec<Msg>, String> {
     let page = match topic {
+        _ if thread != 0 => {
+            tdlib_rs::functions::get_message_thread_history(
+                chat_id,
+                thread,
+                from_message_id,
+                offset,
+                limit,
+                client_id,
+            )
+            .await
+        }
         Some(t) => {
             tdlib_rs::functions::get_forum_topic_history(
                 chat_id,
@@ -3027,6 +3375,12 @@ pub fn convert_chat(chat: types::Chat) -> ChatInfo {
         perms: convert_perms(&chat.permissions),
         protected: chat.has_protected_content,
         reactions_off: reactions_off(&chat.available_reactions),
+        marked_unread: chat.is_marked_as_unread,
+        clearable: (
+            chat.can_be_deleted_only_for_self,
+            chat.can_be_deleted_for_all_users,
+        ),
+        notify: notify_prefs(&chat.notification_settings),
         id: chat.id,
         title: chat.title,
         kind,
@@ -3068,7 +3422,9 @@ fn convert_entity(e: &types::TextEntity) -> Option<Entity> {
         | TextEntityType::Hashtag
         | TextEntityType::Cashtag
         | TextEntityType::BotCommand => EntityKind::Mention,
-        TextEntityType::BlockQuote | TextEntityType::ExpandableBlockQuote => EntityKind::Quote,
+        TextEntityType::BlockQuote => EntityKind::Quote(false),
+        TextEntityType::ExpandableBlockQuote => EntityKind::Quote(true),
+        TextEntityType::CustomEmoji(c) => EntityKind::CustomEmoji(c.custom_emoji_id),
         _ => return None,
     };
     Some(Entity {
@@ -3093,8 +3449,17 @@ fn to_td_entity(e: &Entity) -> Option<types::TextEntity> {
         EntityKind::Link(Some(url)) => {
             TextEntityType::TextUrl(types::TextEntityTypeTextUrl { url: url.clone() })
         }
-        EntityKind::Quote => TextEntityType::BlockQuote,
-        EntityKind::Link(None) | EntityKind::Mention | EntityKind::MentionName(_) => return None,
+        EntityKind::Quote(false) => TextEntityType::BlockQuote,
+        EntityKind::Quote(true) => TextEntityType::ExpandableBlockQuote,
+        EntityKind::CustomEmoji(custom_emoji_id) => {
+            TextEntityType::CustomEmoji(types::TextEntityTypeCustomEmoji {
+                custom_emoji_id: *custom_emoji_id,
+            })
+        }
+        EntityKind::MentionName(user_id) => {
+            TextEntityType::MentionName(types::TextEntityTypeMentionName { user_id: *user_id })
+        }
+        EntityKind::Link(None) | EntityKind::Mention => return None,
     };
     Some(types::TextEntity {
         offset: i32::try_from(e.offset).ok()?,
@@ -3110,18 +3475,20 @@ pub fn convert_text(t: types::FormattedText) -> RichText {
     }
 }
 
+#[derive(Default)]
 pub struct Content {
     pub media: Option<String>,
     pub body: RichText,
     pub attachments: Vec<Attachment>,
+    pub poll: Option<crate::model::Poll>,
+    pub link_preview: Option<crate::model::LinkPreview>,
 }
 
 impl Content {
     fn label(label: impl Into<String>) -> Self {
         Self {
             media: Some(label.into()),
-            body: RichText::default(),
-            attachments: Vec::new(),
+            ..Self::default()
         }
     }
 
@@ -3130,6 +3497,7 @@ impl Content {
             media: Some(label.into()),
             body: convert_text(caption),
             attachments: vec![att],
+            ..Self::default()
         }
     }
 }
@@ -3268,21 +3636,29 @@ pub fn convert_content(content: MessageContent) -> Content {
     use MessageContent as C;
     match content {
         C::MessageText(t) => Content {
-            media: None,
             body: convert_text(t.text),
-            attachments: Vec::new(),
+            link_preview: t.link_preview.map(|p| crate::model::LinkPreview {
+                site: p.site_name,
+                title: p.title,
+                description: p.description.text,
+                above: p.show_above_text,
+            }),
+            ..Content::default()
         },
         C::MessagePhoto(p) => match photo_attachment(&p.photo) {
-            Some(att) => Content::captioned("[photo]", p.caption, att),
+            Some(mut att) => {
+                att.spoiler = p.has_spoiler;
+                Content::captioned("[photo]", p.caption, att)
+            }
             None => Content {
                 media: Some("[photo]".to_owned()),
                 body: convert_text(p.caption),
-                attachments: Vec::new(),
+                ..Content::default()
             },
         },
         C::MessageVideo(v) => {
             let x = &v.video;
-            let att = video_like(
+            let mut att = video_like(
                 MediaKind::Video,
                 &x.video,
                 x.width,
@@ -3293,11 +3669,12 @@ pub fn convert_content(content: MessageContent) -> Content {
                 &x.minithumbnail,
                 &x.thumbnail,
             );
+            att.spoiler = v.has_spoiler;
             Content::captioned(format!("[video {}]", duration(x.duration)), v.caption, att)
         }
         C::MessageAnimation(a) => {
             let x = &a.animation;
-            let att = video_like(
+            let mut att = video_like(
                 MediaKind::Animation,
                 &x.animation,
                 x.width,
@@ -3308,6 +3685,7 @@ pub fn convert_content(content: MessageContent) -> Content {
                 &x.minithumbnail,
                 &x.thumbnail,
             );
+            att.spoiler = a.has_spoiler;
             Content::captioned("[GIF]", a.caption, att)
         }
         C::MessageVideoNote(v) => {
@@ -3380,13 +3758,12 @@ pub fn convert_content(content: MessageContent) -> Content {
         }
         C::MessageSticker(s) => Content {
             media: Some(format!("[sticker {}]", s.sticker.emoji)),
-            body: RichText::default(),
             attachments: vec![sticker_attachment(&s.sticker)],
+            ..Content::default()
         },
         C::MessageAnimatedEmoji(e) => Content {
-            media: None,
             body: RichText::plain(e.emoji),
-            attachments: Vec::new(),
+            ..Content::default()
         },
         C::MessageLocation(l) => Content::label(format!(
             "📍 {}location {:.5}, {:.5}",
@@ -3404,20 +3781,46 @@ pub fn convert_content(content: MessageContent) -> Content {
         )),
         C::MessagePoll(p) => {
             let poll = &p.poll;
+            let (multiple, quiz) = match &poll.r#type {
+                enums::PollType::Regular(r) => (r.allow_multiple_answers, None),
+                enums::PollType::Quiz(q) => (false, Some(q)),
+            };
             let mut text = format!(
                 "📊 {}{}",
                 poll.question.text,
                 if poll.is_closed { " (closed)" } else { "" }
             );
-            for o in &poll.options {
+            for (i, o) in poll.options.iter().enumerate() {
                 let mark = if o.is_chosen { '●' } else { '○' };
+                let correct = quiz.is_some_and(|q| usize::try_from(q.correct_option_id) == Ok(i));
                 text.push_str(&format!(
-                    "\n  {mark} {} — {}%",
-                    o.text.text, o.vote_percentage
+                    "\n  {mark} {} — {}%{}",
+                    o.text.text,
+                    o.vote_percentage,
+                    if correct { " ✓" } else { "" }
                 ));
             }
             text.push_str(&format!("\n  {} votes", poll.total_voter_count));
-            Content::label(text)
+            if let Some(q) = quiz.filter(|q| !q.explanation.text.trim().is_empty()) {
+                text.push_str(&format!("\n  {}", q.explanation.text.trim()));
+            }
+            Content {
+                poll: Some(crate::model::Poll {
+                    options: poll
+                        .options
+                        .iter()
+                        .map(|o| crate::model::PollOption {
+                            text: o.text.text.clone(),
+                            chosen: o.is_chosen,
+                        })
+                        .collect(),
+                    voters: poll.total_voter_count,
+                    closed: poll.is_closed,
+                    multiple,
+                    quiz: quiz.is_some(),
+                }),
+                ..Content::label(text)
+            }
         }
         C::MessageDice(d) => Content::label(format!("{} rolled {}", d.emoji, d.value)),
         C::MessageGame(g) => Content::label(format!("🎮 game: {}", g.game.title)),
@@ -3485,6 +3888,7 @@ pub fn convert_sender(s: &MessageSender) -> Sender {
 pub fn convert_message(m: types::Message) -> Msg {
     let story = matches!(m.content, enums::MessageContent::MessageStory(_));
     let info = m.interaction_info.as_ref();
+    let content = convert_content(m.content);
     let meta = MsgMeta {
         edit_date: i64::from(m.edit_date),
         forward_date: m.forward_info.as_ref().map_or(0, |f| i64::from(f.date)),
@@ -3499,16 +3903,56 @@ pub fn convert_message(m: types::Message) -> Msg {
             Some(enums::MessageReplyTo::Message(r)) if r.chat_id != m.chat_id => r.chat_id,
             _ => 0,
         },
+        reply_msg: match &m.reply_to {
+            Some(enums::MessageReplyTo::Message(r)) if r.chat_id != 0 && r.chat_id != m.chat_id => {
+                r.message_id
+            }
+            _ => 0,
+        },
+        reply_quote: match &m.reply_to {
+            Some(enums::MessageReplyTo::Message(r)) => r
+                .quote
+                .as_ref()
+                .map(|q| q.text.text.clone())
+                .filter(|q| !q.is_empty()),
+            _ => None,
+        },
+        reply_origin: match &m.reply_to {
+            Some(enums::MessageReplyTo::Message(r)) => r.origin.clone().map(convert_origin),
+            _ => None,
+        },
+        reply_media: match &m.reply_to {
+            Some(enums::MessageReplyTo::Message(r)) => r.content.clone().map(|c| {
+                let c = convert_content(c);
+                let text = crate::format::one_line(&c.body.text);
+                match (c.media, text.is_empty()) {
+                    (Some(media), true) => media,
+                    (Some(media), false) => format!("{media} {text}"),
+                    (None, _) => text,
+                }
+            }),
+            _ => None,
+        },
         via_bot: m.via_bot_user_id,
         signature: m.author_signature.clone(),
         story,
         reactors_visible: reactors_visible(info),
+        force_reply: matches!(m.reply_markup, Some(enums::ReplyMarkup::ForceReply(_))),
+        poll: content.poll,
+        link_preview: content.link_preview,
+        comments: m.is_channel_post && info.is_some_and(|i| i.reply_info.is_some()),
+        thread: match &m.topic_id {
+            Some(enums::MessageTopic::Thread(t)) => t.message_thread_id,
+            _ => 0,
+        },
     };
-    let content = convert_content(m.content);
     let state = match m.sending_state {
         None => SendState::Sent,
         Some(enums::MessageSendingState::Pending(_)) => SendState::Pending,
-        Some(enums::MessageSendingState::Failed(f)) => SendState::Failed(f.error.message.clone()),
+        Some(enums::MessageSendingState::Failed(f)) => SendState::Failed {
+            error: f.error.message.clone(),
+            can_retry: f.can_retry,
+        },
     };
     Msg {
         id: m.id,
@@ -3519,7 +3963,9 @@ pub fn convert_message(m: types::Message) -> Msg {
         outgoing: m.is_outgoing,
         state,
         reply_to: match m.reply_to {
-            Some(enums::MessageReplyTo::Message(r)) if r.chat_id == 0 || r.chat_id == m.chat_id => {
+            Some(enums::MessageReplyTo::Message(r))
+                if r.message_id != 0 && (r.chat_id == 0 || r.chat_id == m.chat_id) =>
+            {
                 Some(r.message_id)
             }
             _ => None,
@@ -3672,24 +4118,11 @@ async fn topics_with_icons(raw: Vec<types::ForumTopic>, c: i32) -> Vec<Topic> {
         .collect()
 }
 
-fn topic_settings(mute: bool) -> types::ChatNotificationSettings {
-    types::ChatNotificationSettings {
-        use_default_mute_for: false,
-        mute_for: if mute { MUTE_FOREVER } else { 0 },
-        use_default_sound: true,
-        sound_id: 0,
-        use_default_show_preview: true,
-        show_preview: true,
-        use_default_mute_stories: true,
-        mute_stories: false,
-        use_default_story_sound: true,
-        story_sound_id: 0,
-        use_default_show_story_poster: true,
-        show_story_poster: true,
-        use_default_disable_pinned_message_notifications: true,
-        disable_pinned_message_notifications: false,
-        use_default_disable_mention_notifications: true,
-        disable_mention_notifications: false,
+pub fn notify_prefs(s: &types::ChatNotificationSettings) -> crate::model::NotifyPrefs {
+    crate::model::NotifyPrefs {
+        show_preview: (!s.use_default_show_preview).then_some(s.show_preview),
+        mentions_off: (!s.use_default_disable_mention_notifications)
+            .then_some(s.disable_mention_notifications),
     }
 }
 
@@ -4060,6 +4493,109 @@ mod tests {
         convert_content(serde_json::from_value(v).expect("valid MessageContent JSON"))
     }
 
+    fn poll_json(kind: Value, chosen: [bool; 2], closed: bool) -> Value {
+        let option = |text: &str, pct: i32, chosen: bool| json!({"@type": "pollOption",
+            "text": caption(text), "voter_count": 0, "vote_percentage": pct,
+            "is_chosen": chosen, "is_being_chosen": false});
+        json!({"@type": "messagePoll", "poll": {
+            "@type": "poll", "id": "7", "question": caption("Lunch?"),
+            "options": [option("pizza", 60, chosen[0]), option("sushi", 40, chosen[1])],
+            "total_voter_count": 5, "recent_voter_ids": [], "is_anonymous": true,
+            "type": kind, "open_period": 0, "close_date": 0, "is_closed": closed,
+        }})
+    }
+
+    #[test]
+    fn polls_keep_options_choice_type_and_voters() {
+        let c = content(poll_json(
+            json!({"@type": "pollTypeRegular", "allow_multiple_answers": true}),
+            [false, true],
+            false,
+        ));
+        let p = c.poll.expect("poll");
+        assert_eq!(
+            p.options,
+            vec![
+                crate::model::PollOption { text: "pizza".to_owned(), chosen: false },
+                crate::model::PollOption { text: "sushi".to_owned(), chosen: true },
+            ]
+        );
+        assert!(p.multiple && !p.quiz && !p.closed && p.voted());
+        assert_eq!(p.voters, 5);
+        assert_eq!(
+            c.media.as_deref(),
+            Some("📊 Lunch?\n  ○ pizza — 60%\n  ● sushi — 40%\n  5 votes")
+        );
+    }
+
+    #[test]
+    fn answered_quiz_shows_the_correct_option_and_explanation() {
+        let unanswered = content(poll_json(
+            json!({"@type": "pollTypeQuiz", "correct_option_id": -1, "explanation": caption("")}),
+            [false, false],
+            false,
+        ));
+        assert!(unanswered.poll.as_ref().is_some_and(|p| p.quiz && !p.multiple));
+        assert!(!unanswered.media.unwrap().contains('✓'));
+        let answered = content(poll_json(
+            json!({"@type": "pollTypeQuiz", "correct_option_id": 1,
+                "explanation": caption("Fish is brain food")}),
+            [true, false],
+            true,
+        ));
+        assert_eq!(
+            answered.media.as_deref(),
+            Some(
+                "📊 Lunch? (closed)\n  ● pizza — 60%\n  ○ sushi — 40% ✓\n  5 votes\n  Fish is brain food"
+            )
+        );
+    }
+
+    #[test]
+    fn link_previews_keep_site_title_and_description_only_when_present() {
+        let plain = content(json!({"@type": "messageText", "text": caption("hi")}));
+        assert!(plain.link_preview.is_none());
+        let c = content(json!({"@type": "messageText", "text": caption("see https://example.org"),
+            "link_preview": {"@type": "linkPreview", "url": "https://example.org",
+                "display_url": "example.org", "site_name": "Example", "title": "Example Domain",
+                "description": caption("This domain is for use in examples."), "author": "",
+                "type": {"@type": "linkPreviewTypeUnsupported"}, "has_large_media": false,
+                "show_large_media": false, "show_media_above_description": false,
+                "skip_confirmation": false, "show_above_text": true, "instant_view_version": 0}}));
+        assert_eq!(
+            c.link_preview,
+            Some(crate::model::LinkPreview {
+                site: "Example".to_owned(),
+                title: "Example Domain".to_owned(),
+                description: "This domain is for use in examples.".to_owned(),
+                above: true,
+            })
+        );
+        assert_eq!(c.body.text, "see https://example.org");
+    }
+
+    #[test]
+    fn channel_posts_with_a_discussion_and_thread_messages_are_marked() {
+        let mut post = message_json(5, Value::Null, Value::Null);
+        post["is_channel_post"] = json!(true);
+        let plain = convert_message(serde_json::from_value(post.clone()).unwrap());
+        assert!(!plain.meta.comments);
+        post["interaction_info"] = json!({"@type": "messageInteractionInfo", "view_count": 10,
+            "forward_count": 0, "reply_info": {"@type": "messageReplyInfo", "reply_count": 3,
+                "recent_replier_ids": [], "last_read_inbox_message_id": 0,
+                "last_read_outbox_message_id": 0, "last_message_id": 0}});
+        let m = convert_message(serde_json::from_value(post).unwrap());
+        assert!(m.meta.comments);
+        assert_eq!(m.meta.replies, 3);
+        let comment = message_json(
+            6,
+            json!({"@type": "messageTopicThread", "message_thread_id": 900}),
+            Value::Null,
+        );
+        let c = convert_message(serde_json::from_value(comment).unwrap());
+        assert_eq!((c.meta.thread, c.topic, c.meta.comments), (900, None, false));
+    }
+
     #[test]
     fn photo_picks_inline_and_full_sizes() {
         let size = |t: &str, id: i32, w: i32, h: i32| json!({"@type": "photoSize", "type": t, "photo": file(id, i64::from(w) * 10, false), "width": w, "height": h, "progressive_sizes": []});
@@ -4111,6 +4647,70 @@ mod tests {
         let small = content(video(Value::Null, 300_000));
         let p = small.attachments[0].preview.as_ref().unwrap();
         assert_eq!((p.file.id, p.decode), (9, Decode::Video));
+    }
+
+    #[test]
+    fn spoiler_flag_is_kept_for_photos_videos_and_gifs() {
+        let photo = |spoiler: bool| {
+            content(json!({
+                "@type": "messagePhoto",
+                "photo": {
+                    "@type": "photo", "has_stickers": false, "minithumbnail": null,
+                    "sizes": [{"@type": "photoSize", "type": "m", "photo": file(1, 100, false),
+                        "width": 320, "height": 240, "progressive_sizes": []}]
+                },
+                "caption": caption(""),
+                "show_caption_above_media": false, "has_spoiler": spoiler, "is_secret": false
+            }))
+        };
+        assert!(photo(true).attachments[0].spoiler);
+        assert!(!photo(false).attachments[0].spoiler);
+        let video = content(json!({
+            "@type": "messageVideo",
+            "video": {
+                "@type": "video", "duration": 3, "width": 64, "height": 64,
+                "file_name": "a.mp4", "mime_type": "video/mp4", "has_stickers": false,
+                "supports_streaming": true, "minithumbnail": null, "thumbnail": null,
+                "video": file(9, 300, false)
+            },
+            "alternative_videos": [], "storyboards": [], "cover": null, "start_timestamp": 0,
+            "caption": caption(""), "show_caption_above_media": false,
+            "has_spoiler": true, "is_secret": false
+        }));
+        assert!(video.attachments[0].spoiler);
+        let gif = content(json!({
+            "@type": "messageAnimation",
+            "animation": {
+                "@type": "animation", "duration": 2, "width": 64, "height": 64,
+                "file_name": "a.mp4", "mime_type": "video/mp4", "has_stickers": false,
+                "minithumbnail": null, "thumbnail": null, "animation": file(8, 300, false)
+            },
+            "caption": caption(""), "show_caption_above_media": false,
+            "has_spoiler": true, "is_secret": false
+        }));
+        assert!(gif.attachments[0].spoiler);
+        assert!(gif.attachments[0].full.is_some(), "the viewer still gets the media");
+    }
+
+    #[test]
+    fn force_reply_markup_is_remembered_on_the_message() {
+        let mut m = message_json(5, Value::Null, Value::Null);
+        m["reply_markup"] = json!({
+            "@type": "replyMarkupForceReply", "is_personal": true, "input_field_placeholder": ""
+        });
+        let msg = convert_message(serde_json::from_value(m).expect("JSON"));
+        assert!(msg.meta.force_reply);
+        assert!(msg.keyboard.is_none());
+        let plain = convert_message(
+            serde_json::from_value(message_json(6, Value::Null, Value::Null)).expect("JSON"),
+        );
+        assert!(!plain.meta.force_reply);
+    }
+
+    #[test]
+    fn silent_sends_disable_the_notification_only_when_asked() {
+        assert_eq!(send_options(false), None);
+        assert!(send_options(true).is_some_and(|o| o.disable_notification && !o.from_background));
     }
 
     #[test]
@@ -4479,6 +5079,37 @@ mod tests {
     }
 
     #[test]
+    fn replies_keep_quote_origin_content_and_other_chat() {
+        let mut same = message_json(5, Value::Null, Value::Null);
+        same["reply_to"] = json!({
+            "@type": "messageReplyToMessage", "chat_id": -100, "message_id": 3,
+            "quote": {"@type": "textQuote", "text": caption("the part"), "position": 4, "is_manual": true},
+            "checklist_task_id": 0, "origin_send_date": 0
+        });
+        let same = convert_message(serde_json::from_value(same).expect("JSON"));
+        assert_eq!(same.reply_to, Some(3));
+        assert_eq!(same.meta.reply_quote.as_deref(), Some("the part"));
+        assert_eq!((same.meta.reply_chat, same.meta.reply_msg), (0, 0));
+        let mut other = message_json(6, Value::Null, Value::Null);
+        other["reply_to"] = json!({
+            "@type": "messageReplyToMessage", "chat_id": -200, "message_id": 77,
+            "checklist_task_id": 0,
+            "origin": {"@type": "messageOriginChannel", "chat_id": -200, "message_id": 77, "author_signature": ""},
+            "origin_send_date": 1_600_000_000,
+            "content": {"@type": "messageText", "text": caption("from there")}
+        });
+        let other = convert_message(serde_json::from_value(other).expect("JSON"));
+        assert_eq!(other.reply_to, None);
+        assert_eq!((other.meta.reply_chat, other.meta.reply_msg), (-200, 77));
+        assert_eq!(
+            other.meta.reply_origin,
+            Some(Origin::Sender(Sender::Chat(-200)))
+        );
+        assert_eq!(other.meta.reply_media.as_deref(), Some("from there"));
+        assert_eq!(other.meta.reply_quote, None);
+    }
+
+    #[test]
     fn forum_topics_secret_chats_and_rights_convert() {
         let t: types::ForumTopic = serde_json::from_value(json!({
             "@type": "forumTopic",
@@ -4703,6 +5334,40 @@ mod tests {
     }
 
     #[test]
+    fn custom_emoji_and_expandable_quotes_survive_editing() {
+        let t: types::FormattedText = serde_json::from_value(json!({
+            "@type": "formattedText", "text": "hi 😀\nlong part",
+            "entities": [
+                {"@type": "textEntity", "offset": 3, "length": 2,
+                 "type": {"@type": "textEntityTypeCustomEmoji", "custom_emoji_id": "5368324170671202286"}},
+                {"@type": "textEntity", "offset": 6, "length": 9,
+                 "type": {"@type": "textEntityTypeExpandableBlockQuote"}},
+            ],
+        }))
+        .expect("formatted text JSON");
+        let rt = convert_text(t.clone());
+        assert_eq!(
+            rt.entities[0].kind,
+            EntityKind::CustomEmoji(5_368_324_170_671_202_286)
+        );
+        assert_eq!(rt.entities[1].kind, EntityKind::Quote(true));
+        let source = markup::to_source(&rt);
+        assert_eq!(
+            source,
+            "hi [😀](tg://emoji?id=5368324170671202286)\n>> long part"
+        );
+        let sent = formatted_from_source(&source);
+        assert_eq!(sent, t);
+        let plain = convert_text(serde_json::from_value(json!({
+            "@type": "formattedText", "text": "said",
+            "entities": [{"@type": "textEntity", "offset": 0, "length": 4,
+                          "type": {"@type": "textEntityTypeBlockQuote"}}],
+        })).expect("formatted text JSON"));
+        assert_eq!(plain.entities[0].kind, EntityKind::Quote(false));
+        assert_eq!(markup::to_source(&plain), "> said");
+    }
+
+    #[test]
     fn mention_names_keep_the_user_id() {
         let t: types::FormattedText = serde_json::from_value(json!({
             "@type": "formattedText", "text": "hi Alice and @bob",
@@ -4717,7 +5382,32 @@ mod tests {
         let rt = convert_text(t);
         assert_eq!(rt.entities[0].kind, EntityKind::MentionName(42));
         assert_eq!(rt.entities[1].kind, EntityKind::Mention);
-        assert!(to_td_entity(&rt.entities[0]).is_none());
+        assert_eq!(
+            to_td_entity(&rt.entities[0]).map(|e| e.r#type),
+            Some(TextEntityType::MentionName(
+                types::TextEntityTypeMentionName { user_id: 42 }
+            ))
+        );
+    }
+
+    #[test]
+    fn a_mention_name_survives_editing_and_is_sent() {
+        let rich = RichText {
+            text: "hi Alice".to_owned(),
+            entities: vec![Entity {
+                offset: 3,
+                length: 5,
+                kind: EntityKind::MentionName(42),
+            }],
+        };
+        let sent = formatted_from_source(&markup::to_source(&rich));
+        assert_eq!(sent.text, "hi Alice");
+        assert_eq!(sent.entities.len(), 1);
+        assert_eq!((sent.entities[0].offset, sent.entities[0].length), (3, 5));
+        assert_eq!(
+            sent.entities[0].r#type,
+            TextEntityType::MentionName(types::TextEntityTypeMentionName { user_id: 42 })
+        );
     }
 
     fn tl_error(code: i32, message: &str) -> types::Error {

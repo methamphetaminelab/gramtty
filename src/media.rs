@@ -275,9 +275,13 @@ impl Media {
         self.cache.remove(key);
     }
 
-    #[cfg(test)]
     pub fn download_wanted(&self, file_id: i32) -> bool {
         self.requested.contains(&file_id) || self.downloads.iter().any(|(id, _)| *id == file_id)
+    }
+
+    pub fn cancel_download(&mut self, file_id: i32) -> bool {
+        self.downloads.retain(|(id, _)| *id != file_id);
+        self.requested.remove(&file_id)
     }
 
     #[cfg(test)]

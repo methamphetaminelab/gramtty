@@ -209,7 +209,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, popup: &Popup) {
                         l
                     }),
             );
-            let hint = "key or Enter press · ←→ select · Esc";
+            let hint = "key or Enter press · ←↑↓→ move · Esc close";
             let content = lines
                 .iter()
                 .map(|l| l.spans.iter().map(|s| s.content.width()).sum::<usize>())
@@ -279,7 +279,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, popup: &Popup) {
                 })
                 .collect::<Vec<_>>();
             let rect = centered(area, width, lines.len() as u16 + 2);
-            framed(frame, rect, "Open link", "key or Enter open · Esc", lines);
+            framed(frame, rect, "Open link", "key or Enter open · Esc close", lines);
         }
         Popup::CodePick { items, sel } => {
             let width = 72u16.min(area.width.saturating_sub(2)).max(1);
@@ -310,7 +310,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, popup: &Popup) {
                 })
                 .collect::<Vec<_>>();
             let rect = centered(area, width, lines.len() as u16 + 2);
-            framed(frame, rect, "Copy code", "key or Enter copy · Esc", lines);
+            framed(frame, rect, "Copy code", "key or Enter copy · Esc close", lines);
         }
         Popup::Files { items, sel } => {
             let width = 72u16.min(area.width.saturating_sub(2)).max(1);
@@ -341,7 +341,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, popup: &Popup) {
                 })
                 .collect::<Vec<_>>();
             let rect = centered(area, width, lines.len() as u16 + 2);
-            framed(frame, rect, "Open file", "key or Enter open · Esc", lines);
+            framed(frame, rect, "Open file", "key or Enter open · Esc close", lines);
         }
         Popup::ConfirmStart {
             chat_id, parameter, ..
@@ -511,7 +511,7 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, popup: &Popup) {
                 centered(area, width, h),
                 "Options",
                 if filter.is_some() {
-                    "type to filter · ↑/↓ move · Enter toggle · Esc clear"
+                    "type to filter · ↑↓ move · Enter toggle · Esc clear"
                 } else {
                     "j/k move · Tab section · h/l change · Enter · / filter"
                 },
@@ -688,6 +688,128 @@ pub fn draw(frame: &mut Frame, area: Rect, app: &App, popup: &Popup) {
                 "",
                 lines,
             );
+        }
+        Popup::ConfirmBlock { user_id } => {
+            let name = format::truncate(
+                &format::sanitize(&app.sender_name(Sender::User(*user_id))),
+                32,
+            );
+            let key = |k: &str| Span::styled(format!(" {k} "), theme::active_field());
+            let lines = vec![
+                Line::from(format!(" Block {name}?")),
+                muted(" They won't be able to message or call you."),
+                Line::from(""),
+                Line::from(vec![key("y"), Span::raw("block   "), key("n"), Span::raw("cancel")]),
+            ];
+            let width = lines.iter().map(Line::width).max().unwrap_or(0) + 4;
+            framed(frame, centered(area, width.max(40) as u16, 6), "Block", "", lines);
+        }
+        Popup::ConfirmClearHistory {
+            chat_id,
+            everyone,
+            me,
+        } => {
+            let private = app
+                .chats
+                .get(chat_id)
+                .is_some_and(|c| matches!(c.kind, ChatKind::Private(_)));
+            let name = format::truncate(
+                &format::sanitize(&app.sender_name(Sender::Chat(*chat_id))),
+                32,
+            );
+            let key = |k: &str| Span::styled(format!(" {k} "), theme::active_field());
+            let mut choices = Vec::new();
+            if *everyone {
+                choices.push(key("y"));
+                choices.push(Span::raw(if private {
+                    format!("also for {name}  ")
+                } else {
+                    "for everyone  ".to_owned()
+                }));
+            }
+            if *me {
+                choices.push(key("m"));
+                choices.push(Span::raw("only for me"));
+                choices.push(Span::styled(" (Enter)", theme::muted()));
+            }
+            let lines = vec![
+                Line::from(format!(" Clear the history of {name}?")),
+                Line::from(""),
+                Line::from(choices),
+                Line::from(vec![key("n"), Span::raw("cancel")]),
+            ];
+            let width = lines.iter().map(Line::width).max().unwrap_or(0) + 4;
+            framed(
+                frame,
+                centered(area, width.max(40) as u16, 6),
+                "Clear history",
+                "",
+                lines,
+            );
+        }
+        Popup::ConfirmUnpinAll { topic, .. } => {
+            let key = |k: &str| Span::styled(format!(" {k} "), theme::active_field());
+            let lines = vec![
+                Line::from(if topic.is_some() {
+                    " Unpin all messages in this topic?"
+                } else {
+                    " Unpin all messages in this chat?"
+                }),
+                Line::from(""),
+                Line::from(vec![key("y"), Span::raw("unpin   "), key("n"), Span::raw("cancel")]),
+            ];
+            let width = lines.iter().map(Line::width).max().unwrap_or(0) + 4;
+            framed(frame, centered(area, width.max(40) as u16, 5), "Unpin all", "", lines);
+        }
+        Popup::PollVote {
+            options,
+            picked,
+            multiple,
+            sel,
+            ..
+        } => {
+            let width = 64u16.min(area.width.saturating_sub(2)).max(1);
+            let w = width.saturating_sub(2) as usize;
+            let rows = area.height.saturating_sub(4).max(1) as usize;
+            app.popup_rows.set(rows);
+            let sel = (*sel).min(options.len().saturating_sub(1));
+            let start = list_window(sel, options.len(), rows);
+            let lines = options
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(rows)
+                .map(|(i, text)| {
+                    let on = picked.get(i).copied().unwrap_or(false);
+                    let mark = match (*multiple, on) {
+                        (true, true) => "[x] ",
+                        (true, false) => "[ ] ",
+                        _ => "○ ",
+                    };
+                    let spans = vec![
+                        Span::styled(mark, theme::muted()),
+                        Span::raw(format::sanitize(&format::one_line(text))),
+                    ];
+                    row_line(spans, i == sel, true, w)
+                })
+                .collect::<Vec<_>>();
+            let hint = if *multiple {
+                "Space toggle · Enter vote · Esc close"
+            } else {
+                "Enter vote · Esc close"
+            };
+            let rect = centered(area, width, lines.len() as u16 + 2);
+            framed(frame, rect, "Vote", hint, lines);
+        }
+        Popup::ConfirmStopPoll { .. } => {
+            let key = |k: &str| Span::styled(format!(" {k} "), theme::active_field());
+            let lines = vec![
+                Line::from(" Stop this poll? The results become final."),
+                Line::from(""),
+                Line::from(vec![key("y"), Span::raw("stop   "), key("n"), Span::raw("cancel")]),
+            ];
+            let width = lines.iter().map(Line::width).max().unwrap_or(0) + 4;
+            framed(frame, centered(area, width.max(40) as u16, 5), "Stop poll", "", lines);
         }
         Popup::StatusLog { scroll } => {
             let rect = centered(area, 90, 22);
@@ -870,7 +992,7 @@ fn draw_quote_pick(frame: &mut Frame, area: Rect, input: &crate::input::TextInpu
         frame,
         rect,
         "Reply with quote",
-        "Enter reply · <C-w>/<C-u>/Backspace trim · Esc",
+        "Enter reply · <C-w>/<C-u>/Backspace trim · Esc cancel",
         lines,
     );
     frame.set_cursor_position(Position {
@@ -933,9 +1055,9 @@ fn draw_text_select(
     let visible = rect.height.saturating_sub(2) as usize;
     let skip = (cursor_row + 1).saturating_sub(visible);
     let hint = if anchor.is_some() {
-        "←↑↓→ w b extend · y copy selection · v cancel selection · Esc"
+        "←↑↓→ w b extend · y copy selection · v cancel selection · Esc close"
     } else {
-        "←↑↓→ w b move · v start selection · y copy all · Esc"
+        "←↑↓→ w b move · v start selection · y copy all · Esc close"
     };
     framed(
         frame,
@@ -979,7 +1101,7 @@ fn draw_members(frame: &mut Frame, area: Rect, app: &App, mv: &MembersView) {
     match &mv.page {
         None => lines.push(muted(" Loading…")),
         Some(Err(e)) => lines.push(Line::from(Span::styled(format!(" {e}"), theme::error()))),
-        Some(Ok(p)) if p.members.is_empty() => lines.push(muted(" nobody found")),
+        Some(Ok(p)) if p.members.is_empty() => lines.push(muted(" Nobody found")),
         Some(Ok(p)) => {
             lines.push(muted(format!(
                 " {} shown of {}",
@@ -1009,7 +1131,7 @@ fn draw_members(frame: &mut Frame, area: Rect, app: &App, mv: &MembersView) {
         frame,
         rect,
         &title,
-        "Tab filter · ↑↓ select · Enter profile · Esc",
+        "Tab filter · ↑↓ move · Enter profile · Esc close",
         lines,
     );
     let (_, col) = mv.input.cursor_position(0);
@@ -1081,7 +1203,7 @@ fn draw_event_log(frame: &mut Frame, area: Rect, app: &App, lv: &LogView) {
         frame,
         rect,
         &title,
-        "j/k select · Enter profile · Esc",
+        "↑↓ move · Enter profile · Esc close",
         lines,
     );
 }
@@ -1232,6 +1354,18 @@ fn draw_profile(frame: &mut Frame, area: Rect, app: &App, p: &ProfileView) {
     if secret {
         keys.push("S secret chat");
     }
+    if let Some(u) = p
+        .data
+        .as_ref()
+        .and_then(|d| d.user_id)
+        .filter(|u| app.can_block(*u))
+    {
+        keys.push(if app.blocked.contains(&Sender::User(u)) {
+            "b unblock"
+        } else {
+            "b block"
+        });
+    }
     keys.push("Esc close");
     framed(frame, rect, "Profile", &keys.join(" · "), shown);
 }
@@ -1281,7 +1415,7 @@ fn draw_reactions(frame: &mut Frame, area: Rect, app: &App, r: &ReactionPicker) 
         frame,
         centered(area, 44, h),
         "React",
-        "arrows move · Enter toggle · Esc",
+        "←↑↓→ move · Enter toggle · Esc close",
         lines,
     );
 }
@@ -1370,24 +1504,13 @@ fn draw_search(frame: &mut Frame, area: Rect, app: &App, sv: &SearchView) {
                 ),
                 Some(r) => {
                     let m = &sv.results[r];
-                    let mut spans = vec![Span::styled(
-                        format!(
-                            "{} {} ",
-                            format::date_label(m.date),
-                            format::time_label(m.date)
-                        ),
-                        theme::muted(),
-                    )];
-                    if sv.chat_id.is_none() {
-                        spans.push(Span::styled(
-                            format!("{} · ", app.sender_name(Sender::Chat(m.chat_id))),
-                            theme::mention(),
-                        ));
+                    let mut spans = vec![Span::styled(result_time(app, m.date), theme::muted())];
+                    let sender = app.sender_name(m.sender);
+                    let chat = app.sender_name(Sender::Chat(m.chat_id));
+                    if sv.chat_id.is_none() && chat != sender {
+                        spans.push(Span::styled(format!("{chat} · "), theme::mention()));
                     }
-                    spans.push(Span::styled(
-                        format!("{}: ", app.sender_name(m.sender)),
-                        theme::strong(),
-                    ));
+                    spans.push(Span::styled(format!("{sender}: "), theme::strong()));
                     message_spans(&mut spans, m, query, w);
                     row_line(spans, i == sel, true, w)
                 }
@@ -1397,13 +1520,13 @@ fn draw_search(frame: &mut Frame, area: Rect, app: &App, sv: &SearchView) {
         lines.extend(footer);
     }
     let hint = if listing && sv.results.is_empty() {
-        "/ search · Esc"
+        "/ search · Esc close"
     } else if listing {
-        "/ search · j/k select · Enter jump · Esc"
+        "/ search · ↑↓ move · Enter jump · Esc close"
     } else if sv.chat_id.is_some() {
-        "Backspace on empty drops a filter · Tab media type · ↑↓ select · Enter jump, then n/N · Esc"
+        "Backspace on empty drops a filter · Tab media type · ↑↓ move · Enter jump, then n/N · Esc close"
     } else {
-        "↑↓ select · Enter jump · Esc"
+        "↑↓ move · Enter jump · Esc close"
     };
     let inner = framed(frame, rect, &title, hint, lines);
     if !listing {
@@ -1481,6 +1604,11 @@ fn marked(text: &str, query: &str, width: usize, base: Style) -> Vec<Span<'stati
     spans
 }
 
+fn result_time(app: &App, ts: i64) -> String {
+    let t = format::list_time(app.lang, ts, chrono::Local::now().timestamp());
+    format!("{}{t} ", " ".repeat(8usize.saturating_sub(t.width())))
+}
+
 fn message_spans(spans: &mut Vec<Span<'static>>, m: &Msg, query: &str, w: usize) {
     let used: usize = spans.iter().map(|s| s.content.width()).sum();
     let room = w.saturating_sub(used + theme::selection_marker().width());
@@ -1546,9 +1674,9 @@ fn draw_find(frame: &mut Frame, area: Rect, app: &App, v: &FindView) {
     }
     let joinable = matches!(hits.get(sel), Some(&(_, Hit::Chat(id))) if !app.is_member(id));
     let hint = match (v.scope, joinable) {
-        (Scope::All, true) => "Tab next section · ↑↓ select · Enter preview · Alt-Enter join · Esc",
-        (Scope::All, false) => "Tab next section · ↑↓ select · Enter open · Esc",
-        (Scope::Messages, _) => "↑↓ select · Enter open · Esc",
+        (Scope::All, true) => "Tab next section · ↑↓ move · Enter preview · <A-Enter> join · Esc close",
+        (Scope::All, false) => "Tab next section · ↑↓ move · Enter open · Esc close",
+        (Scope::Messages, _) => "↑↓ move · Enter open · Esc close",
     };
     let title = match v.scope {
         Scope::All => "Search",
@@ -1609,24 +1737,16 @@ fn find_spans(app: &App, v: &FindView, hit: Hit, query: &str, w: usize) -> Vec<S
             let Some(m) = v.msgs.get(i) else {
                 return Vec::new();
             };
-            let mut spans = vec![
-                Span::styled(
-                    format!(
-                        "{} {} ",
-                        format::date_label(m.date),
-                        format::time_label(m.date)
-                    ),
-                    theme::muted(),
-                ),
-                Span::styled(
-                    format!(
-                        "{} · ",
-                        format::truncate(&app.sender_name(Sender::Chat(m.chat_id)), 24)
-                    ),
+            let sender = app.sender_name(m.sender);
+            let chat = app.sender_name(Sender::Chat(m.chat_id));
+            let mut spans = vec![Span::styled(result_time(app, m.date), theme::muted())];
+            if chat != sender {
+                spans.push(Span::styled(
+                    format!("{} · ", format::truncate(&chat, 24)),
                     theme::mention(),
-                ),
-                Span::styled(format!("{}: ", app.sender_name(m.sender)), theme::strong()),
-            ];
+                ));
+            }
+            spans.push(Span::styled(format!("{sender}: "), theme::strong()));
             message_spans(&mut spans, m, query, w);
             spans
         }

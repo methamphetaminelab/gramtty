@@ -1060,6 +1060,55 @@ fn push_text(
     }
 }
 
+const PREVIEW_DESCRIPTION_ROWS: usize = 3;
+
+fn push_link_preview(
+    p: &model::LinkPreview,
+    width: usize,
+    body: &mut Vec<Line<'static>>,
+    texts: &mut Vec<TextPlace>,
+) {
+    let bar = format!("{} ", theme::get().glyphs.quote_bar);
+    let lead = format::cells(&bar);
+    let avail = width.saturating_sub(lead).max(1);
+    let one_line = |text: &str| model::RichText::plain(format::one_line(text.trim()));
+    let mut rows = Vec::new();
+    if !p.site.trim().is_empty() {
+        rows.extend(format::render_rows(&one_line(&p.site), theme::accent(), avail).into_iter().take(1));
+    }
+    if !p.title.trim().is_empty() {
+        rows.extend(format::render_rows(
+            &one_line(&p.title),
+            theme::normal().add_modifier(Modifier::BOLD),
+            avail,
+        ));
+    }
+    let description = model::RichText::plain(p.description.trim().to_owned());
+    if !description.text.is_empty() {
+        let mut desc = format::render_rows(&description, theme::muted(), avail);
+        if desc.len() > PREVIEW_DESCRIPTION_ROWS {
+            desc.truncate(PREVIEW_DESCRIPTION_ROWS);
+            if let Some((line, wrap)) = desc.last_mut() {
+                let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+                let cut = format::truncate(&format!("{}…", text.trim_end()), avail);
+                wrap.width = format::cells(&cut);
+                *line = Line::from(Span::styled(cut, theme::muted()));
+            }
+        }
+        rows.extend(desc);
+    }
+    for (mut line, wrap) in rows {
+        line.spans.insert(0, Span::styled(bar.clone(), theme::quote()));
+        texts.push(TextPlace {
+            line: body.len(),
+            col: (wrap.indent + lead) as u16,
+            width: wrap.width as u16,
+            join: wrap.join,
+        });
+        body.push(line);
+    }
+}
+
 fn push_transcript(
     app: &App,
     m: &Msg,
@@ -1229,7 +1278,21 @@ fn meta_line(
                 .collect(),
         ),
     };
-    let mut tail = text;
+    let mut tail = if att.spoiler {
+        let view = app
+            .keymap
+            .label_for(crate::keymap::Action::ViewAttachment)
+            .unwrap_or_else(|| "v".to_owned());
+        join(
+            [Some("▒ spoiler".to_owned()), Some(text), Some(format!("{view} to view"))]
+                .into_iter()
+                .flatten()
+                .filter(|t| !t.is_empty())
+                .collect(),
+        )
+    } else {
+        text
+    };
     if let Some(p) = f.upload_percent() {
         tail.push_str(&format!(" {} {p}%", g.upload));
     } else if let Some(p) = f.percent() {
@@ -1275,7 +1338,7 @@ fn tick_span(app: &App, last: &Msg) -> Option<Span<'static>> {
     let read = app.read_outbox(last.chat_id) >= last.id;
     let (glyph, style) = theme::tick(match &last.state {
         SendState::Pending => theme::Tick::Pending,
-        SendState::Failed(_) => theme::Tick::Failed,
+        SendState::Failed { .. } => theme::Tick::Failed,
         SendState::Sent if read => theme::Tick::Read,
         SendState::Sent => theme::Tick::Sent,
     });
@@ -1331,6 +1394,38 @@ fn day_separator(ctx: Ctx, ts: i64) -> Vec<Line<'static>> {
     }
 }
 
+fn starts_unread(app: &App, msgs: &[Msg], i: usize) -> bool {
+    let Some((chat, last_read)) = app.unread_mark else {
+        return false;
+    };
+    let Some(m) = msgs.get(i) else {
+        return false;
+    };
+    if m.chat_id != chat || m.outgoing || m.id <= last_read {
+        return false;
+    }
+    for p in msgs[..i].iter().rev() {
+        if p.id <= last_read {
+            return true;
+        }
+        if !p.outgoing {
+            return false;
+        }
+    }
+    false
+}
+
+fn unread_separator(ctx: Ctx) -> Line<'static> {
+    let label = match ctx.lang {
+        format::Lang::Ru => " Непрочитанные сообщения ",
+        format::Lang::En => " Unread messages ",
+    };
+    Line::from(Span::styled(
+        format::separator(label, ctx.width),
+        theme::date_separator(),
+    ))
+}
+
 fn forward_line(app: &App, m: &Msg, lang: format::Lang, width: usize) -> Option<Line<'static>> {
     let origin = m.forward.as_ref()?;
     Some(Line::from(Span::styled(
@@ -1351,15 +1446,19 @@ fn forward_text(app: &App, origin: &model::Origin, lang: format::Lang) -> String
 }
 
 fn reply_strip(app: &App, m: &Msg, lang: format::Lang, width: usize) -> Option<Line<'static>> {
-    let (sender, name, text) = reply_parts(app, m)?;
+    let (sender, name, text) = reply_parts(app, m, lang)?;
     let bar_style = theme::reply_bar(sender.map(sender_id));
     let bar = format!("{} ", theme::get().glyphs.reply_bar);
     let room = width.saturating_sub(bar.width());
     let mut spans = vec![Span::styled(bar, bar_style)];
     if name.is_empty() {
-        let label = match lang {
-            format::Lang::Ru => "ответ на сообщение",
-            format::Lang::En => "reply to a message",
+        let label = if text.is_empty() {
+            match lang {
+                format::Lang::Ru => "ответ на сообщение",
+                format::Lang::En => "reply to a message",
+            }
+        } else {
+            text.as_str()
         };
         spans.push(Span::styled(
             format::truncate(label, room),
@@ -1406,8 +1505,10 @@ fn group_block(
     let last = &msgs[range.end - 1];
     let prev = range.start.checked_sub(1).map(|j| &msgs[j]);
     let new_day = prev.is_none_or(|p| !format::same_day(p.date, m.date));
-    let show_header =
-        new_day || prev.is_none_or(|p| p.sender != m.sender || m.date - p.date > CLASSIC_RUN_SECS);
+    let unread = starts_unread(app, msgs, range.start);
+    let show_header = new_day
+        || unread
+        || prev.is_none_or(|p| p.sender != m.sender || m.date - p.date > CLASSIC_RUN_SECS);
     let edited = group.iter().any(|g| g.edited);
     let pinned = group.iter().any(|g| g.pinned);
     let tick = tick_span(app, last);
@@ -1423,6 +1524,9 @@ fn group_block(
         lines.extend(day_separator(ctx, m.date));
     } else if show_header {
         lines.push(Line::default());
+    }
+    if unread {
+        lines.push(unread_separator(ctx));
     }
     let gutter = gutter();
     let inner = width.saturating_sub(2 * gutter.max(2)).max(4);
@@ -1530,7 +1634,7 @@ fn group_content(
                 .attachments
                 .iter()
                 .enumerate()
-                .filter(|(_, a)| a.is_visual())
+                .filter(|(_, a)| a.is_visual() && !a.spoiler)
                 .map(move |(ai, _)| (mi, ai))
         })
         .collect();
@@ -1591,8 +1695,15 @@ fn group_content(
         }
     }
     for g in group {
+        let preview = g.meta.link_preview.as_ref();
+        if let Some(p) = preview.filter(|p| p.above) {
+            push_link_preview(p, inner, body, &mut texts);
+        }
         if !g.body.text.is_empty() {
             push_text(body, &mut texts, &g.body, theme::normal(), inner);
+        }
+        if let Some(p) = preview.filter(|p| !p.above) {
+            push_link_preview(p, inner, body, &mut texts);
         }
         if g.ttl != 0 {
             let text = format!("{} {}", theme::get().glyphs.timer, format::ttl(g.ttl));
@@ -1614,16 +1725,31 @@ fn group_content(
         let views = (g.meta.channel_post && g.meta.views > 0)
             .then(|| format!("👁 {}", app.count(i64::from(g.meta.views))));
         if !g.reactions.is_empty() || views.is_some() {
-            let mut text = model::reactions_text(&g.reactions, &app.custom_emoji);
-            if let Some(v) = views {
-                if !text.is_empty() {
-                    text.push_str("  ");
+            let mine = theme::reactions()
+                .patch(theme::accent())
+                .add_modifier(Modifier::BOLD);
+            let mut spans: Vec<Span<'static>> = Vec::new();
+            let chips = model::reaction_chips(&g.reactions, &app.custom_emoji)
+                .into_iter()
+                .map(|(t, own)| (t, if own { mine } else { theme::reactions() }))
+                .chain(views.map(|v| (v, theme::reactions())));
+            for (text, style) in chips {
+                if !spans.is_empty() {
+                    spans.push(Span::styled("  ", theme::reactions()));
                 }
-                text.push_str(&v);
+                spans.push(Span::styled(text, style));
             }
+            body.push(Line::from(truncate_spans(spans, inner)));
+        }
+        if g.meta.comments {
+            let text = match g.meta.replies {
+                0 => "Leave a comment".to_owned(),
+                1 => "1 comment".to_owned(),
+                n => format!("{} comments", app.count(i64::from(n))),
+            };
             body.push(Line::from(Span::styled(
                 format::truncate(&text, inner),
-                theme::reactions(),
+                theme::muted(),
             )));
         }
     }
@@ -1648,7 +1774,7 @@ fn group_content(
                     theme::muted(),
                 )))
             }
-            SendState::Failed(e) => body.push(Line::from(Span::styled(
+            SendState::Failed { error: e, .. } => body.push(Line::from(Span::styled(
                 format::truncate(&format!("failed: {e}"), inner),
                 theme::error(),
             ))),
@@ -1936,7 +2062,9 @@ fn draw_messages(frame: &mut Frame, area: Rect, app: &mut App, split: SplitDraw)
         None => title,
     };
     let marker = match (split, app.side_title()) {
-        (SplitDraw::Hidden, Some(other)) => format!(" [split: {}]", format::sanitize(&other)),
+        (SplitDraw::Hidden, Some(other)) if app.side_chat() != app.open_chat => {
+            format!(" · split: {}", format::sanitize(&other))
+        }
         _ => String::new(),
     };
     let hint = match split {
@@ -1986,6 +2114,7 @@ fn draw_messages(frame: &mut Frame, area: Rect, app: &mut App, split: SplitDraw)
 
 fn draw_command_suggestions(frame: &mut Frame, area: Rect, app: &App) {
     let mentions = app.mention_suggestions();
+    let mentioning = !mentions.is_empty();
     let list: Vec<(String, String)> = if mentions.is_empty() {
         app.command_suggestions()
             .into_iter()
@@ -1994,10 +2123,16 @@ fn draw_command_suggestions(frame: &mut Frame, area: Rect, app: &App) {
     } else {
         mentions
             .into_iter()
-            .map(|(username, name)| (format!("@{username} "), name))
+            .map(|(username, name, _)| {
+                if username.is_empty() {
+                    (format!("{name} "), String::new())
+                } else {
+                    (format!("@{username} "), name)
+                }
+            })
             .collect()
     };
-    let title = if list.first().is_some_and(|(k, _)| k.starts_with('@')) {
+    let title = if mentioning {
         " Mention "
     } else {
         " Commands "
@@ -2038,7 +2173,7 @@ fn draw_command_suggestions(frame: &mut Frame, area: Rect, app: &App) {
     frame.render_widget(Clear, rect);
     let block = theme::popup_block()
         .title(Span::styled(title, theme::popup_title()))
-        .title_bottom(Span::styled(" Tab complete · ↑↓ select ", theme::muted()));
+        .title_bottom(Span::styled(" Tab complete · ↑↓ move ", theme::muted()));
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     frame.render_widget(Paragraph::new(lines), inner);
@@ -2105,21 +2240,66 @@ fn origin_name(app: &App, origin: &model::Origin) -> String {
     }
 }
 
-fn reply_parts(app: &App, m: &Msg) -> Option<(Option<Sender>, String, String)> {
-    let reply_id = m.reply_to?;
-    Some(
-        match app.histories.get(&m.chat_id).and_then(|h| h.get(reply_id)) {
-            Some(r) => {
-                let text = if r.body.text.is_empty() {
-                    r.media.clone().unwrap_or_default()
-                } else {
-                    format::one_line(&r.body.text)
-                };
-                (Some(r.sender), app.sender_name(r.sender), text)
-            }
+pub(crate) fn replied_target(m: &Msg) -> Option<(i64, i64)> {
+    if m.meta.reply_chat != 0 && m.meta.reply_msg != 0 {
+        return Some((m.meta.reply_chat, m.meta.reply_msg));
+    }
+    m.reply_to.map(|id| (m.chat_id, id))
+}
+
+fn replied_msg<'a>(app: &'a App, m: &Msg) -> Option<&'a Msg> {
+    let (chat, id) = replied_target(m)?;
+    app.histories
+        .get(&chat)
+        .and_then(|h| h.get(id))
+        .or_else(|| app.replied.get(&(m.chat_id, m.id)).and_then(Option::as_ref))
+}
+
+pub(crate) fn reply_needs_fetch(app: &App, m: &Msg) -> bool {
+    replied_target(m).is_some()
+        && replied_msg(app, m).is_none()
+        && !(m.meta.reply_origin.is_some()
+            && (m.meta.reply_media.is_some() || m.meta.reply_quote.is_some()))
+}
+
+fn reply_parts(app: &App, m: &Msg, lang: format::Lang) -> Option<(Option<Sender>, String, String)> {
+    let (chat, _) = replied_target(m)?;
+    let (mut sender, mut name, mut text) = match replied_msg(app, m) {
+        Some(r) => {
+            let text = if r.body.text.is_empty() {
+                r.media.clone().unwrap_or_default()
+            } else {
+                format::one_line(&r.body.text)
+            };
+            (Some(r.sender), app.sender_name(r.sender), text)
+        }
+        None => match &m.meta.reply_origin {
+            Some(o) => (
+                match o {
+                    model::Origin::Sender(s) => Some(*s),
+                    model::Origin::Name(_) => None,
+                },
+                origin_name(app, o),
+                m.meta.reply_media.clone().unwrap_or_default(),
+            ),
             None => (None, String::new(), String::new()),
         },
-    )
+    };
+    if let Some(q) = &m.meta.reply_quote {
+        text = format::one_line(q);
+    }
+    if chat != m.chat_id {
+        sender = Some(Sender::Chat(chat));
+        name = app.sender_name(Sender::Chat(chat));
+    }
+    if name.is_empty() && matches!(app.replied.get(&(m.chat_id, m.id)), Some(None)) {
+        text = match lang {
+            format::Lang::Ru => "удалённое сообщение",
+            format::Lang::En => "deleted message",
+        }
+        .to_owned();
+    }
+    Some((sender, name, text))
 }
 
 fn fingerprint(
@@ -2135,9 +2315,14 @@ fn fingerprint(
     )
         .hash(&mut h);
     app.media.font().hash(&mut h);
+    (
+        starts_unread(app, msgs, range.start),
+        starts_unread(app, msgs, range.end),
+    )
+        .hash(&mut h);
     msgs[range.clone()].hash(&mut h);
     if ctx.layout == MessageLayout::Cards {
-        let run = layouts::card_run(msgs, &range);
+        let run = layouts::card_run(app, msgs, &range);
         msgs[run.clone()].hash(&mut h);
         for m in &msgs[run] {
             app.sender_name(m.sender).hash(&mut h);
@@ -2157,7 +2342,7 @@ fn fingerprint(
     app.playing.as_ref().map(|p| p.target).hash(&mut h);
     for m in &msgs[range] {
         app.sender_name(m.sender).hash(&mut h);
-        reply_parts(app, m).hash(&mut h);
+        reply_parts(app, m, ctx.lang).hash(&mut h);
         m.forward.as_ref().map(|o| origin_name(app, o)).hash(&mut h);
         for a in &m.attachments {
             app.media.file(&a.file).hash(&mut h);
@@ -2204,6 +2389,7 @@ pub fn mark_deleted(m: &mut Msg) {
 }
 
 pub fn hide_blocked(m: &mut Msg) {
+    m.meta.reply_msg = 0;
     m.body = model::RichText::plain(BLOCKED_PLACEHOLDER);
     m.media = None;
     m.attachments.clear();
@@ -2311,8 +2497,10 @@ fn bubble_block(
     let prev = range.start.checked_sub(1).map(|j| &msgs[j]);
     let next = msgs.get(range.end);
     let new_day = prev.is_none_or(|p| !format::same_day(p.date, m.date));
-    let first_of_run = new_day || prev.is_none_or(|p| !same_run(p, m));
-    let last_of_run = next.is_none_or(|n| !same_run(last, n));
+    let unread = starts_unread(app, msgs, range.start);
+    let first_of_run = new_day || unread || prev.is_none_or(|p| !same_run(p, m));
+    let last_of_run =
+        next.is_none_or(|n| !same_run(last, n)) || starts_unread(app, msgs, range.end);
     let group_chat = app
         .chats
         .get(&m.chat_id)
@@ -2336,6 +2524,10 @@ fn bubble_block(
     } else if first_of_run {
         lines.push(Line::default());
     }
+    if unread {
+        lines.push(unread_separator(ctx));
+        lines.push(Line::default());
+    }
     let gutter = if with_avatar { avatar_cols + 1 } else { 1 };
     let room = width.saturating_sub(gutter + 1).max(4);
     let outer_max = (width * th.layout.bubble_max_width as usize / 100)
@@ -2355,26 +2547,37 @@ fn bubble_block(
             theme::forwarded(),
         )));
     }
-    if let Some((sender, name, text)) = reply_parts(app, m) {
+    if let Some((sender, name, text)) = reply_parts(app, m, ctx.lang) {
         let bar_style = theme::reply_bar(sender.map(sender_id));
         let bar = Span::styled(th.glyphs.bubble_reply_bar.clone(), bar_style);
         let bar_w = bar.content.width();
-        let name = if name.is_empty() {
-            match ctx.lang {
-                format::Lang::Ru => "ответ".to_owned(),
-                format::Lang::En => "reply".to_owned(),
-            }
+        let named = !name.is_empty();
+        if !named && !text.is_empty() {
+            body.push(Line::from(vec![
+                bar.clone(),
+                Span::styled(
+                    format::truncate(&text, inner_max.saturating_sub(bar_w)),
+                    theme::reply_text(),
+                ),
+            ]));
         } else {
-            name
-        };
-        body.push(Line::from(vec![
-            bar.clone(),
-            Span::styled(
-                format::truncate(&name, inner_max.saturating_sub(bar_w)),
-                theme::strong().patch(bar_style),
-            ),
-        ]));
-        if !text.is_empty() {
+            let name = if name.is_empty() {
+                match ctx.lang {
+                    format::Lang::Ru => "ответ".to_owned(),
+                    format::Lang::En => "reply".to_owned(),
+                }
+            } else {
+                name
+            };
+            body.push(Line::from(vec![
+                bar.clone(),
+                Span::styled(
+                    format::truncate(&name, inner_max.saturating_sub(bar_w)),
+                    theme::strong().patch(bar_style),
+                ),
+            ]));
+        }
+        if named && !text.is_empty() {
             body.push(Line::from(vec![
                 bar,
                 Span::styled(
@@ -2856,6 +3059,13 @@ fn draw_message_list(frame: &mut Frame, area: Rect, app: &mut App, parked: bool)
         .filter(|id| *id != 0 && !app.custom_emoji.contains_key(id))
         .collect();
     app.want_emoji.extend(unknown);
+    let replies: Vec<(i64, i64)> = blocks
+        .iter()
+        .flat_map(|(g, _)| &msgs[groups[*g].clone()])
+        .filter(|m| reply_needs_fetch(app, m))
+        .map(|m| (m.chat_id, m.id))
+        .collect();
+    app.want_replied.extend(replies);
     let mut all: Vec<Line<'static>> = Vec::with_capacity(total);
     let mut sel_span = None;
     let mut texts: Vec<(usize, TextPlace)> = Vec::new();
@@ -3366,19 +3576,23 @@ fn draw_attachment(
     animated
 }
 
-fn viewer_hint(player: bool, file: bool, pos: usize, len: usize) -> String {
+fn viewer_hint(player: bool, playable: bool, file: bool, pos: usize, len: usize) -> String {
     let mut parts: Vec<&str> = Vec::new();
     if player {
-        parts.extend(["space play/pause", "←/→ seek", "↑/↓ volume", "m mute"]);
+        parts.extend(["Space play/pause", "←→ seek", "↑↓ volume", "m mute"]);
     }
-    match (pos > 0, pos + 1 < len) {
-        (true, true) => parts.push("j/k prev/next"),
-        (false, true) => parts.push("j next"),
-        (true, false) => parts.push("k prev"),
-        (false, false) => {}
+    if pos + 1 < len {
+        parts.push("j next");
+    }
+    if pos > 0 {
+        parts.push("k prev");
     }
     if file {
-        parts.push(if player { "x mpv" } else { "x play/open" });
+        parts.push(match (player, playable) {
+            (true, _) => "x mpv",
+            (false, true) => "x play/open",
+            (false, false) => "x open",
+        });
         parts.push("s save");
         if !player {
             parts.push(crate::player::OPEN_HINT);
@@ -3405,15 +3619,21 @@ fn draw_viewer(frame: &mut Frame, area: Rect, app: &mut App) {
     frame.render_widget(Clear, area);
     let att = app.attachment(chat_id, msg_id, idx).cloned();
     let title = match &att {
-        Some(a) => format!(" {} {}/{} ", kind_label(a.kind), pos + 1, len),
-        None => format!(" attachment {}/{} ", pos + 1, len),
+        Some(a) => {
+            let label = kind_label(a.kind);
+            let mut chars = label.chars();
+            let first = chars.next().map(|c| c.to_uppercase().collect::<String>());
+            format!(" {}{} {}/{} ", first.unwrap_or_default(), chars.as_str(), pos + 1, len)
+        }
+        None => format!(" Attachment {}/{} ", pos + 1, len),
     };
     let live = app.inline.active() == Some((msg_id, idx));
     let player = att.as_ref().is_some_and(|a| {
         live || (crate::video::playable(a.kind) && app.inline.available().is_ok())
     });
     let file = att.as_ref().is_some_and(|a| app.file_reachable(&a.file));
-    let hint = viewer_hint(player, file, pos, len);
+    let playable = att.as_ref().is_some_and(|a| crate::video::playable(a.kind));
+    let hint = viewer_hint(player, playable, file, pos, len);
     let block = theme::popup_block()
         .title(Span::styled(title, theme::popup_title()))
         .title_bottom(Span::styled(hint, theme::muted()));
@@ -3514,7 +3734,7 @@ fn draw_viewer(frame: &mut Frame, area: Rect, app: &mut App) {
             None if app.inline.requested == Some((msg_id, idx)) && f.local().is_none() => {
                 " ⧗ Downloading…".to_owned()
             }
-            None => " ▶ space to play here".to_owned(),
+            None => " ▶ Space to play here".to_owned(),
         };
         frame.render_widget(
             Paragraph::new(Span::styled(
@@ -3614,24 +3834,30 @@ fn draw_composer(frame: &mut Frame, area: Rect, app: &App) {
     let title = if c.edit.is_some() {
         Span::styled(" Edit message ", theme::editing())
     } else if let Some(id) = c.reply_to {
-        let name = app
+        let target = app
             .selected_message()
             .filter(|m| m.id == id)
             .or_else(|| {
                 app.histories
                     .get(&app.open_chat.unwrap_or(0))
                     .and_then(|h| h.get(id))
-            })
-            .map_or_else(|| "message".to_owned(), |m| app.sender_name(m.sender));
-        match &c.quote {
-            Some((q, _)) => Span::styled(
-                format!(
-                    " Reply to {name}: “{}” ",
-                    format::truncate(&format::one_line(q), 32)
-                ),
+            });
+        let name = target.map_or_else(|| "message".to_owned(), |m| app.sender_name(m.sender));
+        let snippet = match &c.quote {
+            Some((q, _)) => format::one_line(q),
+            None => target.map(model::preview).unwrap_or_default(),
+        };
+        let head = format!(" Reply to {name}");
+        let room = (area.width as usize)
+            .saturating_sub(format::cells(&head) + 8)
+            .min(32);
+        if snippet.is_empty() || room < 4 {
+            Span::styled(format!("{head} "), theme::strong())
+        } else {
+            Span::styled(
+                format!("{head}: “{}” ", format::truncate(&snippet, room)),
                 theme::strong(),
-            ),
-            None => Span::styled(format!(" Reply to {name} "), theme::strong()),
+            )
         }
     } else {
         Span::styled(" Message ", theme::strong())
@@ -3865,8 +4091,6 @@ fn draw_info(frame: &mut Frame, area: Rect, app: &mut App) {
         return;
     };
     let behind = theme::surface().bg;
-    let shape = theme::get().layout.avatar_shape;
-    mask_avatar(frame, t, font, shape, theme::cell_bg(behind));
     if let Some(photo) = app.profile_photo(model::ProfileTarget::Chat(chat_id)) {
         let overlay = app.popup.is_some() || !app.pending.is_empty();
         draw_avatar(frame, t, &mut app.media, &photo, overlay, behind);
@@ -4085,6 +4309,11 @@ fn draw_popup(frame: &mut Frame, area: Rect, app: &App) {
         Popup::Menu { .. }
         | Popup::Help { .. }
         | Popup::ConfirmRemoveChat { .. }
+        | Popup::ConfirmBlock { .. }
+        | Popup::ConfirmClearHistory { .. }
+        | Popup::ConfirmUnpinAll { .. }
+        | Popup::PollVote { .. }
+        | Popup::ConfirmStopPoll { .. }
         | Popup::Profile(_)
         | Popup::Reactions(_)
         | Popup::ReactionList { .. }
@@ -4421,7 +4650,7 @@ fn draw_stickers(frame: &mut Frame, area: Rect, app: &mut App) {
     let block = theme::popup_block()
         .title(Span::styled(title, theme::popup_title()))
         .title_bottom(Span::styled(
-            " Tab/S-Tab section · arrows move · Enter send · <C-o> big preview · type words or emoji to search · Esc ",
+            " Tab/S-Tab section · ←↑↓→ move · Enter send · <C-o> big preview · type words or emoji to search · Esc close ",
             theme::muted(),
         ));
     let inner = block.inner(rect);
@@ -4706,7 +4935,32 @@ fn draw_key_hint(frame: &mut Frame, area: Rect, app: &App) {
     if groups.is_empty() {
         return;
     }
-    let lines = key_hint_lines(&groups, area.width.saturating_sub(4) as usize);
+    let mut lines = key_hint_lines(&groups, area.width.saturating_sub(4) as usize);
+    let room = area.height.saturating_sub(2) as usize;
+    if lines.len() > room && room > 0 {
+        let keys = |ls: &[Line]| {
+            ls.iter()
+                .flat_map(|l| &l.spans)
+                .filter(|s| s.content.starts_with('[') && s.content.ends_with(']'))
+                .count()
+        };
+        let total = keys(&lines);
+        lines.truncate(room - 1);
+        while lines.last().is_some_and(|l| keys(std::slice::from_ref(l)) == 0) {
+            lines.pop();
+        }
+        let hidden = total - keys(&lines);
+        let help = groups
+            .iter()
+            .flat_map(|(_, h)| h)
+            .find(|h| h.action == crate::keymap::Action::ShowHelp)
+            .map(|h| format!(" · {} all keys", h.key))
+            .unwrap_or_default();
+        lines.push(Line::from(Span::styled(
+            format!("… {hidden} more{help}"),
+            theme::muted(),
+        )));
+    }
     let title = if app.pending.first() == Some(&app.keymap.leader) && app.pending.len() == 1 {
         "Leader".to_owned()
     } else {
@@ -4742,8 +4996,22 @@ fn draw_key_hint(frame: &mut Frame, area: Rect, app: &App) {
 fn draw_login(frame: &mut Frame, area: Rect, app: &App) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut cursor_row: Option<(usize, usize)> = None;
-    let hint = |text: &str| Line::from(Span::styled(text.to_owned(), theme::muted()));
     let max_text = (area.width as usize).saturating_sub(5).max(10);
+    let hint = |text: &str| -> Vec<Line<'static>> {
+        let mut rows: Vec<String> = Vec::new();
+        for part in text.split(" · ") {
+            match rows.last_mut() {
+                Some(row) if row.width() + 3 + part.width() <= max_text => {
+                    row.push_str(" · ");
+                    row.push_str(part);
+                }
+                _ => rows.extend(crate::popups::wrap_words(part, max_text)),
+            }
+        }
+        rows.into_iter()
+            .map(|row| Line::from(Span::styled(row, theme::muted())))
+            .collect()
+    };
     let wrapped = |text: &str, style: Style| -> Vec<Line<'static>> {
         crate::popups::wrap_words(text, max_text)
             .into_iter()
@@ -4760,18 +5028,18 @@ fn draw_login(frame: &mut Frame, area: Rect, app: &App) {
         ]
     };
     match &app.auth {
-        Auth::Starting => lines.push(hint("Connecting to Telegram…")),
-        Auth::Closing => lines.push(hint("Closing the session…")),
+        Auth::Starting => lines.extend(hint("Connecting to Telegram…")),
+        Auth::Closing => lines.extend(hint("Closing the session…")),
         Auth::Ready => {}
         Auth::Blocked(text) => {
             lines.extend(wrapped(text, theme::warning()));
             lines.push(Line::from(""));
-            lines.push(hint("Enter: log in again · q: quit"));
+            lines.extend(hint("Enter: log in again · q: quit"));
         }
         Auth::Qr(None) => {
-            lines.push(hint("Requesting a QR code…"));
+            lines.extend(hint(app.connection.unwrap_or("Requesting a QR code…")));
             lines.push(Line::from(""));
-            lines.push(hint("p: log in with phone number · q: quit"));
+            lines.extend(hint("p: log in with phone number · q: quit"));
         }
         Auth::Qr(Some(link)) => match qr::qr_lines(link) {
             Ok(qr) => {
@@ -4797,7 +5065,7 @@ fn draw_login(frame: &mut Frame, area: Rect, app: &App) {
                 }
                 lines.push(Line::from(""));
                 lines.push(Line::from(Span::styled(QR_CAPTION, theme::strong())));
-                lines.push(hint("p: log in with phone number · q: quit"));
+                lines.extend(hint("p: log in with phone number · q: quit"));
             }
             Err(e) => lines.push(Line::from(Span::styled(e, theme::error()))),
         },
@@ -4808,7 +5076,7 @@ fn draw_login(frame: &mut Frame, area: Rect, app: &App) {
             ));
             cursor_row = Some((1, 2));
             lines.push(Line::from(""));
-            lines.push(hint(
+            lines.extend(hint(
                 "Enter: send code · Esc: back to QR login · <C-c>: quit",
             ));
         }
@@ -4819,17 +5087,17 @@ fn draw_login(frame: &mut Frame, area: Rect, app: &App) {
             ));
             cursor_row = Some((1, 2));
             lines.push(Line::from(""));
-            lines.push(hint("Enter: confirm · Esc: change number · <C-c>: quit"));
+            lines.extend(hint("Enter: confirm · Esc: change number · <C-c>: quit"));
         }
         Auth::Password { hint: pw_hint } => {
             let masked = "•".repeat(app.login_input.text().chars().count());
             lines.extend(field("Two-step verification password", masked));
             cursor_row = Some((1, 2));
             if !pw_hint.is_empty() {
-                lines.push(hint(&format!("Hint: {pw_hint}")));
+                lines.extend(hint(&format!("Hint: {pw_hint}")));
             }
             lines.push(Line::from(""));
-            lines.push(hint("Enter: confirm · Esc: clear · <C-c>: quit"));
+            lines.extend(hint("Enter: confirm · Esc: clear · <C-c>: quit"));
         }
         Auth::Email => {
             lines.extend(field(
@@ -4838,7 +5106,7 @@ fn draw_login(frame: &mut Frame, area: Rect, app: &App) {
             ));
             cursor_row = Some((1, 2));
             lines.push(Line::from(""));
-            lines.push(hint("Enter: send code · Esc: change number · <C-c>: quit"));
+            lines.extend(hint("Enter: send code · Esc: change number · <C-c>: quit"));
         }
         Auth::EmailCode { pattern } => {
             lines.extend(field(
@@ -4847,7 +5115,7 @@ fn draw_login(frame: &mut Frame, area: Rect, app: &App) {
             ));
             cursor_row = Some((1, 2));
             lines.push(Line::from(""));
-            lines.push(hint("Enter: confirm · Esc: change number · <C-c>: quit"));
+            lines.extend(hint("Enter: confirm · Esc: change number · <C-c>: quit"));
         }
     }
     if app.login_busy && app.auth.takes_text() {
@@ -4858,16 +5126,21 @@ fn draw_login(frame: &mut Frame, area: Rect, app: &App) {
         };
         lines.push(Line::from(Span::styled(busy, theme::status())));
     }
-    if let Some(err) = &app.auth_error {
-        lines.push(Line::from(""));
-        lines.extend(wrapped(err, theme::error()));
-    }
     let content_w = lines
         .iter()
         .map(|l| l.spans.iter().map(|s| s.content.width()).sum::<usize>())
         .max()
         .unwrap_or(20);
     let width = (content_w as u16 + 4).max(50).min(area.width.max(1));
+    if let Some(err) = &app.auth_error {
+        lines.push(Line::from(""));
+        let room = (width as usize).saturating_sub(3).max(10);
+        lines.extend(
+            crate::popups::wrap_words(err, room)
+                .into_iter()
+                .map(|row| Line::from(Span::styled(row, theme::error()))),
+        );
+    }
     let height = (lines.len() as u16 + 2).min(area.height.max(1));
     let mut rect = centered(area, width, height);
     if rect.height < height {
@@ -5004,6 +5277,9 @@ mod tests {
                 perms: crate::model::Rights::default(),
                 protected: false,
                 reactions_off: false,
+                marked_unread: false,
+                notify: crate::model::NotifyPrefs::default(),
+                clearable: (false, false),
             },
         );
         let mut h = History::default();
@@ -5357,17 +5633,39 @@ mod tests {
     }
 
     #[test]
+    fn popup_footers_name_a_verb_for_every_key() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app();
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        press(&mut app, KeyCode::Char(' '), KeyModifiers::NONE);
+        let text = render(&mut app, 140, 40);
+        assert!(
+            text.contains("Tab next section · ↑↓ move · Enter open · Esc close"),
+            "{text}"
+        );
+        app.popup = Some(Popup::TextSelect {
+            input: TextInput::with_text("hello"),
+            anchor: None,
+        });
+        let text = render(&mut app, 140, 40);
+        assert!(text.contains("y copy all · Esc close"), "{text}");
+    }
+
+    #[test]
     fn viewer_hint_lists_only_keys_that_do_something() {
-        assert_eq!(viewer_hint(false, false, 0, 1), " Esc close ");
-        let first = viewer_hint(false, true, 0, 3);
+        assert_eq!(viewer_hint(false, false, false, 0, 1), " Esc close ");
+        let first = viewer_hint(false, true, true, 0, 3);
         assert!(
             first.starts_with(" j next · x play/open · s save · o "),
             "{first}"
         );
         assert!(!first.contains("prev"), "{first}");
-        let middle = viewer_hint(false, false, 1, 3);
-        assert_eq!(middle, " j/k prev/next · Esc close ");
-        let last = viewer_hint(true, true, 2, 3);
+        let middle = viewer_hint(false, false, false, 1, 3);
+        assert_eq!(middle, " j next · k prev · Esc close ");
+        let photo = viewer_hint(false, false, true, 1, 3);
+        assert!(photo.starts_with(" j next · k prev · x open · s save · o "), "{photo}");
+        assert!(!photo.contains("play"), "{photo}");
+        let last = viewer_hint(true, true, true, 2, 3);
         assert!(
             last.ends_with("m mute · k prev · x mpv · s save · Esc close "),
             "{last}"
@@ -5688,6 +5986,22 @@ mod tests {
     }
 
     #[test]
+    fn bubble_initials_avatar_is_coloured_text_without_a_fill() {
+        let mut app = bubble_app();
+        let rows = snapshot(&mut app, 90, 30);
+        let y = row_of(&rows, " AL ") as u16;
+        let x = col_of(&rows[y as usize], " AL ") as u16 + 1;
+        let fill = theme::get().name_color(2);
+        for dx in 0..AVATAR_COLS {
+            let c = cell_at(&mut app, 90, 30, x - 1 + dx, y);
+            assert_ne!(Some(c.bg), fill, "cell {dx}");
+        }
+        let a = cell_at(&mut app, 90, 30, x, y);
+        assert_eq!(Some(a.fg), fill);
+        assert!(a.modifier.contains(Modifier::BOLD));
+    }
+
+    #[test]
     fn bubble_selection_and_private_chat_without_avatars() {
         let mut app = bubble_app();
         app.chats.get_mut(&10).unwrap().kind = ChatKind::Private(2);
@@ -5760,6 +6074,90 @@ mod tests {
         let rows = snapshot(&mut app, 100, 12);
         assert!(
             rows.iter().any(|r| r.contains("↓ 3 new · G")),
+            "{}",
+            rows.join("\n")
+        );
+    }
+
+    #[test]
+    fn reply_headers_use_quote_fetch_once_and_show_other_chats() {
+        let mut app = bubble_app();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (td, log) = crate::td::Td::recording(tx);
+        app.td = td;
+        let mut other = app.chats[&10].clone();
+        other.id = 20;
+        other.title = "News room".to_owned();
+        app.chats.insert(20, other);
+        let h = app.histories.get_mut(&10).unwrap();
+        let m = h.get_mut(5).unwrap();
+        m.reply_to = Some(99);
+        m.meta.reply_quote = Some("just this bit".to_owned());
+        h.get_mut(4).unwrap().reply_to = Some(98);
+        let m = h.get_mut(2).unwrap();
+        m.meta.reply_chat = 20;
+        m.meta.reply_msg = 77;
+        m.meta.reply_origin = Some(crate::model::Origin::Sender(Sender::Chat(20)));
+        m.meta.reply_media = Some("[photo] sunset".to_owned());
+        let rows = snapshot(&mut app, 100, 40);
+        assert!(rows.iter().any(|r| r.contains("▎News room")), "{}", rows.join("\n"));
+        assert!(rows.iter().any(|r| r.contains("▎[photo] sunset")));
+        assert!(rows.iter().any(|r| r.contains("▎just this bit")));
+        app.after_draw();
+        let mut asked: Vec<String> = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.starts_with("replied 10"))
+            .cloned()
+            .collect();
+        asked.sort();
+        assert_eq!(asked, ["replied 10 4", "replied 10 5"]);
+        let mut original = msg(99, 2, 1, "the whole long original text");
+        original.chat_id = 10;
+        app.handle(crate::td::Event::Replied {
+            chat_id: 10,
+            message_id: 5,
+            result: Ok(Some(original)),
+        });
+        app.handle(crate::td::Event::Replied {
+            chat_id: 10,
+            message_id: 4,
+            result: Ok(None),
+        });
+        let rows = snapshot(&mut app, 100, 40);
+        let quote = row_of(&rows, "▎just this bit");
+        assert!(rows[quote - 1].contains("▎Alice Longname"), "{}", rows.join("\n"));
+        assert!(!rows.iter().any(|r| r.contains("whole long original")));
+        assert!(rows.iter().any(|r| r.contains("▎deleted message")));
+        app.after_draw();
+        snapshot(&mut app, 100, 40);
+        app.after_draw();
+        let again = log
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| e.starts_with("replied 10"))
+            .count();
+        assert_eq!(again, 2);
+    }
+
+    #[test]
+    fn composer_reply_title_shows_a_truncated_snippet_or_the_quote() {
+        let mut app = bubble_app();
+        app.composer.reply_to = Some(3);
+        let rows = snapshot(&mut app, 100, 30);
+        let title = rows
+            .iter()
+            .find(|r| r.contains("Reply to Alice"))
+            .unwrap_or_else(|| panic!("{}", rows.join("\n")));
+        assert!(title.contains(": “second from alice"), "{title}");
+        assert!(title.contains("…”"), "{title}");
+        assert!(!title.contains("twice"), "{title}");
+        app.composer.quote = Some(("the bubble".to_owned(), 70));
+        let rows = snapshot(&mut app, 100, 30);
+        assert!(
+            rows.iter().any(|r| r.contains("Reply to Alice Longname: “the bubble” ")),
             "{}",
             rows.join("\n")
         );
@@ -5954,7 +6352,8 @@ mod tests {
         let header = first - 1;
         let avatar = cell_at(&mut app, 100, 30, 1, header);
         assert_eq!(avatar.symbol(), "A");
-        assert_eq!(Some(avatar.bg), theme::get().name_color(2));
+        assert_eq!(Some(avatar.fg), theme::get().name_color(2));
+        assert_eq!(avatar.bg, Color::Reset);
         let me = row_of(&rows, "Me ") as u16;
         assert_eq!(cell_at(&mut app, 100, 30, 1, me).symbol(), "M");
         app.chats.get_mut(&10).unwrap().kind = ChatKind::Private(2);
@@ -6185,7 +6584,7 @@ mod tests {
             i < j && line[i + a.len()..j].trim().is_empty()
         };
         assert!(
-            gap(&w[2], "[Space]  find chat", "[u]  attach file"),
+            gap(&w[2], "[Space]  find chat, person or message", "[u]  attach file"),
             "{w:#?}"
         );
         assert!(
@@ -6215,7 +6614,7 @@ mod tests {
             !wide.last().unwrap().contains("Esc cancel"),
             "the popup sits above the pane borders instead of cutting through them"
         );
-        let narrow = snapshot(&mut app, 70, 40);
+        let narrow = snapshot(&mut app, 80, 40);
         let n = inner(&narrow);
         assert!(
             n[1].contains("Navigate") && n[1].contains("Compose") && !n[1].contains("Panes"),
@@ -6241,6 +6640,29 @@ mod tests {
             buf[(x, y)].fg
         };
         assert_eq!(buf_row(&mut app), Color::Red);
+    }
+
+    #[test]
+    fn leader_popup_on_a_small_terminal_ends_with_a_more_line() {
+        let mut app = app();
+        app.pending = vec![app.keymap.leader];
+        let rows = snapshot(&mut app, 50, 20);
+        let top = rows.iter().position(|l| l.contains("╭ Leader")).unwrap();
+        let bottom = rows.iter().position(|l| l.contains("╰ Esc cancel")).unwrap();
+        assert!(bottom < 20, "{rows:#?}");
+        let more = &rows[bottom - 1];
+        assert!(rows[bottom - 2].contains("[s]  stickers"), "{rows:#?}");
+        assert!(more.contains("more · ? all keys"), "{rows:#?}");
+        let shown = rows[top..bottom].iter().map(|r| r.matches('[').count()).sum::<usize>();
+        let total: usize = app.key_hints().iter().map(|(_, h)| h.len()).sum();
+        let n: usize = more
+            .split("… ")
+            .nth(1)
+            .and_then(|r| r.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap();
+        assert_eq!(shown + n, total, "{rows:#?}");
+        assert!(rows[top + 1].contains("Navigate"), "{rows:#?}");
     }
 
     fn popup_box(rows: &[String], title: &str) -> Vec<String> {
@@ -6442,6 +6864,116 @@ mod tests {
     }
 
     #[test]
+    fn block_clear_and_unpin_confirmations_render() {
+        let mut app = app();
+        app.chats.insert(
+            20,
+            ChatInfo {
+                id: 20,
+                title: "Alice Longname".to_owned(),
+                kind: ChatKind::Private(2),
+                ..app.chats[&10].clone()
+            },
+        );
+        app.popup = Some(Popup::ConfirmBlock { user_id: 2 });
+        let screen = render(&mut app, 100, 30);
+        assert!(screen.contains("Block Alice Longname?"), "{screen}");
+        assert!(screen.contains(" y block"), "{screen}");
+        assert!(screen.contains(" n cancel"), "{screen}");
+        app.popup = Some(Popup::ConfirmClearHistory {
+            chat_id: 20,
+            everyone: true,
+            me: true,
+        });
+        let screen = render(&mut app, 100, 30);
+        assert!(
+            screen.contains("Clear the history of Alice Longname?"),
+            "{screen}"
+        );
+        assert!(screen.contains(" y also for Alice Longname"), "{screen}");
+        assert!(screen.contains(" m only for me (Enter)"), "{screen}");
+        app.popup = Some(Popup::ConfirmClearHistory {
+            chat_id: 10,
+            everyone: false,
+            me: true,
+        });
+        let screen = render(&mut app, 100, 30);
+        assert!(!screen.contains(" y "), "{screen}");
+        assert!(screen.contains(" m only for me (Enter)"), "{screen}");
+        app.popup = Some(Popup::ConfirmUnpinAll {
+            chat_id: 10,
+            topic: Some(5),
+        });
+        let screen = render(&mut app, 100, 30);
+        assert!(
+            screen.contains("Unpin all messages in this topic?"),
+            "{screen}"
+        );
+        assert!(screen.contains(" y unpin"), "{screen}");
+    }
+
+    #[test]
+    fn profile_hint_offers_block_or_unblock_for_other_users() {
+        let mut app = app();
+        app.my_id = Some(1);
+        let profile = |user: i64| {
+            Popup::Profile(crate::app::ProfileView {
+                target: crate::model::ProfileTarget::User(user),
+                data: Some(crate::model::Profile {
+                    title: "Someone".to_owned(),
+                    user_id: Some(user),
+                    ..crate::model::Profile::default()
+                }),
+                error: None,
+                scroll: 0,
+            })
+        };
+        app.popup = Some(profile(2));
+        let text = render(&mut app, 120, 40);
+        assert!(text.contains("b block"), "{text}");
+        app.blocked.insert(Sender::User(2));
+        let text = render(&mut app, 120, 40);
+        assert!(text.contains("b unblock"), "{text}");
+        app.popup = Some(profile(1));
+        let text = render(&mut app, 120, 40);
+        assert!(!text.contains("b block"), "{text}");
+    }
+
+    #[test]
+    fn spoiler_media_shows_a_quiet_placeholder_instead_of_the_picture() {
+        for layout in all_layouts() {
+            let mut app = media_app();
+            app.settings.appearance.layout = Some(layout);
+            let ctx = Ctx {
+                width: 60,
+                layout,
+                theme: 0,
+                now: 0,
+                today: 0,
+                lang: format::Lang::En,
+                sel: None,
+            };
+            let album_images = |app: &App| {
+                let msgs = app.histories[&10].msgs();
+                let range = model::groups(msgs)
+                    .into_iter()
+                    .find(|r| msgs[r.start].id == 41)
+                    .unwrap();
+                let mut cache = LayoutCache::default();
+                cached_block(app, &mut cache, msgs, range, ctx, false).images.len()
+            };
+            assert_eq!(album_images(&app), 3, "{layout:?}");
+            let h = app.histories.get_mut(&10).unwrap();
+            for id in [41, 42, 43] {
+                h.get_mut(id).unwrap().attachments[0].spoiler = true;
+            }
+            assert_eq!(album_images(&app), 0, "{layout:?}");
+            let screen = render(&mut app, 100, 40);
+            assert!(screen.contains("▒ spoiler · v to view"), "{layout:?}\n{screen}");
+        }
+    }
+
+    #[test]
     fn info_pane_wraps_long_values_instead_of_clipping() {
         let mut app = app();
         app.settings.appearance.show_ids = true;
@@ -6486,6 +7018,9 @@ mod tests {
                 perms: crate::model::Rights::default(),
                 protected: false,
                 reactions_off: false,
+                marked_unread: false,
+                notify: crate::model::NotifyPrefs::default(),
+                clearable: (false, false),
             },
         );
         app.user_meta.insert(
@@ -6538,7 +7073,7 @@ mod tests {
         assert!(screen.contains(" Message · Alice is typing… "), "{screen}");
         assert!(screen.contains("Approve"));
         assert!(screen.contains("Docs ↗"));
-        assert!(screen.contains("❤\u{FE0F}  3•"));
+        assert!(screen.contains("❤\u{FE0F}  3"));
         assert!(screen.contains("📌"));
         assert!(screen.contains("All chats"));
         assert!(screen.contains("42"));
@@ -6698,6 +7233,7 @@ mod tests {
         };
         app.popup = Some(Popup::Search(SearchView {
             chat_id: None,
+            topic: None,
             pinned: false,
             sender: None,
             media: None,
@@ -6852,6 +7388,7 @@ mod tests {
             url: url.to_owned(),
             hidden,
             text: text.to_owned(),
+            kind: format::LinkKind::Url,
         };
         let links = || {
             vec![
@@ -7173,12 +7710,12 @@ mod tests {
             matches!(app.popup, Some(Popup::Viewer { pos: 0, ref items, .. }) if items.len() == 3)
         );
         let screen = render(&mut app, 100, 40);
-        assert!(screen.contains("photo 1/3"));
+        assert!(screen.contains("Photo 1/3"));
         assert!(screen.contains("800×600"));
         app.handle(Event::Input(crossterm::event::Event::Key(
             crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Char('j')),
         )));
-        assert!(render(&mut app, 100, 40).contains("photo 2/3"));
+        assert!(render(&mut app, 100, 40).contains("Photo 2/3"));
         app.handle(Event::Input(crossterm::event::Event::Key(
             crossterm::event::KeyEvent::from(crossterm::event::KeyCode::Esc),
         )));
@@ -7382,6 +7919,45 @@ mod tests {
         assert!(small.contains("Link Desktop Device"), "{small}");
         assert!(small.contains("log in with phone number"), "{small}");
         assert!(!small.contains("too small"), "{small}");
+    }
+
+    #[test]
+    fn login_fits_fifty_columns_shows_the_connection_and_filters_the_phone() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app();
+        app.auth = Auth::Qr(None);
+        app.connection = Some("Waiting for network…");
+        let text = render(&mut app, 50, 20);
+        assert!(text.contains("Waiting for network…"), "{text}");
+        assert!(!text.contains("Requesting a QR code"), "{text}");
+        app.connection = None;
+        assert!(render(&mut app, 50, 20).contains("Requesting a QR code…"));
+
+        app.auth = Auth::Phone;
+        let rows = snapshot(&mut app, 50, 20);
+        let text = rows.join("\n");
+        assert!(!text.contains('…'), "{text}");
+        let first = row_of(&rows, "Enter: send code");
+        assert!(rows[first].contains("Enter: send code · Esc: back to QR login"), "{text}");
+        assert!(rows[first + 1].contains("│ <C-c>: quit "), "{text}");
+        let edges = |rows: &[String]| {
+            let top = &rows[row_of(rows, " login ")];
+            (top.find('╭').unwrap(), top.find('╮').unwrap())
+        };
+        let before = edges(&snapshot(&mut app, 100, 30));
+        app.auth_error = Some(
+            "Enter the full number with the country code, for example +7 900 000 00 00, without extra digits"
+                .to_owned(),
+        );
+        assert_eq!(edges(&snapshot(&mut app, 100, 30)), before);
+        app.auth_error = None;
+
+        for c in "+1 (555) abc-12x".chars() {
+            press(&mut app, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+        assert_eq!(app.login_input.text(), "+1 (555) -12");
+        app.handle(Event::Input(crossterm::event::Event::Paste("tel: +44 20-7946".to_owned())));
+        assert_eq!(app.login_input.text(), "+1 (555) -12 +44 20-7946");
     }
 
     #[test]
@@ -7684,24 +8260,18 @@ mod tests {
         let rows = info_rows(&buf);
         let x0 = 120 - 30 + 1;
         let fill = th.name_color(2).unwrap();
-        let painted: Vec<(u16, u16)> = (0..40u16)
+        let painted = (0..40u16)
             .flat_map(|y| (x0..119).map(move |x| (x, y)))
             .filter(|&(x, y)| buf[(x, y)].bg == fill)
-            .collect();
-        let xs: Vec<u16> = painted.iter().map(|p| p.0).collect();
-        let ys: Vec<u16> = painted.iter().map(|p| p.1).collect();
-        let (left, right) = (*xs.iter().min().unwrap(), *xs.iter().max().unwrap());
-        let (top, bottom) = (*ys.iter().min().unwrap(), *ys.iter().max().unwrap());
-        assert_eq!(
-            (right - left + 1, bottom - top + 1),
-            (16, 8),
-            "square avatar"
-        );
-        assert_eq!(painted.len(), 16 * 8);
-        assert_eq!(left - x0, (28 - 16) / 2, "centred");
-        assert_eq!(top, 3, "right under the pane title");
+            .count();
+        assert_eq!(painted, 0, "no filled tile");
+        let (top, bottom) = (3, 3 + 8 - 1);
         let label = row_of(&rows, "AL");
         assert_eq!(label as u16, top + 4);
+        let (lx, ly) = find_in(&buf, "AL", x0..119);
+        assert_eq!((lx - x0, ly), ((28 - 16) / 2 + (16 - 2) / 2, top + 4), "centred");
+        assert_eq!(buf[(lx, ly)].fg, fill);
+        assert!(buf[(lx, ly)].modifier.contains(Modifier::BOLD));
 
         let title = row_of(&rows, "Alice Longname");
         assert!(title as u16 > bottom);
@@ -7752,10 +8322,14 @@ mod tests {
         let buf = buffer(&mut app, 120, 40);
         let fill = app.frame_theme().name_color(2).unwrap();
         let x0 = 120 - 30 + 1 + 6;
-        assert_ne!(buf[(x0, 3)].bg, fill, "corner cut");
-        assert_eq!(buf[(x0 + 8, 7)].bg, fill, "centre kept");
-        assert_eq!(buf[(x0 + 3, 3)].symbol(), "▄", "edges are half a cell");
-        assert_eq!(buf[(x0 + 3, 3)].fg, fill);
+        for y in 3..11 {
+            for x in x0..x0 + 16 {
+                assert_ne!(buf[(x, y)].bg, fill, "{x},{y}");
+                assert!(!matches!(buf[(x, y)].symbol(), "▄" | "▀"), "{x},{y}");
+            }
+        }
+        assert_eq!(buf[(x0 + 7, 7)].symbol(), "A");
+        assert_eq!(buf[(x0 + 7, 7)].fg, fill);
     }
 
     #[test]
@@ -8000,8 +8574,8 @@ mod tests {
         assert_eq!(buf[(x, y)].fg, c.own_name.0.fg.unwrap());
         let (x, y) = find(&buf, "Alice Longname ");
         assert_eq!(Some(buf[(x, y)].fg), th.name_color(2));
-        assert_eq!(Some(buf[(x - 2, y)].bg), th.name_color(2));
-        assert_eq!(buf[(x - 2, y)].fg, c.avatar_text.0.unwrap());
+        assert_eq!(Some(buf[(x - 2, y)].fg), th.name_color(2));
+        assert_ne!(Some(buf[(x - 2, y)].bg), th.name_color(2));
         let (x, y) = find(&buf, "✓✓");
         assert_eq!(buf[(x, y)].fg, c.tick_read.0.fg.unwrap());
         let (x, y) = find(&buf, "Bob Hidden");
@@ -8332,6 +8906,36 @@ mod tests {
     }
 
     #[test]
+    fn split_marker_skips_the_same_chat_and_the_open_hint_clears_once_chosen() {
+        use crossterm::event::{KeyCode, KeyModifiers};
+        let mut app = app();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.td = crate::td::Td::recording(tx).0;
+        app.show_info = false;
+        app.show_folders = false;
+        app.show_chats = false;
+        let mut other = app.chats[&10].clone();
+        other.id = 20;
+        other.title = "Второй чат".to_owned();
+        app.chats.insert(20, other);
+        app.focus = Pane::Messages;
+        press(&mut app, KeyCode::Char('w'), KeyModifiers::CONTROL);
+        press(&mut app, KeyCode::Char('v'), KeyModifiers::NONE);
+        assert_eq!(
+            app.status.as_ref().map(|s| s.0.as_str()),
+            Some("split: open another chat here; <C-w> w switches panes")
+        );
+        let rows = snapshot(&mut app, 90, 40);
+        let title = &rows[row_of(&rows, "╭ Rust чат")];
+        assert!(!title.contains("split"), "{title}");
+        app.open(20);
+        assert!(app.status.is_none(), "{:?}", app.status);
+        let rows = snapshot(&mut app, 90, 40);
+        let title = &rows[row_of(&rows, "╭ Второй чат")];
+        assert!(title.contains(" · split: Rust чат "), "{title}");
+    }
+
+    #[test]
     fn split_below_the_minimum_width_draws_only_the_live_pane_and_names_the_other() {
         let (mut app, _log) = split_scene();
         for width in [90, 99] {
@@ -8339,12 +8943,13 @@ mod tests {
             let text = rows.join("\n");
             assert!(text.contains("second-chat-line"), "{width}");
             assert!(!text.contains("hello there"), "{width}");
-            assert!(text.contains("[split: Rust чат]"), "{width}\n{text}");
+            assert!(text.contains(" · split: Rust чат "), "{width}\n{text}");
+            assert!(!text.contains("[split"), "{width}\n{text}");
         }
         let rows = snapshot(&mut app, 100, 40);
         let text = rows.join("\n");
         assert!(text.contains("hello there") && text.contains("second-chat-line"));
-        assert!(!text.contains("[split:"));
+        assert!(!text.contains("split:"));
     }
 
     #[test]
@@ -8490,6 +9095,54 @@ mod tests {
             app
         }
 
+        #[test]
+        fn unread_separator_sits_above_the_first_unread_message_in_every_layout() {
+            for layout in [
+                MessageLayout::Classic,
+                MessageLayout::Bubbles,
+                MessageLayout::Cards,
+                MessageLayout::Compact,
+                MessageLayout::Minimal,
+                MessageLayout::Split,
+            ] {
+                let mut app = conversation(layout);
+                let plain = snapshot(&mut app, 90, 60);
+                assert!(!plain.iter().any(|r| r.contains("Unread messages")), "{layout:?}");
+                let history = || conversation(layout).histories.remove(&10).unwrap();
+                app.open_chat = None;
+                let chat = app.chats.get_mut(&10).unwrap();
+                chat.last_read_inbox = 1;
+                chat.unread = 2;
+                app.enter_chat(10);
+                app.histories.insert(10, history());
+                let rows = snapshot(&mut app, 90, 60);
+                let sep = row_of(&rows, "Unread messages");
+                assert_eq!(rows.iter().filter(|r| r.contains("Unread messages")).count(), 1);
+                assert!(rows[sep].contains("─ Unread messages ─"), "{layout:?}\n{}", rows.join("\n"));
+                assert!(row_of(&rows, "hey, did you see") < sep, "{layout:?}\n{}", rows.join("\n"));
+                let next = rows[sep + 1..]
+                    .iter()
+                    .position(|r| !r.trim_matches(['│', ' ']).is_empty())
+                    .unwrap()
+                    + sep
+                    + 1;
+                assert!(
+                    next <= row_of(&rows, "the changelog") && row_of(&rows, "the changelog") <= next + 1,
+                    "{layout:?}\n{}",
+                    rows.join("\n")
+                );
+                let chat = app.chats.get_mut(&10).unwrap();
+                chat.last_read_inbox = 5;
+                chat.unread = 0;
+                assert_eq!(snapshot(&mut app, 90, 60), rows, "{layout:?} stays put while read");
+                app.open(11);
+                app.open(10);
+                app.histories.insert(10, history());
+                let left = snapshot(&mut app, 90, 60);
+                assert!(!left.iter().any(|r| r.contains("Unread messages")), "{layout:?}");
+            }
+        }
+
         fn tiny_cards() -> App {
             let mut app = conversation(MessageLayout::Cards);
             app.users.insert(7, "twink".to_owned());
@@ -8555,6 +9208,135 @@ mod tests {
             assert!(text.contains("Message ID"), "{text}");
             assert!(text.contains("Sender ID        2 (user)"), "{text}");
             assert!(text.contains("Checking…"), "{text}");
+        }
+
+        #[test]
+        fn polls_quiz_results_and_vote_popups_render_in_every_layout() {
+            for layout in MessageLayout::ALL {
+                let mut app = conversation(layout);
+                let m = app.histories.get_mut(&10).unwrap().get_mut(5).unwrap();
+                m.body = RichText::default();
+                m.forward = None;
+                m.media = Some(
+                    "📊 Capital of Australia? (closed)\n  ● Sydney — 40%\n  ○ Canberra — 60% ✓\n  5 votes\n  Canberra was built as a compromise"
+                        .to_owned(),
+                );
+                let rows = snapshot(&mut app, 100, 70);
+                let text = rows.join("\n");
+                for part in ["Capital of Australia?", "● Sydney — 40%", "○ Canberra — 60% ✓", "5 votes", "Canberra was built as a compromise"] {
+                    assert!(text.contains(part), "{layout:?} {part}\n{text}");
+                }
+            }
+            let mut app = conversation(MessageLayout::Classic);
+            app.popup = Some(Popup::PollVote {
+                chat_id: 10,
+                msg_id: 5,
+                options: vec!["pizza".to_owned(), "sushi".to_owned()],
+                picked: vec![false, true],
+                multiple: true,
+                sel: 1,
+            });
+            let rows = snapshot(&mut app, 100, 40);
+            let text = rows.join("\n");
+            assert!(text.contains("Vote"), "{text}");
+            assert!(text.contains("[ ] pizza"), "{text}");
+            assert!(text.contains("[x] sushi"), "{text}");
+            assert!(text.contains("Space toggle"), "{text}");
+            app.popup = Some(Popup::ConfirmStopPoll { chat_id: 10, msg_id: 5 });
+            let text = snapshot(&mut app, 100, 40).join("\n");
+            assert!(text.contains("Stop this poll?"), "{text}");
+        }
+
+        #[test]
+        fn channel_posts_show_a_quiet_comment_count_in_every_layout() {
+            for layout in MessageLayout::ALL {
+                let mut app = conversation(layout);
+                let plain = snapshot(&mut app, 90, 60).join("\n");
+                assert!(!plain.contains("comment"), "{layout:?}\n{plain}");
+                let m = app.histories.get_mut(&10).unwrap().get_mut(5).unwrap();
+                m.meta.channel_post = true;
+                m.meta.comments = true;
+                m.meta.replies = 12;
+                let rows = snapshot(&mut app, 90, 60);
+                let at = row_of(&rows, "12 comments");
+                assert!(row_of(&rows, "Rust 1.99 released") < at, "{layout:?}\n{}", rows.join("\n"));
+                let m = app.histories.get_mut(&10).unwrap().get_mut(5).unwrap();
+                m.meta.replies = 0;
+                let text = snapshot(&mut app, 90, 60).join("\n");
+                assert!(text.contains("Leave a comment"), "{layout:?}\n{text}");
+            }
+            let mut app = conversation(MessageLayout::Classic);
+            let mut channel = app.chats[&10].clone();
+            channel.id = 50;
+            channel.title = "Rust News".to_owned();
+            app.chats.insert(50, channel);
+            app.open_thread = Some(crate::app::ThreadView {
+                chat_id: 10,
+                thread_id: 5,
+                channel_id: 50,
+                post_id: 77,
+            });
+            let text = snapshot(&mut app, 90, 60).join("\n");
+            assert!(text.contains("Comments · Rust News"), "{text}");
+        }
+
+        fn with_preview(layout: MessageLayout, above: bool) -> App {
+            let mut app = conversation(layout);
+            let m = app.histories.get_mut(&10).unwrap().get_mut(3).unwrap();
+            m.body = RichText::plain("read this https://example.org/post");
+            m.meta.link_preview = Some(crate::model::LinkPreview {
+                site: "Example Blog".to_owned(),
+                title: "Why terminals are cozy".to_owned(),
+                description: "word ".repeat(80).trim_end().to_owned(),
+                above,
+            });
+            app
+        }
+
+        #[test]
+        fn link_previews_render_as_a_quiet_quote_block_in_every_layout() {
+            for layout in MessageLayout::ALL {
+                let mut app = with_preview(layout, false);
+                let rows = snapshot(&mut app, 70, 70);
+                let text = rows.join("\n");
+                let site = row_of(&rows, "Example Blog");
+                let title = row_of(&rows, "Why terminals are cozy");
+                let body = row_of(&rows, "read this");
+                assert!(body < site && site + 1 == title, "{layout:?}\n{text}");
+                assert!(rows[site].contains("▎ Example Blog"), "{layout:?}\n{text}");
+                let desc: Vec<&String> = rows[title + 1..]
+                    .iter()
+                    .take_while(|r| r.contains("▎ word"))
+                    .collect();
+                assert_eq!(desc.len(), 3, "{layout:?}\n{text}");
+                assert!(desc[2].contains('…'), "{layout:?}\n{text}");
+                let width = |r: &str| unicode_width::UnicodeWidthStr::width(r);
+                assert!(
+                    rows.iter().filter(|r| r.contains('▎')).all(|r| width(r) <= 70),
+                    "{layout:?}\n{text}"
+                );
+                let bars = |rows: &[String]| rows.iter().filter(|r| r.contains('▎')).count();
+                let plain = snapshot(&mut conversation(layout), 70, 70);
+                assert_eq!(bars(&rows), bars(&plain) + 5, "{layout:?}\n{}", plain.join("\n"));
+                let mut app = with_preview(layout, true);
+                let rows = snapshot(&mut app, 70, 70);
+                assert!(
+                    row_of(&rows, "Example Blog") < row_of(&rows, "read this"),
+                    "{layout:?}\n{}",
+                    rows.join("\n")
+                );
+            }
+            let mut wide = with_preview(MessageLayout::Classic, false);
+            let mut bubbles = with_preview(MessageLayout::Bubbles, false);
+            let rows = |app: &mut App| {
+                snapshot(app, 70, 70)
+                    .into_iter()
+                    .filter(|r| r.contains("▎ word"))
+                    .map(|r| r.trim_matches(['│', ' ']).chars().count())
+                    .max()
+                    .unwrap()
+            };
+            assert!(rows(&mut bubbles) < rows(&mut wide), "bubbles wrap narrower");
         }
 
         #[test]
@@ -9125,7 +9907,7 @@ mod tests {
                     (AVATAR_COLS, AVATAR_COLS / 2),
                     "{shape:?}"
                 );
-                let initials = crate::theme::avatar(2).bg.unwrap();
+                let initials = crate::theme::avatar(2).fg.unwrap();
                 for y in y0..=y1 {
                     for x in x0..=x1 {
                         assert_ne!(buf[(x, y)].bg, initials, "{shape:?} {x},{y}");
@@ -9971,7 +10753,7 @@ mod tests {
                 app.custom_emoji.insert(PARTY, "🎉".to_owned());
                 let rows = pane_rows(&mut app);
                 let screen = rows.join("\n");
-                for chip in ["👍 1", "❤\u{FE0F} 1", "🎉 2•", "😁 3"] {
+                for chip in ["👍 1", "❤\u{FE0F} 1", "🎉 2", "😁 3"] {
                     assert!(screen.contains(chip), "{layout:?} {chip}\n{screen}");
                 }
                 assert!(
@@ -9991,6 +10773,32 @@ mod tests {
                         && !r.chars().any(|c| c.is_ascii_digit());
                     assert!(!lone, "{layout:?} bare reaction glyph: [{r}]\n{screen}");
                 }
+            }
+        }
+
+        #[test]
+        fn own_reactions_are_bold_accent_chips_without_a_dot() {
+            for layout in ALL {
+                let mut app = chat_scene(layout);
+                app.custom_emoji.insert(PARTY, "🎉".to_owned());
+                let screen = pane_rows(&mut app).join("\n");
+                assert!(!screen.contains("2•"), "{layout:?}\n{screen}");
+                let buf = buffer(&mut app, 140, 60);
+                let cell = |glyph: &str, count: &str| {
+                    let area = buf.area;
+                    (0..area.height)
+                        .flat_map(|y| (0..area.width.saturating_sub(3)).map(move |x| (x, y)))
+                        .find(|&(x, y)| buf[(x, y)].symbol() == glyph && buf[(x + 3, y)].symbol() == count)
+                        .map(|(x, y)| buf[(x + 3, y)].clone())
+                        .unwrap_or_else(|| panic!("{layout:?} {glyph} {count}"))
+                };
+                let own = cell("🎉", "2");
+                assert_eq!(own.symbol(), "2");
+                assert!(own.modifier.contains(Modifier::BOLD), "{layout:?}");
+                assert_eq!(own.fg, theme::reactions().patch(theme::accent()).fg.unwrap_or(Color::Reset), "{layout:?}");
+                let other = cell("😁", "3");
+                assert_eq!(other.symbol(), "3");
+                assert!(!other.modifier.contains(Modifier::BOLD), "{layout:?}");
             }
         }
 
@@ -10093,7 +10901,7 @@ mod tests {
                     .count()
             };
             let rows = pane_rows(&mut app);
-            assert!(rows.iter().any(|r| r.contains("• 2•")), "{rows:#?}");
+            assert!(rows.iter().any(|r| r.contains("• 2")), "{rows:#?}");
             app.after_draw();
             pane_rows(&mut app);
             app.after_draw();
@@ -10104,7 +10912,7 @@ mod tests {
             )]))));
             let screen = pane_rows(&mut app).join("\n");
             assert!(
-                screen.contains("🎉 2•") && !screen.split_whitespace().any(|w| w == "•"),
+                screen.contains("🎉 2") && !screen.split_whitespace().any(|w| w == "•"),
                 "{screen}"
             );
             app.after_draw();
@@ -11084,6 +11892,9 @@ mod tests {
                 perms: crate::model::Rights::default(),
                 protected: false,
                 reactions_off: false,
+                marked_unread: false,
+                notify: crate::model::NotifyPrefs::default(),
+                clearable: (false, false),
             },
         );
         app.secret_chats.insert(
@@ -11858,6 +12669,9 @@ mod repaint_tests {
                 perms: crate::model::Rights::default(),
                 protected: false,
                 reactions_off: false,
+                marked_unread: false,
+                notify: crate::model::NotifyPrefs::default(),
+                clearable: (false, false),
             },
         );
         rig.app.show_info = true;
@@ -12028,7 +12842,7 @@ mod repaint_tests {
         let text = buffer_text(&rig.buf);
         assert!(text.contains(" ▶ 0:0"), "{text}");
         assert!(text.contains("vol 100%"), "{text}");
-        assert!(text.contains("space play/pause"), "{text}");
+        assert!(text.contains("Space play/pause"), "{text}");
         let key = |code| {
             Event::Input(crossterm::event::Event::Key(
                 crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE),
@@ -12108,7 +12922,7 @@ mod repaint_tests {
             "viewer: {:?}",
             &stale[..stale.len().min(5)]
         );
-        assert!(buffer_text(&rig.buf).contains(" photo 1/2 "));
+        assert!(buffer_text(&rig.buf).contains(" Photo 1/2 "));
         rig.screen.soil_blanks();
         rig.app.popup = None;
         rig.frame();

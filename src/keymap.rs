@@ -167,6 +167,7 @@ fn narrow(likely: u32, found: u32) -> u32 {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LayoutGuess {
     likely: u32,
+    non_latin: bool,
 }
 
 impl LayoutGuess {
@@ -180,7 +181,10 @@ impl LayoutGuess {
             .iter()
             .position(|(l, _, _)| *l == lang)
             .map_or(0, |i| 1 << i);
-        Self { likely }
+        Self {
+            likely,
+            non_latin: likely != 0,
+        }
     }
 
     pub fn from_env() -> Self {
@@ -196,6 +200,18 @@ impl LayoutGuess {
         if found != 0 {
             self.likely = narrow(self.likely, found);
         }
+        if c.is_ascii_alphabetic() {
+            self.non_latin = false;
+        } else if layout_char(c) {
+            self.non_latin = true;
+        }
+    }
+
+    fn latin_punct(&self, c: char) -> Option<char> {
+        if !self.non_latin || !c.is_ascii_punctuation() || self.likely.count_ones() != 1 {
+            return None;
+        }
+        qwerty_in(self.likely.trailing_zeros() as usize, c)
     }
 
     pub fn latin(&self, c: char) -> Option<char> {
@@ -389,7 +405,7 @@ pub enum HelpLine {
     Blank,
 }
 
-const HELP_EXTRA: [(Section, &str, &str); 29] = [
+const HELP_EXTRA: [(Section, &str, &str); 30] = [
     (
         Section::Global,
         "Enter",
@@ -403,6 +419,7 @@ const HELP_EXTRA: [(Section, &str, &str); 29] = [
     (Section::Global, "<C-n>, <C-p>", "next, previous"),
     (Section::Global, "<C-c>", "quit"),
     (Section::Composer, "Enter", "send"),
+    (Section::Composer, "<A-s>", "send without sound"),
     (Section::Composer, "<S-Enter> <A-Enter> <C-j>", "new line"),
     (
         Section::Composer,
@@ -863,7 +880,7 @@ impl Action {
             Action::ToggleInfoPane => "toggle chat info",
             Action::OpenPaneActions => "actions",
             Action::RefreshScreen => "redraw",
-            Action::ChatSwitcher => "find chat",
+            Action::ChatSwitcher => "find chat, person or message",
             Action::LogOut => "log out",
             Action::AttachFile => "attach file",
             Action::RecordVoice => "record voice message",
@@ -877,7 +894,7 @@ impl Action {
             Action::ShowReactionUsers => "who reacted",
             Action::OpenProfile => "profile",
             Action::ShowPinned => "pinned messages",
-            Action::SearchMessages => "search all chats",
+            Action::SearchMessages => "search messages in all chats",
             Action::OpenInbox => "notification inbox",
             Action::MarkChatRead => "mark chat read",
             Action::OpenBotKeyboard => "bot buttons",
@@ -1203,7 +1220,7 @@ impl Keymap {
         let KeyCode::Char(c) = chord.code else {
             return chord;
         };
-        match guess.latin(c) {
+        match guess.latin(c).or_else(|| guess.latin_punct(c)) {
             Some(l) if self.feed(pending, chord) == Feed::Unbound => {
                 Chord::new(KeyCode::Char(l), chord.mods)
             }
@@ -1523,7 +1540,12 @@ Bogus = "x"
         assert!(
             items
                 .iter()
-                .any(|h| h.key == "Space" && h.desc == "find chat")
+                .any(|h| h.key == "Space" && h.desc == "find chat, person or message")
+        );
+        assert!(
+            items
+                .iter()
+                .any(|h| h.key == "/" && h.desc == "search messages in all chats")
         );
         assert_eq!(map.label_for(Action::ChatSwitcher).unwrap(), "Space Space");
         assert_eq!(map.label_for(Action::OpenProfile).unwrap(), "Space p");
@@ -1759,5 +1781,51 @@ Bogus = "x"
         let map = Keymap::from_toml("[keymap]\nSelectNext = \"о\"\n", &mut warnings).unwrap();
         assert!(warnings.is_empty(), "{warnings:?}");
         assert_eq!(map.layout_fallback(&[], key('о'), &guess), key('о'));
+    }
+
+    #[test]
+    fn russian_punctuation_keys_reach_the_qwerty_binds_after_a_cyrillic_letter() {
+        let map = Keymap::default();
+        let mut guess = LayoutGuess::for_locale("ru_RU.UTF-8");
+        guess.observe('ы');
+        assert_eq!(map.layout_fallback(&[], key('.'), &guess), key('/'));
+        assert_eq!(map.layout_fallback(&[], key(','), &guess), key('?'));
+        assert_eq!(map.layout_fallback(&[], key('?'), &guess), key('?'));
+        assert_eq!(map.layout_fallback(&[space()], key('.'), &guess), key('.'));
+        guess.observe('j');
+        assert_eq!(map.layout_fallback(&[], key('.'), &guess), key('.'));
+        assert_eq!(map.layout_fallback(&[], key(','), &guess), key(','));
+        guess.observe('ж');
+        assert_eq!(map.layout_fallback(&[], key('.'), &guess), key('/'));
+    }
+
+    #[test]
+    fn belarusian_apostrophe_starts_the_bracket_chords() {
+        let map = Keymap::default();
+        let mut guess = LayoutGuess::default();
+        guess.observe('ы');
+        guess.observe('і');
+        assert_eq!(map.layout_fallback(&[], key('\''), &guess), key('\''));
+        guess.observe('ў');
+        let first = map.layout_fallback(&[], key('\''), &guess);
+        assert_eq!(first, key(']'));
+        assert_eq!(
+            map.feed(&[first], key('u')),
+            Feed::Action(Action::OpenNextUnread)
+        );
+    }
+
+    #[test]
+    fn punctuation_needs_a_single_known_layout() {
+        let map = Keymap::default();
+        let mut guess = LayoutGuess::default();
+        assert_eq!(map.layout_fallback(&[], key('.'), &guess), key('.'));
+        assert_eq!(map.layout_fallback(&[], key('\''), &guess), key('\''));
+        guess.observe('к');
+        assert_eq!(map.layout_fallback(&[], key('.'), &guess), key('.'));
+        assert_eq!(
+            LayoutGuess::for_locale("ru_RU.UTF-8").latin_punct('.'),
+            Some('/')
+        );
     }
 }

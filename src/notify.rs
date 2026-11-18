@@ -13,12 +13,13 @@ pub struct Candidate {
     pub outgoing: bool,
     pub muted: bool,
     pub mention: bool,
+    pub mentions_off: bool,
     pub viewing: bool,
     pub age: i64,
 }
 
 pub fn worth_inbox(c: &Candidate) -> bool {
-    !c.outgoing && c.age < MAX_AGE_SECS && (!c.muted || c.mention)
+    !c.outgoing && c.age < MAX_AGE_SECS && (!c.muted || (c.mention && !c.mentions_off))
 }
 
 pub fn should_notify(c: &Candidate) -> bool {
@@ -537,6 +538,17 @@ mod tests {
         assert!(should_notify(&Candidate {
             muted: true,
             mention: true,
+            ..base
+        }));
+        assert!(!should_notify(&Candidate {
+            muted: true,
+            mention: true,
+            mentions_off: true,
+            ..base
+        }));
+        assert!(should_notify(&Candidate {
+            mention: true,
+            mentions_off: true,
             ..base
         }));
         assert!(worth_inbox(&Candidate {

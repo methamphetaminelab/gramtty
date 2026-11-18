@@ -1003,6 +1003,9 @@ fn chat(id: i64, title: &str, kind: ChatKind, order: i64, lists: &[ListId], now:
         perms: crate::model::Rights::default(),
         protected: false,
         reactions_off: false,
+        marked_unread: false,
+        notify: crate::model::NotifyPrefs::default(),
+        clearable: (false, false),
     }
 }
 

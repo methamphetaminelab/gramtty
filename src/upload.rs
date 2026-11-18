@@ -9,6 +9,10 @@ use crate::model::fuzzy_score;
 pub const ALBUM_MAX: usize = 10;
 pub const PHOTO_MAX_BYTES: u64 = 10 * 1024 * 1024;
 pub const CAPTION_MAX: usize = 1024;
+
+pub fn caption_fits(source: &str, max: usize) -> bool {
+    crate::markup::parse(source).rich.text.encode_utf16().count() <= max
+}
 const CLIPBOARD_TIMEOUT: Duration = Duration::from_secs(5);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_DIR_ENTRIES: usize = 5000;
@@ -898,6 +902,14 @@ pub fn dropped_paths(text: &str) -> Option<Vec<PathBuf>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captions_count_utf16_units_of_the_parsed_text() {
+        assert!(caption_fits(&format!("**{}**", "a".repeat(1024)), CAPTION_MAX));
+        assert!(!caption_fits(&"a".repeat(1025), CAPTION_MAX));
+        assert!(!caption_fits(&"😀".repeat(513), CAPTION_MAX));
+        assert!(caption_fits(&"😀".repeat(512), CAPTION_MAX));
+    }
 
     fn pending(name: &str, kind: Kind) -> Pending {
         Pending {

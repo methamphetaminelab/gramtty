@@ -1894,10 +1894,11 @@ pub fn reply_bar(sender: Option<i64>) -> Style {
 
 pub fn avatar(id: i64) -> Style {
     let t = get();
-    let mut st = t.colors.strong.0;
-    st.fg = t.colors.avatar_text.0;
-    st.bg = t.name_color(id);
-    st
+    let st = t.colors.strong.0;
+    match t.name_color(id) {
+        Some(c) => st.fg(c),
+        None => st,
+    }
 }
 
 pub fn tick(state: Tick) -> (String, Style) {

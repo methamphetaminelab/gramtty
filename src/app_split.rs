@@ -5,6 +5,8 @@ use crate::keymap::Action;
 use crate::model::{self, Sender};
 use crate::td;
 
+pub const OPEN_HINT: &str = "split: open another chat here";
+
 pub struct SideView {
     pub open_chat: Option<i64>,
     pub open_topic: Option<i32>,
@@ -54,7 +56,8 @@ impl App {
             return;
         };
         if self.side.is_some() {
-            self.set_status("already split; Ctrl-w q closes the focused pane", false);
+            let key = self.keymap.label_for(Action::SplitClose).unwrap_or_default();
+            self.set_status(format!("already split; {key} closes the focused pane"), false);
             return;
         }
         self.side = Some(SideView {
@@ -72,15 +75,14 @@ impl App {
             cmd_sel: 0,
         });
         self.side_left = true;
-        self.set_status(
-            "split: open another chat here; Ctrl-w w switches panes",
-            false,
-        );
+        let key = self.keymap.label_for(Action::SplitFocus).unwrap_or_default();
+        self.set_status(format!("{OPEN_HINT}; {key} switches panes"), false);
     }
 
     pub(super) fn split_focus(&mut self) {
         if self.side.is_none() {
-            self.set_status("no split; Ctrl-w v starts one", false);
+            let key = self.keymap.label_for(Action::SplitOpen).unwrap_or_default();
+            self.set_status(format!("no split; {key} starts one"), false);
             return;
         }
         self.swap_side();
@@ -142,7 +144,8 @@ impl App {
 
     pub(super) fn split_forward(&mut self) {
         let Some(target) = self.side_chat() else {
-            self.set_status("no split; Ctrl-w v starts one", false);
+            let key = self.keymap.label_for(Action::SplitOpen).unwrap_or_default();
+            self.set_status(format!("no split; {key} starts one"), false);
             return;
         };
         if let Some(why) = self.send_blocked(target) {

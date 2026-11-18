@@ -24,10 +24,15 @@ Terminal Telegram client in Rust on TDLib.
 - Chat list in two lines per chat, as in Telegram: the last message with its sender and time, drafts and who is typing; one line per chat with `appearance.compact_chat_list`. On a narrow terminal the chat info pane steps aside until you focus it (`4`), and `j` `k` scroll it when it is focused
 - Inline media in the terminal: photos, albums, video, video notes, stickers, voice, files (kitty graphics; sixel, iTerm2 and half-block fallbacks); animated stickers and GIFs play right in the chat and in the sticker/GIF picker (natively in kitty; in sixel, iTerm2 and half-block terminals they are redrawn at up to 12 fps, at most 2 at a time in the chat, within about 1 MB/s of terminal output); video, video notes, GIFs, voice and music play with sound inside the viewer in kitty (libmpv), or in a separate mpv window
 - Sending: files, albums, clipboard paste, voice messages, stickers and GIFs; upload progress and cancel
-- Reactions, replies, edit, delete, forward, pin, copy, translate, save to Saved Messages
+- Reactions, replies (with quotes, also to messages from other chats), edit, delete, forward, pin, copy, translate, save to Saved Messages
+- Polls: vote, retract a vote, stop your own poll; quizzes show the right answer and the explanation
+- Channel comments: open the discussion under a post and reply in it
+- Link previews under messages
+- Block and unblock, clear history, mark as unread, unpin all messages, send without sound
 - Search like in Telegram: chats, contacts, public channels and messages in one box; search in a chat with highlighted matches, media filters, jump to a date and `n`/`N` stepping; pinned messages, notification inbox
 - Jumps to the next unread chat, mention or reply, reaction
 - Bot commands and inline keyboard buttons
+- Typing `@` in a group suggests its members; `Tab` completes the mention
 - t.me links and @mentions open users, bots, channels, groups and messages right in gramtty; joining by an invite link and sending /start from a bot link ask first
 - Desktop notifications and a notification sound
 - Formatting as you type: bold, italic, underline, strikethrough, spoiler, code, links and quotes, shown live in the composer; a Format menu on `Ctrl-t`; editing a sent message keeps its formatting
@@ -164,12 +169,13 @@ Vim-style. `?` lists every key binding by context, your remaps included. `Space`
 | `n` `N` | next (older) / previous (newer) result of the chat search |
 | `i` | compose; in a group or channel you haven't joined, join it. Where you can't write, the composer says why |
 | `Enter` / `Shift-Enter` or `Alt-Enter` or `Ctrl-j` | send / newline (in the composer) |
+| `Alt-s` | send without sound (in the composer) |
 | `Esc` | leave the composer; the text and the reply stay as a draft, synced with Telegram when you switch chats. Outside it, clear marks, drop the reply, close the filter or deselect the message |
 | `R` `e` `d` | reply, edit, delete |
 | `r` `f` `y` `P` | react, forward, copy text, pin or unpin |
 | `m` | mark or unmark a message; `f` `y` `d` then act on all marked ones |
 | `V` | select part of the message text to copy |
-| `o` | open a link or @mention from the message (with several, pick one from a list); t.me links and mentions open inside gramtty, other links in the browser |
+| `o` | open a link, @mention, hashtag, cashtag or bot command from the message (with several, pick one from a list); t.me links and mentions open inside gramtty, other links in the browser |
 | `v` / `x` | view attachment (media plays inside it) / play in mpv or open |
 | in the viewer: `Space` `←` `→` `↑` `↓` `m` | pause, seek ∓5 s, volume ±5, mute |
 | `Space u` | attach file (composer: `Ctrl-o`) |
@@ -183,7 +189,7 @@ Vim-style. `?` lists every key binding by context, your remaps included. `Space`
 | `Space m` | mark chat read |
 | `Space p` | profile |
 | `Space g` | shared media: photos, videos, files, links, voice and video messages, GIFs, music |
-| `Space a` | actions for the selected message, or for the selected chat: mute, pin, archive, leave or delete it and more |
+| `Space a` | actions for the selected message (vote in a poll, open comments, cancel a download and more), or for the selected chat: mute, pin, archive, block, clear history, mark as unread, unpin all, leave or delete it and more |
 | `Space 1` `2` `4` | toggle folders, chats, info panes |
 | `Space r` | redraw |
 | `Space M` | recent notices and errors |
@@ -222,6 +228,8 @@ Type markup and it is shown live in the composer (the markers are dimmed).
 | `[text](https://example.com)` | link |
 | `[name](tg://user?id=123)` | mention by user id |
 | `> text` (one or more lines) | block quote |
+| `>> text` | expandable block quote |
+| `[😀](tg://emoji?id=123)` | custom emoji (Telegram Premium) |
 | `\*` | a literal marker character |
 
 An opening marker must be followed by a non-space and a closing one preceded by one, and `__` only applies at word boundaries, so `my__var__name`, `2 ** 3` and `a * b * c` stay as typed. Nothing is parsed inside code.
